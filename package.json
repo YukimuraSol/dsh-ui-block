@@ -1,7 +1,6 @@
 {
   "name": "dsh-ui-block",
   "version": "0.2.2",
-  "private": true,
   "type": "module",
   "files": [
     "index.js",
@@ -11,6 +10,27 @@
     "extension/"
   ],
   "description": "Page block + element chip: render a ::dsh-ui <name> [res=WxH]:: line's ui-blocks file in a sandboxed canvas, and render an element\u00ab...\u00bb token as a composer chip that serializes back to the token verbatim.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YukimuraSol/dsh-ui-block.git"
+  },
+  "homepage": "https://github.com/YukimuraSol/dsh-ui-block#readme",
+  "bugs": {
+    "url": "https://github.com/YukimuraSol/dsh-ui-block/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "ui-block",
+    "ui-blocks",
+    "canvas",
+    "sandbox",
+    "element-chip",
+    "chat-ui"
+  ],
+  "author": "YukimuraSol",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js"
