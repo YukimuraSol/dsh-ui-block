@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "dsh-element-picker",
+  "version": "0.2.1",
+  "description": "Pick a page element and copy it to the clipboard as a dsh-element payload.",
+  "permissions": ["activeTab", "scripting"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Pick an element \u2192 clipboard" }
+}

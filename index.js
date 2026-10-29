@@ -23,11 +23,12 @@
  * @module dsh-ui-block
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 /** Stable Cordis plugin name. */
@@ -38,6 +39,8 @@ export const inject = ['tools']
 const CREATE_TOOL = 'create_ui_block'
 const READ_TOOL = 'read_ui_block'
 const ROUTE_PATH = '/ui-blocks'
+const EXTENSION_ROUTE = '/ui-block-extension'
+const EXTENSION_DIR_NAME = 'extension'
 const DIR_NAME = 'ui-blocks'
 const EXT = '.uiblock'
 /** Canvas geometry shared with client.js (asserted equal by self-check.mjs). */
@@ -52,6 +55,26 @@ const EDGE_CANDIDATES = [
 function blocksDir() {
   const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh')
   return join(home, DIR_NAME)
+}
+
+/**
+ * The packaged browser extension directory, as an ABSOLUTE path.
+ *
+ * Derived from THIS module's own location plus one constant child segment. A
+ * request value never reaches it: realpathSync collapses the profile's
+ * node_modules junction back to the package body, so the string is the same no
+ * matter which spelling the loader resolved the plugin through — and the
+ * "open the folder" route below cannot be talked into opening anything else.
+ */
+function extensionDir() {
+  return join(dirname(realpathSync(fileURLToPath(import.meta.url))), EXTENSION_DIR_NAME)
+}
+
+/** The extension's own manifest: its version is the one the browser installed. */
+async function readExtensionManifest() {
+  const dir = extensionDir()
+  const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'))
+  return { dir, manifest }
 }
 
 /** One block name: a single path segment, no traversal, no separator. */
@@ -748,6 +771,88 @@ export function apply(ctx) {
         } catch (error) {
           try { res.writeHead(500); res.end('read failed') } catch { /* client gone */ }
           if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: ' + ROUTE_PATH + ' route failed: ' + String(error))
+        }
+      }
+    })
+  })
+  // Browser-extension surface: two routes, one read and one action.
+  //
+  // Neither takes a path argument. GET answers with the package's own
+  // extension/ directory and the manifest version inside it; POST spawns
+  // explorer.exe /select, on that SAME fixed directory. A request can therefore
+  // never widen either route into "read an arbitrary path" or "open an
+  // arbitrary path" — the only variable is which of the two actions runs.
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.webServer.register({
+      kind: 'prefix',
+      path: EXTENSION_ROUTE,
+      handler: async (req, res) => {
+        const send = (status, body) => {
+          const text = JSON.stringify(body)
+          res.writeHead(status, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(Buffer.byteLength(text)),
+            'cache-control': 'no-store'
+          })
+          res.end(text)
+        }
+        try {
+          const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+          const action = url.pathname.slice(EXTENSION_ROUTE.length).replace(/\/+$/, '')
+          if (action === '' || action === '/info') {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+              send(405, { ok: false, error: 'GET only' })
+              return
+            }
+            const facts = await readExtensionManifest()
+            send(200, {
+              ok: true,
+              dir: facts.dir,
+              version: String(facts.manifest.version ?? ''),
+              name: String(facts.manifest.name ?? ''),
+              manifestVersion: facts.manifest.manifest_version
+            })
+            return
+          }
+          if (action === '/reveal') {
+            if (req.method !== 'POST') {
+              send(405, { ok: false, error: 'POST only' })
+              return
+            }
+            // A custom header is the CSRF guard: a cross-site page can post a
+            // plain form here, but it cannot add a header without a preflight
+            // this server never answers. The card is same-origin, so it can.
+            if (req.headers['x-dsh-ui-block-reveal'] !== '1') {
+              send(403, { ok: false, error: 'missing reveal header' })
+              return
+            }
+            const dir = extensionDir()
+            if (!existsSync(dir)) {
+              send(404, { ok: false, error: 'extension directory missing' })
+              return
+            }
+            // windowsVerbatimArguments keeps OUR quoting: explorer wants
+            // /select,"<path>" (the comma must stay outside the quotes), which
+            // Node's default escaping would rewrite into "\/select,<path>".
+            const command = '/select,"' + dir + '"'
+            const child = spawn('explorer.exe', [command], {
+              detached: true,
+              stdio: 'ignore',
+              windowsVerbatimArguments: true
+            })
+            child.on('error', (error) => {
+              if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: explorer reveal failed: ' + String(error))
+            })
+            // Revised here so a failing spawn still answers instead of hanging.
+            const pid = child.pid
+            child.unref()
+            send(200, { ok: true, dir, pid: pid === undefined ? null : pid, command: 'explorer.exe ' + command })
+            return
+          }
+          send(404, { ok: false, error: 'unknown extension action' })
+        } catch (error) {
+          try { send(500, { ok: false, error: String(error && error.message ? error.message : error) }) } catch { /* client gone */ }
+          if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: ' + EXTENSION_ROUTE + ' route failed: ' + String(error))
         }
       }
     })

@@ -48,6 +48,13 @@
  * Sandbox: allow-same-origin ONLY, never allow-scripts (both together disable the
  * sandbox). The draft stays script-inert and its CSP still blocks external loads,
  * but the parent can read the frame's DOM — which is what the canvas picker needs.
+  *
+ * Merged bundle (2026-10-28, v0.2.0): dsh-element-chip's client half lives HERE
+ * now - the `element«…»` @ source, the draft watcher, the history chip and the
+ * user-text rule. One bundle and one patch row, so the `element` source the
+ * canvas picker relies on (PICK_SOURCE below) cannot be loaded after it any
+ * more. The token spelling did not change: messages sent before this merge
+ * still render.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-ui-block',
@@ -149,6 +156,751 @@ window.__ModuleLoader__.load({
     }
     function formatRes(res) { return res.w + '×' + res.h; }
     // [/directive-parsers]
+
+    // ═══ element chip (merged from dsh-element-chip 0.1.0, 2026-10-28) ═══════
+    // The page block's canvas picker writes `element«…»` tokens and routes them
+    // through the source registered HERE (`PICK_SOURCE` below). Both halves now
+    // load as one bundle, so that source can never be missing or late.
+
+    // -- constants ---------------------------------------------------------
+    /** Registered trigger-source name (the chip's serializer routing key). */
+    var SOURCE_NAME = 'element';
+    /** Trigger char; the @ roster is shared with @file, so a source name is mandatory. */
+    var TRIGGER = '@';
+    /** Token prefix: the semantic word plus the opening guillemet. */
+    var TOKEN_PREFIX = 'element\u00ab';
+    /** Token terminator: the first bare closing guillemet. */
+    var TOKEN_CLOSE = '\u00bb';
+    /**
+     * One whole token, content included. Lazy and dot-all so the content may span
+     * lines; the extension has already escaped any literal guillemet in the page
+     * content, so the first bare closing guillemet really is the end.
+     */
+    var TOKEN_RE = /element\u00ab(.*?)\u00bb/gs;
+    /** The first tag name on the token's `HTML Element:` line. */
+    var TAG_RE = /HTML Element:\s*<([A-Za-z][A-Za-z0-9-]*)/;
+    /** The token's `DOM Path:` line, for the @ menu description. */
+    var PATH_RE = /element\u00abDOM Path:\s*([^\n]*)/;
+    // -- history chip: shared shapes ---------------------------------------
+    /**
+     * Class names taken verbatim from the stylesheets already in the document
+     * (ui-chat's MessageItem / MessageIconActions, ui-conversation's
+     * ReferenceChip / composer-editor). Reusing them is what keeps the redrawn
+     * bubble pixel-identical to the built-in one, and what makes a history chip
+     * look exactly like the composer chip it came from. Read-only literals: the
+     * plugin never edits the upstream packages.
+     * ponytail: a ui-chat upgrade that rehashes these names degrades styling,
+     * never correctness - re-read them from the shipped client.js and update.
+     */
+    var ELEMENT_CSS = {
+      userRow: 'Sixlwa_userRow',
+      userStack: 'Sixlwa_userStack',
+      bubble: 'Sixlwa_bubble',
+      referenceSummary: 'Sixlwa_referenceSummary',
+      attachmentRow: 'Sixlwa_attachmentRow',
+      fileCard: 'Sixlwa_fileCard',
+      fileIcon: 'Sixlwa_fileIcon',
+      fileContent: 'Sixlwa_fileContent',
+      fileName: 'Sixlwa_fileName',
+      fileMeta: 'Sixlwa_fileMeta',
+      actions: 'xzv4MW_actions',
+      timeStart: 'xzv4MW_timeStart',
+      action: 'xzv4MW_action',
+      chip: 'q44v1G_reference yAWgPa_chip',
+      chipMarker: 'yAWgPa_marker',
+      chipLabel: 'yAWgPa_label'
+    };
+    /** The chat locale namespace ui-chat registers; this entry reuses it. */
+    var CHAT_NS = 'chat';
+    /**
+     * One token's payload without the \u00ab...\u00bb wrapper - the four lines the
+     * chip's tooltip shows.
+     * @param token - the whole token.
+     * @returns the inner four lines.
+     */
+    function tokenBody(token) {
+      var s = rawOf(token);
+      return s.slice(TOKEN_PREFIX.length, s.length - TOKEN_CLOSE.length);
+    }
+    /**
+     * Split one sent message into the runs the history bubble renders: one chip
+     * per well-formed element token, and the untouched text between them.
+     *
+     * Safe failure, same rule as the draft watcher: a token whose tag cannot be
+     * parsed is not chipped at all - it stays inside a text run and the scan
+     * goes on, so a malformed token can never eat its neighbours.
+     *
+     * Pure (no DOM, no ctx), so the self-check drives it directly.
+     * @param text - the logged message text.
+     * @returns runs in source order; always at least one run.
+     */
+    function splitElementTokens(text) {
+      var s = String(text == null ? '' : text);
+      var parts = [];
+      var cursor = 0;
+      TOKEN_RE.lastIndex = 0;
+      var m;
+      while ((m = TOKEN_RE.exec(s)) !== null) {
+        var tag = tokenTag(m[0]);
+        if (tag === null) continue;
+        if (m.index > cursor) parts.push({ kind: 'text', text: s.slice(cursor, m.index) });
+        parts.push({ kind: 'chip', label: tag, token: m[0] });
+        cursor = m.index + m[0].length;
+      }
+      if (cursor < s.length) parts.push({ kind: 'text', text: s.slice(cursor) });
+      if (parts.length === 0) parts.push({ kind: 'text', text: s });
+      return parts;
+    }
+    /**
+     * Split one message's content blocks into text, attachments and the rest.
+     *
+     * Mirrors ui-chat's own contentParts (dsh-client-ui-chat/lib/client.js:1193),
+     * which is not exported; the redrawn bubble needs the same three buckets so
+     * images and file cards keep rendering.
+     * @param content - the node's content blocks.
+     * @returns { text, attachments, rest }.
+     */
+    function contentParts(content) {
+      var texts = [];
+      var attachments = [];
+      var rest = [];
+      var list = Array.isArray(content) ? content : [];
+      for (var i = 0; i < list.length; i += 1) {
+        var b = list[i];
+        if (b === null || typeof b !== 'object') { rest.push(b); continue; }
+        if (b.type === 'text' && typeof b.text === 'string') texts.push(b.text);
+        else if (b.type === 'image' && b.attachment !== undefined) attachments.push({ type: 'image', image: { attachment: b.attachment } });
+        else if (b.type === 'file' && b.attachment !== undefined) attachments.push({ type: 'file', file: b.attachment });
+        else rest.push(b);
+      }
+      return { text: texts.join(''), attachments: attachments, rest: rest };
+    }
+    /** Zero-pad one clock field. */
+    function pad2(n) { return n < 10 ? '0' + n : String(n); }
+    /**
+     * Compact local timestamp for the message action row, the shipped rule
+     * (dsh-client-ui-chat/lib/client.js:1057): same calendar day -> HH:mm;
+     * earlier this year -> the clock.md date template; other years -> clock.ymd.
+     *
+     * ponytail: the shipped version re-renders at local midnight (useCalendarDay);
+     * this one reads the clock per render, so a row left mounted across midnight
+     * keeps yesterday's date until its next render. Display-only.
+     * @param time - Unix epoch ms from the source session event.
+     * @param t - translate seat supplying the clock templates.
+     * @param now - reference instant (defaults to wall clock).
+     * @returns the clock string.
+     */
+    function formatClock(time, t, now) {
+      var d = new Date(time);
+      var n = new Date(now === undefined ? Date.now() : now);
+      var clock = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return clock;
+      var params = { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() };
+      return (d.getFullYear() === n.getFullYear() ? t('clock.md', params) : t('clock.ymd', params)) + ' ' + clock;
+    }
+
+
+    // -- pure helpers (lifted into the self-check; no DOM, no ctx) ---------
+    /**
+     * The chip label one token carries: its element's tag, e.g. `<button>`.
+     *
+     * The tag is read from the token's own `HTML Element:` line - the first tag
+     * name after the `<`. Attributes are never parsed (an attribute value may
+     * itself contain `>`), and a token that carries no such line, or an empty
+     * one, is refused rather than guessed at.
+     *
+     * @param token - the whole token.
+     * @returns `<tag>`, or null when the token is not a well-formed element token.
+     */
+    function tokenTag(token) {
+      var s = String(token == null ? '' : token);
+      if (s.slice(0, TOKEN_PREFIX.length) !== TOKEN_PREFIX) return null;
+      if (s.slice(-TOKEN_CLOSE.length) !== TOKEN_CLOSE) return null;
+      var m = TAG_RE.exec(s);
+      if (m === null) return null;
+      return '<' + m[1] + '>';
+    }
+    /**
+     * The token's own DOM path line, used as the @ menu description.
+     * @param token - the whole token.
+     * @returns the path, or '' when the token carries none.
+     */
+    function tokenPath(token) {
+      var m = PATH_RE.exec(String(token == null ? '' : token));
+      return m === null ? '' : m[1];
+    }
+    /**
+     * The next token one draft still needs decorated, in clipboard coordinates.
+     *
+     * One edit per call on purpose: every scoped event CASes on draftRev, so a
+     * second edit of the same tick could not apply. The draft watcher re-runs on
+     * every revision, so the draft converges one chip at a time and a failed edit
+     * simply retries on the next interaction instead of wedging.
+     *
+     * A token that is already a chip (its offset is one of the draft's own
+     * occurrences) is skipped, and so is a token whose tag cannot be parsed -
+     * that one is left as plain text (safe failure) and the scan goes on.
+     *
+     * @param text - draft text (clipboard projection).
+     * @param occurrences - the input state's chip occurrences.
+     * @returns { token, tag, start, end }, or null when nothing is left to do.
+     */
+    function nextEdit(text, occurrences) {
+      var s = String(text == null ? '' : text);
+      var chipped = Object.create(null);
+      var list = Array.isArray(occurrences) ? occurrences : [];
+      for (var i = 0; i < list.length; i += 1) {
+        var o = list[i];
+        if (o !== null && typeof o === 'object' && o.source === SOURCE_NAME) chipped[o.offset] = true;
+      }
+      TOKEN_RE.lastIndex = 0;
+      var m;
+      while ((m = TOKEN_RE.exec(s)) !== null) {
+        if (chipped[m.index] === true) continue;
+        var tag = tokenTag(m[0]);
+        if (tag === null) continue;
+        return { token: m[0], tag: tag, start: m.index, end: m.index + m[0].length };
+      }
+      return null;
+    }
+    /**
+     * Fold one clipboard-projection offset onto its detect-projection twin.
+     * Every chip is one U+FFFC in detect coordinates but its clipboardText chars
+     * in the clipboard projection, so each chip fully before the offset shifts it
+     * back by length - 1.
+     * @param offset - offset into the clipboard projection.
+     * @param occurrences - the input state's chip occurrences.
+     * @returns the detect offset, or null when the offset lands inside a chip.
+     */
+    function foldDetectOffset(offset, occurrences) {
+      var list = Array.isArray(occurrences) ? occurrences : [];
+      var shift = 0;
+      for (var i = 0; i < list.length; i += 1) {
+        var o = list[i];
+        if (o === null || typeof o !== 'object') continue;
+        var start = o.offset;
+        var len = o.length;
+        if (typeof start !== 'number' || typeof len !== 'number') continue;
+        if (offset > start && offset < start + len) return null;
+        if (start + len <= offset) shift += len - 1;
+      }
+      return offset - shift;
+    }
+    /**
+     * The model / clipboard form of one reference.
+     *
+     * The ref IS the token, so both projections are the identity - that is what
+     * makes the sent message byte-identical to the paste. Never throws: a
+     * non-string ref (the unknown-ref probe, an empty ref) degrades to ''.
+     * @param ref - the chip's reference.
+     * @returns the token verbatim, or ''.
+     */
+    function rawOf(ref) {
+      if (typeof ref === 'string') return ref;
+      if (ref === null || ref === undefined) return '';
+      try {
+        return String(ref);
+      } catch (error) {
+        return '';
+      }
+    }
+    /**
+     * The plugin's read-only parse cache: every token it has seen, in first-seen
+     * order, with the label it renders as. Pure display data for the @ menu - the
+     * chips themselves carry their own ref and label, so nothing here is needed
+     * to send or copy.
+     */
+    function createRegistry() {
+      var tags = Object.create(null);
+      var paths = Object.create(null);
+      var tokens = [];
+      return {
+        /** Remember one token. A re-paste of the same token is a no-op. */
+        remember: function (token) {
+          var key = rawOf(token);
+          if (key === '') return;
+          if (tags[key] !== undefined) return;
+          tags[key] = tokenTag(key) || '';
+          paths[key] = tokenPath(key);
+          tokens.push(key);
+        },
+        list: function () {
+          return tokens.slice();
+        },
+        tagOf: function (token) {
+          return tags[rawOf(token)];
+        },
+        pathOf: function (token) {
+          return paths[rawOf(token)] || '';
+        }
+      };
+    }
+    /**
+     * Build the @ trigger source over one registry.
+     *
+     * The source exists for two reasons: the pipeline routes serialize() through
+     * the roster by source name, and a token in the draft can be chipped by hand
+     * from the menu. No lexicon hook: the draft's tokens are decorated by the
+     * paste watcher, never by @-token decoration.
+     * @param registry - the plugin's parse cache.
+     * @returns the InputTriggerSource.
+     */
+    function makeSource(registry) {
+      return {
+        trigger: TRIGGER,
+        name: SOURCE_NAME,
+        order: 5,
+        showGroupTitle: true,
+        async candidates(session, req) {
+          var q = String((req && req.query) || '').toLowerCase();
+          return registry.list().map(function (token, index) {
+            return {
+              name: String(index + 1),
+              label: registry.tagOf(token) || token,
+              description: registry.pathOf(token),
+              value: token
+            };
+          }).filter(function (candidate) {
+            return q === '' || candidate.label.toLowerCase().indexOf(q) >= 0;
+          });
+        },
+        /** Hand back a chip that renders as <tag> and serializes to the token. */
+        onPick: function (pick) {
+          var candidate = (pick && pick.candidate) || {};
+          var token = candidate.value === undefined ? candidate.name : candidate.value;
+          var tag = tokenTag(token);
+          if (tag === null) return undefined;
+          return {
+            insert: {
+              source: SOURCE_NAME,
+              ref: token,
+              label: tag,
+              clipboardText: token
+            }
+          };
+        },
+        codec: {
+          /** Copy / persist projection: the token, verbatim. */
+          clipboardText: function (ref) {
+            return rawOf(ref);
+          },
+          /**
+           * Model projection: the token, verbatim.
+           *
+           * NEVER rejects and never throws synchronously - a throw here blocks
+           * the entire send (contract), and the identity function cannot fail.
+           */
+          serialize: function (ref) {
+            return Promise.resolve().then(function () {
+              try {
+                return rawOf(ref);
+              } catch (error) {
+                console.error('[dsh-element-chip] serialize failed:', error);
+                return '';
+              }
+            });
+          }
+        }
+      };
+    }
+
+    // -- history chip: components ------------------------------------------
+    /** The primitives package, resolved on first use (see needPrimitives); the
+     * cache itself is the shared one declared at the top of this bundle. */
+    /**
+     * Resolve the primitives package on first use rather than at apply time: the
+     * slot registration must not depend on client-bundle load order, and the
+     * self-check's stub need not provide the id at all.
+     * @returns the primitives module.
+     */
+    function needPrimitives() {
+      if (primitives === null) primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      return primitives;
+    }
+    /** One history chip: the composer chip's own markup and classes, plus the
+     * token's four lines as the native tooltip. */
+    function ElementChipRun(props) {
+      return react.createElement('span', {
+        className: ELEMENT_CSS.chip,
+        'data-element-chip': 'history',
+        title: tokenBody(props.token)
+      },
+        react.createElement('span', { className: ELEMENT_CSS.chipMarker, 'aria-hidden': true }, '@'),
+        react.createElement('span', { className: ELEMENT_CSS.chipLabel }, props.label)
+      );
+    }
+    /**
+     * One element token rendered through the shared user-text pipeline
+     * (`conversation.user.text.node`, key `element`).
+     *
+     * This is the SECOND projection of the same token, and the one that covers
+     * every right-aligned bubble the app draws from user text: steering
+     * messages (key `steering`), pending steering items, submission echoes and
+     * command bubbles never pass through `conversation.chat.node`/`user` at
+     * all - they all funnel through the session-scoped `conversation.user.text`
+     * Factory, whose rules are the documented extension point. Shadowing only
+     * the user node therefore left those bubbles showing the raw token.
+     *
+     * @param props - { node, raw, interactive } from the UserText renderer.
+     * @returns the history chip.
+     */
+    function ElementTextNode(props) {
+      var data = (props && props.node && props.node.data) || {};
+      var token = typeof data.token === 'string' ? data.token : rawOf(props && props.raw);
+      var label = typeof data.label === 'string' ? data.label : (tokenTag(token) || '');
+      return ElementChipRun({ token: token, label: label });
+    }
+    /**
+     * The copy button and clock of one user message's action row - the shipped
+     * MessageIconActions reduced to the parts a user message actually uses
+     * (dsh-client-ui-chat/lib/client.js:1117, called at :1458 with only
+     * text/time/clock/className). Reproduced because shadowing the user
+     * renderer also shadows this row.
+     *
+     * The rewind plugin's button is NOT reproduced: it is portaled into this
+     * row at runtime (dsh-rewind-plugin/lib/client.js:1019-1025 takes the last
+     * non-rewind button's parentElement), so it keeps working as long as a
+     * button sits here - which is why the copy button must not be dropped.
+     * @param props - message text, event time, translate seat.
+     * @returns the action row.
+     */
+    function HistoryActions(props) {
+      var P = needPrimitives();
+      var t = props.t;
+      var state = react.useState(false);
+      var copied = state[0];
+      var setCopied = state[1];
+      var timer = react.useRef(null);
+      react.useEffect(function () {
+        return function () { if (timer.current !== null) clearTimeout(timer.current); };
+      }, []);
+      var label = copied ? t('copied') : t('copy');
+      var onCopy = function () {
+        if (copied) return;
+        var p = P.writeClipboard(props.text);
+        Promise.resolve(p).then(function (ok) {
+          if (ok !== true) return;
+          setCopied(true);
+          timer.current = setTimeout(function () { timer.current = null; setCopied(false); }, 1000);
+        }, function () {});
+      };
+      return react.createElement('div', { className: ELEMENT_CSS.actions, 'data-clock': 'start' },
+        react.createElement('span', { className: ELEMENT_CSS.timeStart }, formatClock(props.time, t)),
+        react.createElement(P.Tooltip, { label: label, side: 'bottom' },
+          react.createElement('button', {
+            type: 'button',
+            className: ELEMENT_CSS.action,
+            'aria-label': label,
+            onClick: onCopy
+          }, react.createElement(copied ? P.IconCheckOutlineRegular : P.IconCopyOutlineRegular, {}))
+        )
+      );
+    }
+    /** One attachment in the message's attachment row: image gallery or file card. */
+    function AttachmentItem(props) {
+      var P = needPrimitives();
+      var attachment = props.attachment;
+      if (attachment.type === 'image') {
+        return props.renderMessageImages({
+          images: [attachment.image],
+          align: 'end',
+          compact: props.compactImages
+        });
+      }
+      var file = attachment.file;
+      return react.createElement('span', { className: ELEMENT_CSS.fileCard, title: file.name },
+        react.createElement(P.FileTypeIcon, { path: file.name, className: ELEMENT_CSS.fileIcon }),
+        react.createElement('span', { className: ELEMENT_CSS.fileContent },
+          react.createElement('span', { className: ELEMENT_CSS.fileName }, file.name),
+          react.createElement('span', { className: ELEMENT_CSS.fileMeta },
+            [String(P.fileExtension(file.name)).toUpperCase().slice(0, 8), P.fileSizeText(file.bytes)].filter(Boolean).join(' '))
+        )
+      );
+    }
+    /**
+     * projectUserText and JsonBlock are read as dynamic properties of the
+     * primitives module, so the shipped frontend build cannot see them and
+     * tree-shakes whatever its own app does not use. Measured in
+     * dsh-web-frontend @0.2.1-rc.2 dist/assets/index-CN7NIWNw.js:
+     * projectUserText 0 hits (calling it threw and killed the whole bubble),
+     * JsonBlock / writeClipboard / Tooltip / the icons 1 each. Probe before
+     * calling; a plain text run only loses the @mention capsules, the element
+     * chips come from splitElementTokens and keep working.
+     * ponytail: text-only fallback, no mention capsules -- copy
+     * projectUserText's ~40 lines here only if history mentions matter.
+     */
+    function userTextNodes(P, text, referenceLabels, skillNames, references) {
+      if (typeof P.projectUserText === 'function') {
+        return P.projectUserText(text, referenceLabels, skillNames, 'skill', references);
+      }
+      return react.createElement('span', null, text);
+    }
+    /** Same dynamic-access hazard as projectUserText: fall back to a plain
+     * preformatted dump if a future build drops JsonBlock.
+     * @param P - the primitives module.
+     * @param payload - the extra content block.
+     * @param t - the chat namespace translate seat.
+     * @param key - react key.
+     * @returns the extra block node.
+     */
+    function jsonBlockNode(P, payload, t, key) {
+      if (typeof P.JsonBlock === 'function') {
+        return react.createElement(P.JsonBlock, {
+          key: key,
+          label: t('message.extraBlock'),
+          payload: payload,
+          truncatedLabel: function (total) { return t('json.truncated', { total: total }); }
+        });
+      }
+      var body;
+      try {
+        body = JSON.stringify(payload, null, 2);
+      } catch (e) {
+        body = String(payload);
+      }
+      return react.createElement('pre', { key: key }, body);
+    }
+    /**
+     * The shadowing user/steering bubble.
+     *
+     * Structure, classes, and copy are the shipped UserStyleBubble +
+     * UserMessageNodeView (dsh-client-ui-chat/lib/client.js:1332-1466) with one
+     * substitution: a well-formed element token renders as a chip instead of a
+     * text run. Everything else - the attachment row (images AND file cards),
+     * the reference-summary line, extra content blocks, the action row with its
+     * copy button and clock - is reproduced so a plain message keeps the exact
+     * DOM it had before this plugin existed.
+     *
+     * A message with no token takes the identical path: splitElementTokens
+     * returns one text run, projectUserText decorates it exactly as before.
+     * @param props - the keyed chat node plus the owner seats.
+     * @returns the user bubble.
+     */
+    function ElementChipUserBubble(props) {
+      var P = needPrimitives();
+      var data = props.node.data;
+      var t = props.t;
+      var parts = contentParts(data.content);
+      var attachments = parts.attachments;
+      var compactImages = attachments.length > 1;
+      var runs = splitElementTokens(parts.text);
+      var showBubble = parts.text !== '' || parts.rest.length > 0;
+      var references = { openFile: props.openFile, openSkill: props.openSkill };
+      var referenceLabels = data.referenceLabels === undefined ? [] : data.referenceLabels;
+      var skillNames = data.skillNames === undefined ? [] : data.skillNames;
+      var children = [];
+      var i;
+      for (i = 0; i < runs.length; i += 1) {
+        var run = runs[i];
+        if (run.kind === 'chip') children.push(react.createElement(ElementChipRun, { key: 'c' + i, label: run.label, token: run.token }));
+        else children.push(react.createElement(react.Fragment, { key: 't' + i }, userTextNodes(P, run.text, referenceLabels, skillNames, references)));
+      }
+      for (i = 0; i < parts.rest.length; i += 1) {
+        children.push(jsonBlockNode(P, parts.rest[i], t, 'r' + i));
+      }
+      var stackChildren = [];
+      if (attachments.length > 0) {
+        stackChildren.push(react.createElement('div', {
+          key: 'attachments',
+          className: ELEMENT_CSS.attachmentRow,
+          'data-message-attachments': true
+        }, attachments.map(function (attachment, index) {
+          return react.createElement(AttachmentItem, {
+            key: attachment.type + ':' + index,
+            attachment: attachment,
+            compactImages: compactImages,
+            renderMessageImages: props.renderMessageImages
+          });
+        })));
+      }
+      if (showBubble) stackChildren.push(react.createElement('div', { key: 'bubble', className: ELEMENT_CSS.bubble }, children));
+      if (referenceLabels.length > 0) {
+        stackChildren.push(react.createElement('div', { key: 'refs', className: ELEMENT_CSS.referenceSummary },
+          t('message.referenceSummary', { labels: referenceLabels.join(t('message.referenceSeparator')) })));
+      }
+      return react.createElement('div', { className: ELEMENT_CSS.userRow, 'data-element-chip-bubble': 'history' },
+        react.createElement('div', { className: ELEMENT_CSS.userStack }, stackChildren),
+        react.createElement(HistoryActions, { text: parts.text, time: data.time, t: t })
+      );
+    }
+    /**
+     * Wire the shadowing entry. Registered at priority -1: the slot ledger keeps
+     * one winner per cell and the LOWEST priority renders
+     * (dsh-client-ui-slots/lib/index.js:278-293, dsh-client-ui-renderer/lib/
+     * client.js:1154), so this entry takes the cell from ui-chat's own priority-0
+     * registration without touching any upstream file.
+     * @param ctx - client root context.
+     */
+    function registerHistoryRenderer(ctx) {
+      ctx.slots.inject('conversation.chat.node', function () {
+        return ctx.slots.register({
+          name: 'conversation.chat.node',
+          key: 'user',
+          priority: -1,
+          locale: CHAT_NS
+        }, ElementChipUserBubble);
+      });
+    }
+
+    /** UserText rule id; also the renderer key on `conversation.user.text.node`. */
+    var RULE_ID = 'element';
+    /**
+     * The UserText rule that turns every well-formed element token in a sent
+     * message into one chip, wherever the app renders user text.
+     *
+     * Rules are polled: `match(text, from)` returns the nearest token at or
+     * after `from`, or undefined. A token whose tag cannot be parsed is skipped
+     * (safe failure, same rule as splitElementTokens) so it can never eat its
+     * neighbours.
+     * @returns the rule object.
+     */
+    function createElementRule() {
+      return {
+        id: RULE_ID,
+        order: 20,
+        match: function (text, from) {
+          var s = String(text == null ? '' : text);
+          TOKEN_RE.lastIndex = typeof from === 'number' && from > 0 ? from : 0;
+          var m;
+          while ((m = TOKEN_RE.exec(s)) !== null) {
+            var tag = tokenTag(m[0]);
+            if (tag === null) continue;
+            return { id: RULE_ID, start: m.index, end: m.index + m[0].length, data: { label: tag, token: m[0] } };
+          }
+          return undefined;
+        }
+      };
+    }
+    /**
+     * Register the user-text rule and its keyed renderer.
+     *
+     * Both are optional: without `uiConversation` the shadow renderer still
+     * chips the user's own messages, and without the slot the text simply keeps
+     * the raw token - never a half-rendered chip.
+     * @param ctx - client root context.
+     */
+    function registerUserTextRule(ctx) {
+      var uiConversation = ctx.get('uiConversation');
+      if (uiConversation === undefined || uiConversation.userText === undefined) return;
+      ctx.effect(function () {
+        return uiConversation.userText.register(createElementRule());
+      }, 'dsh-element-chip: user text rule');
+      ctx.slots.inject('conversation.user.text.node', function () {
+        return ctx.slots.register({
+          name: 'conversation.user.text.node',
+          key: RULE_ID
+        }, ElementTextNode);
+      });
+    }
+
+    // -- plugin body -------------------------------------------------------
+    var registry = createRegistry();
+    /** Required services: the trigger registry, the seat registry, the session scopes. */
+    var inject = ['inputTriggers', 'slots', 'sessions', 'uiConversation'];
+
+    /**
+     * Client plugin body: register the @ source, then mount the draft watcher.
+     * @param ctx - client root context.
+     */
+    function applyElementChip(ctx) {
+      var inputTriggers = ctx.get('inputTriggers');
+      if (inputTriggers !== undefined) {
+        ctx.effect(function () {
+          return inputTriggers.registerSource(makeSource(registry));
+        }, 'dsh-element-chip: @ source');
+      } else {
+        console.error('[dsh-element-chip] inputTriggers service unavailable; chip source not registered');
+      }
+
+      /**
+       * Apply one scoped input event to one session scope.
+       * @param sessionId - owning session (the scope the event is addressed to).
+       * @param event - scoped input event name.
+       * @param payload - event payload.
+       * @returns whether the editor applied the edit.
+       */
+      function emit(sessionId, event, payload) {
+        var sessions = ctx.get('sessions');
+        var actx = sessions === undefined ? undefined : sessions.scope(sessionId);
+        if (actx === undefined) return false;
+        return actx.bail(actx, event, payload) === true;
+      }
+
+      /**
+       * Advance one pasted draft by a single chip edit through the public scoped
+       * events. The token is remembered first so the @ menu can offer it back.
+       * @param sessionId - owning session (the scope the event is addressed to).
+       * @param state - current InputState.
+       */
+      function consumePaste(sessionId, state) {
+        if (state === null || state === undefined) return;
+        if (state.phase !== 'plain') return;
+        var draft = state.draft;
+        if (typeof draft !== 'string' || draft === '') return;
+        var edit = nextEdit(draft, state.occurrences);
+        if (edit === null) return;
+        var start = foldDetectOffset(edit.start, state.occurrences);
+        var end = foldDetectOffset(edit.end, state.occurrences);
+        if (start === null || end === null || end <= start) return;
+        registry.remember(edit.token);
+        emit(sessionId, 'slash/input-insert-reference', {
+          reference: {
+            source: SOURCE_NAME,
+            ref: edit.token,
+            label: edit.tag,
+            clipboardText: edit.token
+          },
+          span: { start: start, end: end, draftRev: state.draftRev }
+        });
+      }
+
+      /**
+       * Headless session-scope seat: renders nothing, watches the draft.
+       * @param props - session standard props (sessionId + useInput).
+       * @returns null.
+       */
+      function ElementChipWatcher(props) {
+        var useInput = props.useInput;
+        var input = typeof useInput === 'function' ? useInput(function (s) {
+          return s;
+        }) : undefined;
+        var draft = input === undefined ? undefined : input.draft;
+        var draftRev = input === undefined ? undefined : input.draftRev;
+        react.useEffect(function () {
+          try {
+            consumePaste(props.sessionId, input);
+          } catch (error) {
+            console.error('[dsh-element-chip] draft watch failed:', error);
+          }
+        }, [draft, draftRev, props.sessionId]);
+        return null;
+      }
+
+      ctx.slots.inject('conversation.input.overlay', function () {
+        return ctx.slots.register({
+          name: 'conversation.input.overlay',
+          id: 'dsh-element-chip',
+          order: 5
+        }, ElementChipWatcher);
+      });
+
+      // History bubble: token -> chip (see registerHistoryRenderer).
+      try {
+        registerHistoryRenderer(ctx);
+      } catch (error) {
+        console.error('[dsh-element-chip] history renderer not registered; history keeps the raw token:', error);
+      }
+
+      // Every OTHER user-style bubble (steering, pending steering, submission
+      // echo, command rows) is drawn from `conversation.user.text` and never
+      // reaches the node slot above; the rule below chips those too.
+      try {
+        registerUserTextRule(ctx);
+      } catch (error) {
+        console.error('[dsh-element-chip] user text rule not registered; steering bubbles keep the raw token:', error);
+      }
+    }
+
 
     function readScheme() {
       var scheme = '';
@@ -1455,14 +2207,208 @@ window.__ModuleLoader__.load({
       };
     }
 
+    // -- browser-extension settings tab ------------------------------------
+    // One card in Settings -> Plugins: where the packaged extension lives, a
+    // button that opens that folder, the three steps to load it unpacked, and
+    // the "moving the plugin means reloading the extension" note. The card only
+    // READS the host's fixed path and never sends one, so nothing typed or
+    // clicked here can widen the host's reveal route.
+    var EXTENSION_ROUTE = '/ui-block-extension';
+    var EXT_SETTINGS_CSS = [
+      '.dshub-ext{display:flex;flex-direction:column;gap:12px;padding:12px;max-width:760px}',
+      '.dshub-ext-title{font:var(--dsw-font-xs-strong-13);color:var(--dsw-alias-label-primary)}',
+      '.dshub-ext-ver{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}',
+      '.dshub-ext-row{display:flex;align-items:center;gap:8px}',
+      '.dshub-ext-path{flex:1 1 auto;min-width:0;height:28px;padding:0 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}',
+      '.dshub-ext-btn{flex:none;height:28px;padding:0 14px;border-radius:6px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-interactive-bg);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}',
+      '.dshub-ext-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshub-ext-steps{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);line-height:1.6}',
+      '.dshub-ext-hint{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);line-height:1.6}',
+      '.dshub-ext-note{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-success-primary);word-break:break-all}',
+      '.dshub-ext-bad{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-error-primary);word-break:break-all}'
+    ].join('');
+
+    /** One line of human text for an unknown thrown value. */
+    function errorText(error) {
+      return String(error && error.message ? error.message : error);
+    }
+
+    /** Clipboard is best-effort: execCommand keeps insecure/denied contexts working. */
+    function fallbackCopy(text) {
+      try {
+        var area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.left = '-1000px';
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand('copy');
+        if (area.parentNode !== null) area.parentNode.removeChild(area);
+      } catch (e) { /* copying is a convenience, never a requirement */ }
+    }
+
+    /** Settings -> Plugins -> 浏览器扩展: locate, copy, reveal, and the 3 loading steps. */
+    function ExtensionSettingsCard() {
+      if (react === null || typeof react.useState !== 'function') return null;
+      var h = react.createElement;
+      var infoState = react.useState({ phase: 'loading', dir: '', version: '' });
+      var info = infoState[0];
+      var setInfo = infoState[1];
+      var noteState = react.useState('');
+      var note = noteState[0];
+      var setNote = noteState[1];
+      var copiedState = react.useState(false);
+      var copied = copiedState[0];
+      var setCopied = copiedState[1];
+
+      react.useEffect(function () {
+        var live = true;
+        window.fetch(EXTENSION_ROUTE, { credentials: 'same-origin', cache: 'no-store' })
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+          })
+          .then(function (body) {
+            if (!live) return;
+            setInfo({ phase: 'ready', dir: String(body.dir || ''), version: String(body.version || '') });
+          })
+          .catch(function (error) {
+            if (!live) return;
+            setInfo({ phase: 'error', dir: '', version: '' });
+            setNote('读取扩展目录失败：' + errorText(error));
+          });
+        return function () { live = false; };
+      }, []);
+
+      function copyDir() {
+        if (info.dir === '') return;
+        var done = function () {
+          setCopied(true);
+          window.setTimeout(function () { setCopied(false); }, 1600);
+        };
+        try {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(info.dir).then(done, function () {
+              fallbackCopy(info.dir);
+              done();
+            });
+            return;
+          }
+        } catch (e) { /* fall through to the textarea path */ }
+        fallbackCopy(info.dir);
+        done();
+      }
+
+      function reveal() {
+        setNote('正在打开文件夹…');
+        window.fetch(EXTENSION_ROUTE + '/reveal', {
+          method: 'POST',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'x-dsh-ui-block-reveal': '1' }
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+          })
+          .then(function (body) {
+            setNote(body && body.ok === true ? '已打开：' + String(body.dir || '') : '打开失败');
+          })
+          .catch(function (error) { setNote('打开失败：' + errorText(error)); });
+      }
+
+      var pathValue = info.phase === 'ready' ? info.dir : (info.phase === 'error' ? '（读取失败）' : '读取中…');
+      return h('div', { className: 'dshub-ext', 'data-dsh-ui-block-extension': 'card' },
+        h('div', { className: 'dshub-ext-title' }, '浏览器扩展 dsh-element-picker'),
+        h('div', { className: 'dshub-ext-ver' }, info.version === '' ? '扩展版本未知' : '扩展版本 ' + info.version + ' · 与插件 package.json 同版'),
+        h('div', { className: 'dshub-ext-row' },
+          h('input', {
+            className: 'dshub-ext-path',
+            value: pathValue,
+            readOnly: true,
+            'aria-label': '扩展目录',
+            onFocus: function (event) { event.target.select(); }
+          }),
+          h('button', { type: 'button', className: 'dshub-ext-btn', onClick: copyDir }, copied ? '已复制' : '复制路径'),
+          h('button', { type: 'button', className: 'dshub-ext-btn', onClick: reveal }, '打开文件夹')
+        ),
+        h('ol', { className: 'dshub-ext-steps' },
+          h('li', null, '打开 chrome://extensions'),
+          h('li', null, '打开右上角的「开发者模式」'),
+          h('li', null, '点「加载已解压的扩展程序」，选上面这个目录')
+        ),
+        h('div', { className: 'dshub-ext-hint' }, '插件换目录（重装、换实例）后要回到 chrome://extensions 重新加载一次扩展，否则浏览器里跑的还是旧目录那份。'),
+        note === '' ? null : h('div', { className: /失败/.test(note) ? 'dshub-ext-bad' : 'dshub-ext-note' }, note)
+      );
+    }
+
+    /**
+     * Register the Settings -> Plugins tab. The slots service can still be
+     * inactive at first paint, so read it non-strictly and skip silently when it
+     * is absent; the registration itself waits for the slot declaration.
+     */
+    function attachExtensionSettings(ctx) {
+      var slots = ctx && typeof ctx.get === 'function' ? ctx.get('slots', false) : undefined;
+      if (slots === undefined || slots === null || typeof slots.inject !== 'function') return;
+      ctx.effect(function () {
+        if (typeof document === 'undefined' || document.head === null) return function () {};
+        var style = document.createElement('style');
+        style.setAttribute('data-plugin-css', 'dsh-ui-block-extension');
+        style.textContent = EXT_SETTINGS_CSS;
+        document.head.appendChild(style);
+        return function () {
+          if (style.parentNode !== null) style.parentNode.removeChild(style);
+        };
+      }, 'dsh-ui-block: extension settings styles');
+      ctx.effect(function () {
+        return slots.inject('settings.plugins.tab', function () {
+          return slots.register({
+            name: 'settings.plugins.tab',
+            id: 'ui-block-extension',
+            order: 92,
+            label: function () { return '浏览器扩展'; }
+          }, ExtensionSettingsCard);
+        });
+      }, 'dsh-ui-block: extension settings tab');
+    }
+
     return {
       apply: function (ctx) {
+        // Element half FIRST: the `element` @ source this file registers is what
+        // renders a picked element as a chip and what serializes it back, so the
+        // canvas picker below can never run before it exists.
+        applyElementChip(ctx);
+        // Third half: the packaged browser extension's settings card. Independent
+        // of both halves above — it only needs the slots service.
+        attachExtensionSettings(ctx);
         if (ctx && typeof ctx.effect === 'function') {
           var dispose = install(ctx);
           ctx.effect(function () { return dispose; });
           return;
         }
         install(ctx);
+      },
+      inject: inject,
+      // ponytail: pure halves exported only so self-check-element-chip.mjs can
+      // assert them without a DOM or a live harness; the page never reads them.
+      __pure: {
+        tokenTag: tokenTag,
+        tokenBody: tokenBody,
+        splitElementTokens: splitElementTokens,
+        contentParts: contentParts,
+        formatClock: formatClock,
+        tokenPath: tokenPath,
+        nextEdit: nextEdit,
+        foldDetectOffset: foldDetectOffset,
+        rawOf: rawOf,
+        createRegistry: createRegistry,
+        makeSource: makeSource,
+        createElementRule: createElementRule,
+        TOKEN_PREFIX: TOKEN_PREFIX,
+        TOKEN_CLOSE: TOKEN_CLOSE,
+        SOURCE_NAME: SOURCE_NAME,
+        TRIGGER: TRIGGER
       }
     };
   }

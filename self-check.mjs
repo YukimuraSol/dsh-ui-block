@@ -51,10 +51,13 @@ const registered = []
 const stubCtx = {
   tools: { register: (definition) => { registered.push(definition); return () => {} } },
   get: (service) => stubContext[service],
-  inject: (services, fn) => { fn({ webServer: { register: (route) => { stubContext.route = route; return () => {} } } }) },
+  // A plugin may mount more than one route now (ui-blocks + the extension
+  // surface), so the stub records them all and keeps `route` as the FIRST one
+  // for the read-route assertion below.
+  inject: (services, fn) => { fn({ webServer: { register: (route) => { stubContext.routes.push(route); if (stubContext.route === undefined) stubContext.route = route; return () => {} } } }) },
   logger: { warn: () => {} }
 }
-const stubContext = {}
+const stubContext = { routes: [] }
 
 apply(stubCtx)
 
@@ -111,9 +114,15 @@ check('output schemas require path and image', () => {
   assert.equal(byName.read_ui_block.output.schema.required.includes('image'), true)
   assert.equal(byName.read_ui_block.output.schema.properties.image.properties.attachmentId.type, 'string')
 })
-check('the read route registered on /ui-blocks', () => {
+check('the read route registered on /ui-blocks (plus the extension surface)', () => {
   assert.equal(stubContext.route.kind, 'prefix')
   assert.equal(stubContext.route.path, '/ui-blocks')
+  // The extension surface is a second prefix route, and it is the only other
+  // one: the reveal action hangs off that same fixed path.
+  const extension = stubContext.routes.find((route) => route.path === '/ui-block-extension')
+  assert.equal(extension !== undefined, true)
+  assert.equal(extension.kind, 'prefix')
+  assert.equal(typeof extension.handler, 'function')
 })
 
 console.log('--- 2. create_ui_block writes body only ---')

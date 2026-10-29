@@ -1,9 +1,16 @@
 {
   "name": "dsh-ui-block",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Page block: render a ::dsh-ui <name> [res=WxH]:: line's ui-blocks file in a sandboxed canvas, in place of that line.",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "extension/"
+  ],
+  "description": "Page block + element chip: render a ::dsh-ui <name> [res=WxH]:: line's ui-blocks file in a sandboxed canvas, and render an element\u00ab...\u00bb token as a composer chip that serializes back to the token verbatim.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js"
