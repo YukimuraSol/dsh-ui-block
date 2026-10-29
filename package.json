@@ -1,0 +1,24 @@
+{
+  "name": "dsh-ui-block",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Page block: render a ::dsh-ui <name> [res=WxH]:: line's ui-blocks file in a sandboxed canvas, in place of that line.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
