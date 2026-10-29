@@ -2207,16 +2207,18 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // -- browser-extension settings tab ------------------------------------
-    // One card in Settings -> Plugins: where the packaged extension lives, a
-    // button that opens that folder, the three steps to load it unpacked, and
-    // the "moving the plugin means reloading the extension" note. The card only
-    // READS the host's fixed path and never sends one, so nothing typed or
-    // clicked here can widen the host's reveal route.
+    // -- browser-extension detail section ----------------------------------
+    // One section under dsh-ui-block's own page in Settings -> Plugins: where the
+    // packaged extension lives, a button that opens that folder, the three steps
+    // to load it unpacked, and the "moving the plugin means reloading the
+    // extension" note. The slot renders it on that page only and gives every
+    // other detail page null. It only READS the host's fixed path and never
+    // sends one, so nothing typed or clicked here can widen the host's reveal
+    // route.
     var EXTENSION_ROUTE = '/ui-block-extension';
     var EXT_SETTINGS_CSS = [
-      '.dshub-ext{display:flex;flex-direction:column;gap:12px;padding:12px;max-width:760px}',
-      '.dshub-ext-title{font:var(--dsw-font-xs-strong-13);color:var(--dsw-alias-label-primary)}',
+      '.dshub-ext{display:flex;flex-direction:column;gap:12px}',
+      '.dshub-ext-title{margin:0;font-size:14px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary)}',
       '.dshub-ext-ver{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}',
       '.dshub-ext-row{display:flex;align-items:center;gap:8px}',
       '.dshub-ext-path{flex:1 1 auto;min-width:0;height:28px;padding:0 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}',
@@ -2248,8 +2250,25 @@ window.__ModuleLoader__.load({
       } catch (e) { /* copying is a convenience, never a requirement */ }
     }
 
-    /** Settings -> Plugins -> 浏览器扩展: locate, copy, reveal, and the 3 loading steps. */
-    function ExtensionSettingsCard() {
+    /** The slot entry the card lives in. The self-check reads this, not the DOM. */
+    var EXT_SETTINGS_ENTRY = { name: 'plugins.detail.section', id: 'ui-block-extension', order: 100 };
+
+    /**
+     * True only for dsh-ui-block's own package page. The slot hands every detail
+     * page the same { subject } props, so the card has to say no to the rest:
+     * official plugins and single rows are 'item' / 'row', and another package is
+     * a 'bundle' whose pkg.name is something else.
+     */
+    function extensionSubjectMatch(subject) {
+      return subject !== null && typeof subject === 'object'
+        && subject.kind === 'bundle'
+        && subject.pkg !== null && typeof subject.pkg === 'object'
+        && subject.pkg.name === 'dsh-ui-block';
+    }
+
+    /** Plugins -> dsh-ui-block: locate, copy, reveal, and the 3 loading steps. */
+    function ExtensionSettingsCard(props) {
+      if (!extensionSubjectMatch(props ? props.subject : undefined)) return null;
       if (react === null || typeof react.useState !== 'function') return null;
       var h = react.createElement;
       var infoState = react.useState({ phase: 'loading', dir: '', version: '' });
@@ -2344,9 +2363,9 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Register the Settings -> Plugins tab. The slots service can still be
-     * inactive at first paint, so read it non-strictly and skip silently when it
-     * is absent; the registration itself waits for the slot declaration.
+     * Register the Plugins -> dsh-ui-block detail section. The slots service can
+     * still be inactive at first paint, so read it non-strictly and skip silently
+     * when it is absent; the registration itself waits for the slot declaration.
      */
     function attachExtensionSettings(ctx) {
       var slots = ctx && typeof ctx.get === 'function' ? ctx.get('slots', false) : undefined;
@@ -2362,15 +2381,10 @@ window.__ModuleLoader__.load({
         };
       }, 'dsh-ui-block: extension settings styles');
       ctx.effect(function () {
-        return slots.inject('settings.plugins.tab', function () {
-          return slots.register({
-            name: 'settings.plugins.tab',
-            id: 'ui-block-extension',
-            order: 92,
-            label: function () { return '浏览器扩展'; }
-          }, ExtensionSettingsCard);
+        return slots.inject(EXT_SETTINGS_ENTRY.name, function () {
+          return slots.register(EXT_SETTINGS_ENTRY, ExtensionSettingsCard);
         });
-      }, 'dsh-ui-block: extension settings tab');
+      }, 'dsh-ui-block: extension detail section');
     }
 
     return {
@@ -2379,7 +2393,7 @@ window.__ModuleLoader__.load({
         // renders a picked element as a chip and what serializes it back, so the
         // canvas picker below can never run before it exists.
         applyElementChip(ctx);
-        // Third half: the packaged browser extension's settings card. Independent
+        // Third half: the packaged browser extension's detail section. Independent
         // of both halves above — it only needs the slots service.
         attachExtensionSettings(ctx);
         if (ctx && typeof ctx.effect === 'function') {
@@ -2401,6 +2415,8 @@ window.__ModuleLoader__.load({
         tokenPath: tokenPath,
         nextEdit: nextEdit,
         foldDetectOffset: foldDetectOffset,
+        extensionSubjectMatch: extensionSubjectMatch,
+        extensionEntry: EXT_SETTINGS_ENTRY,
         rawOf: rawOf,
         createRegistry: createRegistry,
         makeSource: makeSource,

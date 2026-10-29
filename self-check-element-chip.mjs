@@ -16,7 +16,10 @@
  *     refs all resolve);
  *   - a whole draft of tokens round-trips byte for byte through the shell's own
  *     serialize splice;
- *   - the registry is a read-only parse cache: remember / list / tagOf / pathOf.
+ *   - the registry is a read-only parse cache: remember / list / tagOf / pathOf;
+ *   - the packaged extension's card registers into the PLUGINS DETAIL section
+ *     (not the old Settings -> Plugins tab) and its subject guard renders it on
+ *     dsh-ui-block's own page only.
  *
  * Run it from dsh-ui-block: node self-check-element-chip.mjs.
  */
@@ -299,5 +302,20 @@ assert.equal(P.formatClock(new Date(2026, 2, 4, 9, 5).getTime(), clockT, noon), 
 assert.equal(P.formatClock(new Date(2025, 2, 4, 9, 5).getTime(), clockT, noon), '2025-3-4 09:05', 'another year uses clock.ymd');
 assert.equal(P.formatClock(new Date(2026, 9, 9, 0, 0).getTime(), clockT, noon), '00:00', 'midnight pads to 00:00');
 assert.equal(P.formatClock(new Date(2026, 9, 9, 23, 59).getTime(), clockT, noon), '23:59', 'the last minute of the day is 23:59');
+
+// -- 14. the extension card: its slot entry and its subject filter ------------
+// The card used to be a global Settings -> Plugins tab; it now lives in
+// 'plugins.detail.section', so it must register there and must draw nothing on
+// the other detail pages it shares the slot with.
+assert.equal(P.extensionEntry.name, 'plugins.detail.section', 'the card registers as a detail-page section, not a settings tab');
+assert.equal(P.extensionEntry.id, 'ui-block-extension', 'the cell id is its own, so no shipped entry is replaced');
+assert.equal(P.extensionSubjectMatch({ kind: 'bundle', pkg: { name: 'dsh-free-search' } }), false, "another package's detail page gets no card");
+assert.equal(P.extensionSubjectMatch({ kind: 'item', id: 'dsh-ui-block' }), false, "an official plugin's page gets no card");
+assert.equal(P.extensionSubjectMatch({ kind: 'row', rowId: 'dsh-ui-block' }), false, "a row's page gets no card");
+assert.equal(P.extensionSubjectMatch(undefined), false, 'absent props get no card');
+assert.equal(P.extensionSubjectMatch(null), false, 'a null subject gets no card');
+assert.equal(P.extensionSubjectMatch({ kind: 'bundle', pkg: { name: 'dsh-ui-block', version: '0.2.2', rows: [] } }), true, "dsh-ui-block's own detail page DOES get the card");
+// The guard must be the component's first statement, or the filter is decorative.
+assert.ok(source.includes('function ExtensionSettingsCard(props) {\n      if (!extensionSubjectMatch('), 'the card guards on the subject before it renders anything');
 
 console.log('dsh-ui-block element-chip self-check: all assertions passed');
