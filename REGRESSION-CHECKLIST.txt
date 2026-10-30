@@ -1,0 +1,578 @@
+dsh-ui-block 全量回归测试清单
+版本基线：归档仓库 0.2.2 ／ 3080 插件体 0.2.2 ／ 4000 插件体 0.2.2（index.js、client.js、extension 三件、cordis.patch.yml 三份 SHA256 一致；package.json 有差异，见已知问题 1）
+编写日期：2026-10-30　　编写方式：逐文件读 index.js（879 行）+ client.js（2431 行）+ extension/manifest.json、background.js、content.js + 三个 self-check-*.mjs + cordis.patch.yml + README.md；并在 3080 上实跑三个自检、探了四条只读路由
+
+======================================================================
+一、怎么用这份清单
+======================================================================
+
+【1. 适用范围与文件位置】
+
+这份清单测的是 dsh-ui-block 这个包，不是某个实例。三个代码位置：
+
+  归档仓库    D:\cursor编程文件\工作区1相关\工作区1\DSH自研插件\dsh-ui-block（本目录，只读参考）
+  3080 插件体 D:\DSH Pack Launcher\dsh-packs\dsh-origin-3080\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block
+             另有一份实体副本：...\profiles\web\node_modules\dsh-ui-block（不是 junction，见已知问题 3）
+  4000 插件体 D:\DSH Pack Launcher\dsh-packs\dsh-fallback-4000\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block
+
+被测数据都落在 DSH_HOME 下（3080 的 DSH_HOME 是 D:\DSH Pack Launcher\dsh-packs\dsh-origin-3080）：
+
+  块文件      <DSH_HOME>\ui-blocks\<name>.uiblock（HTML 片段，无元信息行、无 <html> 包装）
+  历史        <DSH_HOME>\ui-blocks\.history\<name>\base.uiblock 与 log.json（一行一条 {at, patch}）
+  钉子        <DSH_HOME>\ui-blocks\.pins.json（键 "<name>|<nodeKey>|<index>"，值是 epoch 毫秒）
+  浏览器扩展  <包目录>\extension\（manifest.json + background.js + content.js 三件）
+
+标记约定：本包三份代码一致，条目不再区分实例；凡「实测」字样都是 2026-10-30 在 3080 上跑出来的。
+
+【2. 跑的顺序】
+
+先跑 S0 自检，再按 UB-A → UB-G 走。
+
+  S0 自检（必须在实例插件体目录跑，不要在归档目录跑，理由见 UB-F-01）
+
+      cd "<实例>\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block"
+      node self-check.mjs                     期望末行 self-check: 26 checks OK
+      node self-check-uiblock-directive.mjs   期望末行 self-check-uiblock-directive: 46 assertions passed
+      node self-check-element-chip.mjs        期望末行 dsh-ui-block element-chip self-check: all assertions passed
+      node self-check.mjs --shot              需 4000 在跑；不在跑会打印 SKIPPED，不算通过
+
+  然后 UB-A（指令与渲染）→ UB-B（元素 chip）→ UB-C（扩展卡片）→ UB-D（浏览器扩展）
+      → UB-E（宿主路由）→ UB-F（自检与探针）→ UB-G（边界）。
+
+  顺序上的三条硬约束：
+    · B-12（画布内选区）依赖 UB-A 的块已经渲染出来，不能先跑。
+    · UB-D 要真实浏览器装好扩展，与 DSH 实例无关，可以并行准备。
+    · E-06（POST /reveal）会真的弹出资源管理器并选中目录，放到最后一条做。
+
+  每条之间新开一条消息，或至少刷新页面：同一个页面上残留的块会污染 stats.blocks 与 live 数组的下标。
+
+【3. 怎么触发（四种通道，条目里会指名用哪一种）】
+
+  UI 通道     消息里的 ::dsh-ui 行、块横栏按钮、插件详情页的扩展卡片、composer、画布内选区图标。
+  消息通道    发一条消息，正文里放独立一行的引用；res= 写在名字后面。
+  文件通道    直接读写 <DSH_HOME>\ui-blocks\*.uiblock（改完 1.5 秒内画布应自己重绘）。
+  接口通道    loopback HTTP，例如：
+                Invoke-RestMethod http://127.0.0.1:3080/ui-block-extension
+              3080 上这四条只读 GET 实测不需要 token；若某实例回 401，从 launcher.out.log 的
+              dsh web: 行取 token 再带 ?token=。
+  扩展通道    点浏览器工具栏图标 → 选元素 → 确定 → 粘进 composer。
+
+【4. 判定标准】
+
+  PASS     操作能重复做到；「期望」里列的每一项都观察到了（DOM 属性、精确文案、HTTP 状态码与
+           JSON 字段、日志整行、文件内容与文件名、进程内计数），而不是「界面看起来正常」。
+  PARTIAL  只对上一部分，必须写明哪一项没对上。
+  FAIL     稳定复现的对不上。
+  BLOCKED  跑不动（实例没起、机器没装 Edge、浏览器没装扩展、拿不到 token），不算失败。
+
+  精确字符串逐字比对（例如「未声明，使用默认」「画布分辨率 820×510」「已打开：」「宽高要填正整数」），
+  文案是模型与用户的输入，改一个字就是行为变更。
+  数值型期望给容差：时间 ±0.5 秒；尺寸按整数像素；zoom 按 0.001 比较。
+
+【5. 失败怎么记】
+
+  每条失败照下面的模板记一行，写在单独的记录文件里，不要改本文件：
+
+    [编号] FAIL | 实例 3080 或 4000 | 包版本 0.2.2 | 时间 | 会话 id
+      现象：看到了什么（原文 / DOM 片段 / JSON / 截图路径）
+      对照：源码 file:line 说的应该是什么
+      复现：N/N 次
+
+  硬规矩：本清单只做记录。发现缺陷不改代码、不改配置、不重启实例；
+  任何修复都走「4000 改 → 4000 重启验证 → 才允许同步 3080 与归档」的顺序。
+
+【本机限制】剪贴板不可观测
+  实测：Set-Clipboard 'hello123' 后 Get-Clipboard -Raw 长度仍为 0；
+        页面内 navigator.clipboard.readText() 返回 ""（writeText 不抛、hasFocus() 为 true）。
+  受影响条目：A-13 / B-02 / B-08 / C-05 / D-10 / D-11 / D-14。
+  这些条目的「剪贴板里是什么」在本机只能判 PARTIAL 或 BLOCKED，不是插件失败。
+  换一台剪贴板正常的机器可以补测。
+
+======================================================================
+二、指令与渲染　UB-A
+======================================================================
+
+  说明（2026-10-30 实测修订，先读这一段）：指令只能出现在助手的 markdown 回复里 —— 那里才有 <p>。
+  这是设计行为，不是缺陷，也不是待修项。
+
+    桌面端的用户气泡由本插件自己的 conversation.chat.node（key=user、priority=-1）重绘成
+      div.Sixlwa_userRow[data-element-chip-bubble=history] > div.Sixlwa_userStack > div.Sixlwa_bubble > span
+    （white-space: normal，没有 <p> 元素）；而 sweep() 只扫 document.querySelectorAll('p, li')（client.js:1969-1991）。
+    所以「用户发一条消息，正文里单独一行写 ::dsh-ui <name>::」这条路在桌面端永远不触发：那行只会原样
+    显示成文字，不建画布，也不报错。引用由助手发出，用户气泡只负责显示与 chip 化（见 UB-B-05）。
+
+    本分类所有条目按下面两句话读：
+      · 「操作」里的发消息一律指「让助手在回复里输出以下 markdown」，由助手发出，不是用户发出；
+      · 需要「画布已渲染」作前置的条目（A-09、A-12～A-16），先用一条助手回复把块引用出来，再动手。
+
+[UB-A-01] 独立一行 ::dsh-ui <name>:: 触发画布，原行隐藏
+  操作：新建块 probe-a01（用 create_ui_block，或直接写 <DSH_HOME>\ui-blocks\probe-a01.uiblock）。让助手在回复里输出以下 markdown：单独一行 ::dsh-ui probe-a01::，上下各留一段普通文字。
+  期望：该行元素 style.display 变成 none；紧跟其后出现 div.dshpb-seat > div.dshpb-host > div.dshpb-shell > iframe.dshpb-frame；控制台 __dshPageBlock.sweep().live[0].ref 等于 ui-blocks/probe-a01.uiblock；消息正文里看不到路径文本。
+  源码：client.js:108（DIRECTIVE_RE 整行锚定）+ client.js:1783-1784（座位插到行后、原行隐藏）+ client.js:1986-1989（sweep 命中后 ensureSeat）
+[UB-A-02] res=WxH 决定画布尺寸，横栏按钮显示同一对数
+  操作：让助手在回复里输出以下 markdown：::dsh-ui probe-a02 res=820x510::（块内容任意）。
+  期望：iframe 的 width/height 属性与 CSS 尺寸都是 820/510；横栏按钮文字是 820×510；sweep().live[0].res 为 820×510、declared 为 true；横栏不出现「未声明，使用默认」。
+  源码：client.js:127（res 解析进 directive）+ client.js:1937-1940（采用行上的 res）+ client.js:1311（按钮文案）+ client.js:1407（note 只在未声明时挂）
+[UB-A-03] 缺 res 用 1440×900，并显示「未声明，使用默认」
+  操作：让助手在回复里输出以下 markdown：::dsh-ui probe-a03::（不写 res）。
+  期望：画布 1440×900；按钮显示 1440×900；sweep().live[0].declared 为 false；横栏出现 span.dshpb-note，文字逐字是「未声明，使用默认」。
+  源码：client.js:135-137（directiveRes 回默认）+ client.js:1402-1407（note 文本与挂载条件）
+[UB-A-04] 行内多一个字、缺冒号、两个指令挤一行都不触发
+  操作：让助手在回复里依次输出以下四行 markdown：::dsh-ui probe-a01:: 看这里 ／ 看这里 ::dsh-ui probe-a01:: ／ ::dsh-ui probe-a01 ／ ::dsh-ui probe-a01:: ::dsh-ui probe-a01::。
+  期望：四条都不出现 .dshpb-seat；四条都按原样显示文字；sweep().stats.blocks 不因它们增加。
+  源码：client.js:108（^ 与 $ 之间只允许空白）+ client.js:120-129（parseDirectiveLine 返回 null）
+[UB-A-05] 围栏里的同一行不算触发；反引号包住的行内代码仍会挂座位
+  操作：让助手在回复里输出以下 markdown：先一段 ```dsh-ui 围栏，块体第一行写 ::dsh-ui probe-a01::；再单独一行用反引号包住整行 ::dsh-ui probe-a01::。
+  期望：围栏那段渲染成普通代码块、没有 .dshpb-seat —— 它产出 <pre><code>，既不在 sweep() 的 p、li 扫描集里，也会被 isPageChrome 的 pre、code 命中。反引号那行**会**挂座位：它渲染成 <p><code>::dsh-ui probe-a01::</code></p>，sweep() 命中的是外层 <p>，而 isPageChrome 只看 node.closest(...) 的祖先链 —— <code> 是 <p> 的子节点，不在祖先链上，因此不构成豁免；现象是该行 display 变 none、行后出现 .dshpb-seat，stats.blocks 为 1 而不是 0。控制台无警告。
+  源码：client.js:108（模式里没有反引号字符）+ client.js:1737-1739（isPageChrome 只看祖先链：closest('[contenteditable="true"], [data-lexical-editor], pre, code')）+ client.js:1969-1991（sweep 只扫 p、li，先按长度与 ::dsh-ui 粗筛再查 isPageChrome）
+[UB-A-06] 非法 res 让整行作废，不是退回默认尺寸
+  操作：让助手在回复里依次输出以下四行 markdown：::dsh-ui probe-a01 res=axb:: ／ res=0x0:: ／ res=820:: ／ res=820x510x9::。
+  期望：四行都保持纯文本，都不渲染；这一条与 UB-A-03 的区别是：整行不命中，而不是「用 1440×900 渲染」。
+  源码：client.js:120-129（正则不匹配即 null）+ self-check-uiblock-directive.mjs:151-161（同一组断言）
+[UB-A-07] 合法但极端的 res 被钳到 200–6000
+  操作：让助手在回复里输出以下 markdown：::dsh-ui probe-a07 res=10x10::，再一行 ::dsh-ui probe-a07 res=99999x99999::。
+  期望：前者画布 200×200、按钮 200×200；后者画布 6000×6000、按钮 6000×6000；两条 declared 都是 true。
+  源码：client.js:69-70（MIN_RES 200 / MAX_RES 6000）+ client.js:138-142（clampRes）
+[UB-A-08] 文件不存在：不建画布，按 1.5 秒节流重试，stats 记一笔
+  操作：让助手在回复里输出以下 markdown：::dsh-ui no-such-block::；等 3 秒，期间在控制台读 __dshPageBlock.ref("ui-blocks/no-such-block.uiblock")。
+  期望：页面没有 .dshpb-seat；ref() 返回 {text: null, pending: false, error: 含 HTTP 404}；sweep().stats.refWait 最多每 1.5 秒加 1；控制台没有未捕获异常。
+  源码：client.js:2054-2074（失败缓存为 null 并记 error）+ client.js:1138（REF_TTL 1500）+ client.js:2087-2093（节流重试）
+[UB-A-09] 改块文件后 1.5 秒内自动重绘，不用刷新
+  操作：块已渲染。用编辑器或 write/edit 改 .uiblock 里一段可见文字（例如标题），等 2 秒。
+  期望：画布内文字更新；__dshPageBlock.ref() 的 fetchedAt 变大；页面没刷新；sweep().live 仍是同一条（converted 不变）；块位置与缩放不变。
+  源码：client.js:2004-2006（TTL 到期重读）+ client.js:2081-2085（refStale）+ client.js:1883-1890（body 变了才重建，否则只重刷主题）
+[UB-A-10] 引用按消息时刻冻结：老消息不随后续修改变化
+  操作：让助手在回复里输出以下 markdown 作为消息 1：::dsh-ui probe-a10::（文件内容 v1）；把文件改成 v2；再让助手在另一条回复里输出同一行作为消息 2；回看消息 1。
+  期望：消息 1 仍显示 v1，消息 2 显示 v2；<DSH_HOME>\ui-blocks\.pins.json 出现键 probe-a10|<nodeKey>|0，值是毫秒数；带 ?pin= 的 GET 响应头 x-uiblock-at 等于该毫秒数而不是 live；该引用不再 1.5 秒轮询（网络面板静默）。
+  源码：client.js:2034-2044（pinOf / refKeyOf）+ client.js:2061（请求带 ?pin=&i=）+ client.js:2081-2085（钉住的不重读）+ index.js:741-770（宿主按 moment 回放）
+[UB-A-11] 一条消息里两个引用各自成画布，index 从 0 递增
+  操作：让助手在一条回复里输出以下两行 markdown，分别引用 probe-a11a 与 probe-a11b。
+  期望：出现两个 .dshpb-seat；sweep().live 有两条，pin.index 分别是 0 与 1；.pins.json 里两个键分别以 |0、|1 结尾。
+  源码：client.js:2014-2028（refIndexIn 按文档序数）+ client.js:1974-1990（sweep 扫 p、li）
+[UB-A-12] 沙箱只有 allow-same-origin，脚本与外链都不生效
+  操作：块体里写 <script>window.__ran=1</script> 和一个指向 https 的外链 img。渲染后读 __dshPageBlock.picker.state(0).sandbox，并在 devtools 里选中 iframe 看它的 document。
+  期望：sandbox 属性恰为 allow-same-origin（没有 allow-scripts）；iframe 内 window.__ran 为 undefined；外链图 naturalWidth 为 0；iframe 有 referrerpolicy=no-referrer；iframe 的 title 等于块名。
+  源码：client.js:1774-1775（sandbox 与 referrerpolicy）+ client.js:1941（title=name）+ client.js:977（CSP 串）
+[UB-A-13] 横栏是真 CodeBlock：标签 dsh-ui、复制路径、没有换行开关
+  操作：鼠标移到块横栏，点复制按钮；读横栏文本与按钮集合。
+  期望：横栏左侧语言标签逐字是 dsh-ui；剪贴板得到 ui-blocks/<name>.uiblock；横栏里没有「自动换行 / 不换行」按钮（buildControls 会摘掉带 aria-pressed 的旧按钮）；剩下的 aria-pressed 按钮只有选区图标，aria-label 是「在画布内选取元素」；.md-code-block.dshpb-active 里的 pre 被 CSS 隐藏（画布占据 body 槽）。
+  源码：client.js:78-81（LANG_LABEL / COPY_LABEL）+ client.js:1824-1837（CodeBlock 的 code=路径、lang、toolbarLabels）+ client.js:1370-1375（摘旧 aria-pressed）+ client.js:1390-1391（选区按钮自己的 aria-pressed）+ client.js:996（pre display:none）
+[UB-A-14] 滚轮朝光标缩放 20%–400%，不重排画布
+  操作：画布上滚轮向上 10 次、向下 15 次，每次读 sweep().live[0].zoom 与 res。
+  期望：zoom 每次乘或除 1.1，钳在 0.2 与 4 之间；res 始终不变；iframe 的 width/height 不变，只有 transform 变；双击画布后 autoFit 为 true、zoom 回到适应宽度、画布重新居中（不再是拖动后的偏移）。
+  源码：client.js:71-73（ZOOM_MIN / ZOOM_MAX / WHEEL_STEP）+ client.js:1429-1446（朝光标缩放）+ client.js:1292-1294（尺寸与 transform 分离）+ client.js:1473-1477（双击复位）
+[UB-A-15] 外框高度默认 min(画布高×适应, 480)，拖把手改，双击复位
+  操作：块用 1440×900。先读 sweep().live[0].viewH；把下缘把手向上拖 200px；再双击把手。
+  期望：初始 viewH 等于 min(900×fitZoom, 480)（宽栏时是 480）；拖动后 viewH 变小、userViewH 为 true、hDeclared 为 true；双击后 userViewH 为 false、hDeclared 为 false、viewH 回到默认值。
+  源码：client.js:1251-1254（defaultViewH）+ client.js:1479-1506（把手拖动与双击）+ client.js:1256-1261（resetViewH 清标记）+ client.js:74-76（MIN_VIEW_H / FALLBACK_VIEW_H）
+[UB-A-16] 分辨率菜单：四个预设 + 自定义，非法输入只 toast 不改尺寸
+  操作：点横栏尺寸按钮 → 选「手机 390×844」；再点开，宽高填 0 点「应用」；再填 800×600 应用。
+  期望：选预设后画布 390×844，toast 逐字「画布分辨率 390×844」；填 0 时 toast「宽高要填正整数」且尺寸不变；自定义 800×600 生效并 toast 同样格式。
+  源码：client.js:63-68（PRESETS 四条）+ client.js:1314-1363（菜单与自定义）+ client.js:1326、1350（两句 toast）
+[UB-A-17] 超过 110 字符的行不渲染；列表项只渲染一次
+  操作：让助手在一条回复里输出以下 markdown：一行「前缀文字很多……::dsh-ui probe-a01::」（整行超过 110 字符）；再在另一条回复里输出「- ::dsh-ui probe-a01::」写成列表项。
+  期望：超长行保持纯文本、不渲染；列表项只出现一个画布（LI 里套 P 时跳过 LI，只认 P），不会一屏两个。
+  源码：client.js:110（DIRECTIVE_MAX 110）+ client.js:1981（先按长度与标记粗筛）+ client.js:1984（LI 套 P 时跳过 LI）
+[UB-A-18] 绕过 create_ui_block 直接写文件也能渲染（与工具描述相反）
+  操作：用 write 直接写 <DSH_HOME>\ui-blocks\probe-a18.uiblock（内容任意 HTML），然后让助手在回复里输出以下 markdown：::dsh-ui probe-a18::；再调用 read_ui_block。
+  期望：引用照常渲染；read_ui_block 也能出图；首次读取时宿主补建 .history\probe-a18\base.uiblock 与空 log.json。也就是说工具描述里「用 write 创建的文件找不到」这句与实现不符（见已知问题 6）。
+  源码：index.js:496-503（只查文件存在）+ index.js:733-737（读取时补记历史）+ client.js:2054-2075（客户端只按路径取）
+
+======================================================================
+三、元素 chip　UB-B
+======================================================================
+
+[UB-B-01] 粘贴 element«…» token 后变 chip，标签是它自己的标签名
+  操作：把扩展产出的 token（或手写一份三行 token）粘进 composer。
+  期望：composer 里显示成带 @ 标记的 chip，文字是 <button> 这类标签名，而不是三行原文；@ 菜单里能查到该 token；草稿的纯文本投影里 token 不再裸露。
+  源码：client.js:835-855（consumePaste 每次改一处）+ client.js:846-854（slash/input-insert-reference）+ client.js:348-365（nextEdit 找下一个未成 chip 的 token）
+[UB-B-02] 发送后的正文与粘贴内容逐字节相同
+  操作：粘 token + 说明文字，发送；用气泡上的复制按钮取回文本，与粘贴内容比对。
+  期望：两者逐字节相同（含 element«、三行、»）；序列化不追加任何后缀、不加编号；把整段再粘回 composer 不会变长。
+  源码：client.js:493-503（serialize 是恒等函数）+ client.js:482-486（clipboardText 恒等）+ self-check-element-chip.mjs:197-244（往返逐字节断言）
+[UB-B-03] chip 标签取自 token 自己的 HTML Element 行，属性里的 > 不干扰
+  操作：token 的 HTML Element 行写 <a title="a>b" href="#">x</a>；另造一个 <my-widget part="x"> 的 token。
+  期望：两个 chip 的标签分别是 <a> 与 <my-widget>；不会出现 <a title=… 这种半截标签，也不会因为属性里的 > 截断。
+  源码：client.js:181（TAG_RE 只取第一个标签名）+ client.js:315-322（tokenTag 要求首尾都匹配）
+[UB-B-04] 畸形 token 保持纯文本，不吞掉后面的好 token
+  操作：造三个畸形 token（element« 与闭合 » 都在，只坏 HTML Element 行），每个后面各放一个合法 token：① HTML Element 行写成 <>；② HTML Element 行只有普通文字、没有标签（例如 HTML Element: button）；③ 整行 HTML Element 缺失。
+  期望：三种都原样留在文本里、不成 chip；同一草稿里排在它们后面的合法 token 仍然成 chip；历史气泡里同样如此（畸形在文本 run 里，合法的是 chip）。判定边界在 TAG_RE：只要求 HTML Element: 后面是 < 加一个字母（[A-Za-z][A-Za-z0-9-]*），不要求右括号、也不看属性 —— 所以 <button（缺 >）仍会成 chip、标签就是 <button>；只有 < 后面不是字母（<>、<1bad>）或整行取不到标签时才判为畸形。
+  源码：client.js:181（TAG_RE = /HTML Element:\s*<([A-Za-z][A-Za-z0-9-]*)/）+ client.js:315-322（tokenTag：先验 element« 与 »，再靠 TAG_RE 取标签，取不到返回 null）+ client.js:358-364（nextEdit 跳过 tag 为 null 的） + client.js:243-249（splitElementTokens 同一规则）+ self-check-element-chip.mjs:124-134
+[UB-B-05] 历史气泡用影子渲染器画 chip，普通消息 DOM 不变
+  操作：发一条含 token 的消息，刷新页面看历史；再发一条不含 token 的普通消息。
+  期望：含 token 的气泡根节点带 data-element-chip-bubble=history；chip 是 span[data-element-chip=history]，内含 @ 与标签；普通消息的类名、附件行、动作行与时钟与内置渲染一致，且不多出任何 chip 相关节点（data-element-chip 与 data-element-chip-bubble 都不出现）。
+  源码：client.js:734-743（priority -1 抢 conversation.chat.node 的 user 单元）+ client.js:721（根节点标记）+ client.js:522-531（chip 结构）
+[UB-B-06] steering / 提交回显 / 命令气泡里的 token 也成 chip
+  操作：在 assistant 正在跑的一轮里发一条含 token 的消息（走 steering 路径），观察右侧回显。
+  期望：回显里是 chip 而不是原文 token；走的是 conversation.user.text.node 的 element 规则，不是 chat.node；禁用 uiConversation 时退回原文但不报错。
+  源码：client.js:757-794（createElementRule 与注册）+ client.js:547-552（ElementTextNode 读 data.token）+ client.js:782-784（缺服务直接返回）
+[UB-B-07] chip 的 tooltip 是 token 的三行内容，不含 guillemet
+  操作：鼠标悬停历史气泡里的 chip。
+  期望：原生 tooltip 显示 DOM Path: … / Position: … / HTML Element: …（旧 token 带 Styles 行就是四行），首尾不含 element« 与 »。
+  源码：client.js:221-224（tokenBody 去掉包装）+ client.js:526（title 用它）
+[UB-B-08] 历史气泡动作行：复制按钮 + 时钟
+  操作：点气泡右侧复制按钮；再发一条昨天的消息看时钟。
+  期望：按钮 aria-label 从「复制」变「已复制」（中文界面；其它语言是对应词），约 1 秒后复原；剪贴板是整条消息文本（token 原样）；当天消息显示 HH:mm，当年更早显示 M/D HH:mm，跨年显示 YYYY-M-D HH:mm。
+  源码：client.js:567-598（HistoryActions）+ client.js:293-300（formatClock 三档）+ client.js:723（动作行挂在气泡上）
+[UB-B-09] @ 菜单能再次插入记住的 token，并按标签过滤
+  操作：粘过一个 token 后，在 composer 打 @，输入 <h。
+  期望：菜单出现 <h1> 一项，描述是它的 DOM Path；选中后插入 chip；空查询按首次出现顺序列出全部记住的 token；重复粘同一个 token 不会多出一项。
+  源码：client.js:448-505（makeSource：candidates / onPick / codec）+ client.js:413-437（registry 只增不重）+ client.js:463-465（按 label 过滤）
+[UB-B-10] 序列化永不抛：空、非字符串、未知 ref 都退化成字符串
+  操作：在控制台用 __pure.makeSource(registry) 造一个 source，依次调 codec.serialize(null / undefined / 123 / {} / 未知 ref)。
+  期望：全部 resolve 成字符串（空串、"123"、"[object Object]" 之类），没有 reject；未知 ref 原样返回。理由：serialize 一旦 reject 会阻塞整条发送。
+  源码：client.js:493-503（Promise.resolve 包住并 try/catch）+ self-check-element-chip.mjs:184-195（同一组断言）
+[UB-B-11] 草稿里已有 chip 时，第二个 token 的插入位置不偏
+  操作：先粘一个 token 让它成 chip，再在它后面粘第二个 token。
+  期望：第二个 chip 插在正确位置，不覆盖第一个；草稿文本里两个 token 顺序不变；落在 chip 内部的偏移会被折算函数判为 null，这次编辑放弃、下一轮重试，而不是插错地方。
+  源码：client.js:375-388（foldDetectOffset）+ client.js:842-844（折算失败就 return）+ client.js:348-354（跳过已 chipped 的偏移）
+[UB-B-12] 画布内选区：点元素直接生成 token 进 composer
+  操作：点块横栏的选区图标（13×13 箭头），在画布内点一个按钮。
+  期望：composer 出现以该元素标签命名的 chip；token 是三行（DOM Path / Position / HTML Element）；picker.state(0).armed 仍为 true（可连续选）；再点图标后 buttonLit 为 false、蓝框消失。
+  源码：client.js:1643-1657（pickSelect 取 captureInsertion 后发事件）+ client.js:1562-1567（pickEmit）+ client.js:1687-1730（armPick / 退出）
+[UB-B-13] 选区的滚轮与方向键导航，Enter / Esc 不绑
+  操作：选区点亮后：滚轮上下滚，按 ↑ ↓ ← →，再按 Enter 与 Esc。
+  期望：滚轮在层叠栈里换层且不触发画布缩放；↑ 选父、↓ 选首个子、← → 选兄弟；Enter 与 Esc 都不改变选区、也不退出（退出只靠再点图标）。
+  源码：client.js:1600-1614（滚轮切层）+ client.js:1616-1634（方向键，1629 行明写 Enter/Escape 不绑）
+
+======================================================================
+四、扩展卡片　UB-C
+======================================================================
+
+[UB-C-01] 卡片注册进 plugins.detail.section，id 与 order 固定
+  操作：控制台读 __pure.extensionEntry；或打开 设置 → 插件 → dsh-ui-block 详情页。
+  期望：条目对象是 {name: plugins.detail.section, id: ui-block-extension, order: 100}；详情页底部出现 div[data-dsh-ui-block-extension=card]。
+  源码：client.js:2254（EXT_SETTINGS_ENTRY）+ client.js:2383-2387（inject + register）
+[UB-C-02] 只在 dsh-ui-block 自己的详情页出现
+  操作：依次打开 dsh-ui-block、dsh-free-search（或任一官方插件）、以及某条单行插件的详情页。
+  期望：只有 subject.kind 为 bundle 且 subject.pkg.name 为 dsh-ui-block 的页面有卡片；其它页面返回 null，不渲染、不发请求。
+  源码：client.js:2262-2271（subject 守卫是组件第一句）+ self-check-element-chip.mjs:306-319（五种 subject 的断言）
+[UB-C-03] 版本号来自 extension/manifest.json，不是写死的常量
+  操作：GET /ui-block-extension，把返回的 version 与 extension/manifest.json 的 version 比对；在测试环境把 manifest 改成 9.9.9 重启后再看卡片。
+  期望：卡片第二行逐字「扩展版本 0.2.2 · 与插件 package.json 同版」；GET 返回 version 0.2.2、name dsh-element-picker、manifestVersion 3；改 manifest 后卡片跟着变（证明读的是文件）。
+  源码：client.js:2343（文案）+ index.js:74-78（readExtensionManifest）+ index.js:807-815（响应字段）
+[UB-C-04] 目录字段只读，加载中与失败各有文案
+  操作：打开详情页的瞬间看输入框；再让路由返回 500（测试环境改名 extension 目录）后刷新。
+  期望：加载中显示「读取中…」；成功显示绝对路径（3080 实测 ...\profiles\web\node_modules\dsh-ui-block\extension）；失败显示「（读取失败）」，卡片下方出现红字「读取扩展目录失败：…」。
+  源码：client.js:2340（pathValue 三态）+ client.js:2293-2299（失败文案）
+[UB-C-05] 复制路径按钮
+  操作：点「复制路径」。
+  期望：剪贴板是目录绝对路径；按钮文字变「已复制」，1.6 秒后复原；navigator.clipboard 不可用时走 textarea + execCommand 兜底，仍然显示已复制。
+  源码：client.js:2303-2320（copyDir 两条路径）+ client.js:2352（按钮文案）
+[UB-C-06] 打开文件夹：带 CSRF 头的 POST，成功与失败各有文案
+  操作：点「打开文件夹」。
+  期望：先出现「正在打开文件夹…」；请求是 POST /ui-block-extension/reveal 且带请求头 x-dsh-ui-block-reveal: 1；成功后变成「已打开：<dir>」并弹出资源管理器选中 extension 目录；把头去掉直接 POST 得到 403。
+  源码：client.js:2322-2338（reveal 与三种文案）+ index.js:825-849（头部校验与 explorer 调用）
+[UB-C-07] 卡片正文：标题、三步加载说明、换目录要重载的提示
+  操作：读卡片全文。
+  期望：标题「浏览器扩展 dsh-element-picker」；有序列表三条逐字为「打开 chrome://extensions」「打开右上角的「开发者模式」」「点「加载已解压的扩展程序」，选上面这个目录」；下方提示含「重新加载一次扩展」。
+  源码：client.js:2341-2360（卡片 JSX 全文）
+[UB-C-08] 卡片样式独立成标签，随卸载移除，不污染全局
+  操作：看 head 里的 style[data-plugin-css]；禁用插件后刷新。
+  期望：存在 style[data-plugin-css=dsh-ui-block-extension]（与画布那份 dsh-ui-block 分开）；插件卸载后两个标签都不在；类名全部 dshub- 前缀，不覆盖宿主类名。
+  源码：client.js:2219-2231（EXT_SETTINGS_CSS）+ client.js:2373-2382（effect 挂载与清理）+ client.js:1153-1156（画布那份）
+[UB-C-09] 卡片不发送任何路径参数
+  操作：抓包看卡片的两个请求。
+  期望：GET 无 query；POST 无 body、无 path 字段；宿主侧只按固定目录应答，请求值进不了 extensionDir()。
+  源码：client.js:2210-2217（注释：只读宿主给的固定路径）+ client.js:2286、2324-2329（两个请求）+ index.js:778-784（路由不接受路径参数）
+
+======================================================================
+五、浏览器扩展　UB-D
+======================================================================
+
+[UB-D-01] manifest 三要素：MV3、名字、版本与包同版
+  操作：读 extension/manifest.json，与 package.json 比对。
+  期望：manifest_version 为 3；name 为 dsh-element-picker；version 为 0.2.2 且与 package.json 相同；permissions 恰为 [activeTab, scripting]；background.service_worker 为 background.js；action.default_title 存在。
+  源码：extension/manifest.json:2-8 + package.json:3
+[UB-D-02] 没有 host_permissions、storage、WebSocket，也没有宿主桥
+  操作：读 manifest 与 background.js 头注释；在三个扩展文件里搜 fetch / WebSocket / chrome.storage。
+  期望：manifest 无 host_permissions；background.js 无 WebSocket、无 storage；content.js 不发任何网络请求；跨进程通道只有 chrome.runtime.onMessage 与 chrome.tabs.sendMessage；与 DSH 宿主的唯一交接是剪贴板。
+  源码：extension/background.js:1-4（设计声明）+ extension/content.js:102-104（唯一的 onMessage）
+[UB-D-03] 点图标 → 向所有 frame 注入 → 广播开始
+  操作：在有 iframe 的普通网页上点扩展工具栏图标。
+  期望：执行 chrome.scripting.executeScript({target:{tabId, allFrames:true}, files:[content.js]})，随后 sendMessage(tabId, {type: dsh-picker-start})；顶层出现工具栏，iframe 内不出现第二个工具栏。
+  源码：extension/background.js:15-23（pick）+ extension/content.js:271-273（只有顶层挂 UI）
+[UB-D-04] 受限页面报错：红色感叹号徽标 2.5 秒
+  操作：在 chrome://extensions 或 edge:// 页面点图标。
+  期望：不注入；徽标文字变 !、底色 #b91c1c；2.5 秒后清空；控制台 warn 一行 [dsh-element-picker] Cannot pick on this page: …。
+  源码：extension/background.js:11（协议白名单）+ extension/background.js:25-30（reportError）
+[UB-D-05] 重复点图标幂等
+  操作：连续点两次图标。
+  期望：第二次直接 return（globalThis.__dshElementPickerInstalled 已为 true）；页面上仍只有一个 [data-dsh-element-picker-ui] 工具栏，监听器没有叠加。
+  源码：extension/content.js:8-9（安装守卫）+ extension/content.js:102-104（每次 start 只走一条路径）
+[UB-D-06] 工具栏结构与文案
+  操作：点图标后读工具栏 DOM。
+  期望：根节点 data-dsh-element-picker-ui=true；标题栏有 ⣿、「拖动此处移动面板」、居中的「选取 / 浏览」两个按钮、右侧「确定」；输入区 data-dsh-element-picker-field=true，其左侧占位文字逐字「点页面元素加入引用，可直接打字说明」；右下有 resize grip。
+  源码：extension/content.js:129-140（工具栏）+ extension/content.js:154-209（标题栏与模式开关）+ extension/content.js:18（placeholder）+ extension/content.js:263-270（grip）
+[UB-D-07] token 是三行，没有 Styles 行
+  操作：选一个元素，点确定，粘到文本编辑器里看。
+  期望：形如 element«DOM Path: … / Position: top=..px, left=..px, width=..px, height=..px / HTML Element: <tag …>text</tag>»；没有 Styles: 行；没有 [N] 标记，也没有附录。
+  源码：extension/content.js:549-560（tokenFor 三行）+ extension/content.js:11-13（token 常量的契约注释）
+[UB-D-08] 属性最多 8 个、文本最多 80 字，超出加省略
+  操作：选一个属性很多、文字很长的元素。
+  期望：HTML Element 行最多 8 个属性，多出的写成 ...+N more；文本超过 80 字符截断并加 …；只印元素自己的文本，不展开子节点标记。
+  源码：extension/content.js:15-17（MAX_ATTRS 8 / MAX_TEXT 80）+ extension/content.js:539-547（截断实现）
+[UB-D-09] «、» 与反斜杠按规则转义
+  操作：选一个文本里含 «、» 或反斜杠的元素，看 token。
+  期望：token 里出现 \u00ab、\u00bb、\\；第一个裸 » 一定是 token 结尾；把 token 粘进 composer 后仍是一个 chip，而不是被截成两段。
+  源码：extension/content.js:530-535（escapeToken）+ extension/content.js:552-560（拼接处）
+[UB-D-10] 确定 = 写剪贴板并关闭；空内容直接关
+  操作：不选元素直接点「确定」；再选一个元素点「确定」。
+  期望：空内容时不写剪贴板，面板直接关闭；有内容时剪贴板是 body 文本（尾部空白被去掉），写入成功后关闭面板，页面上的蓝框与编号一起消失。
+  源码：extension/content.js:788-792（confirm 与空内容分支）+ extension/content.js:735-737（clipboardText 去尾空白）
+[UB-D-11] 剪贴板三级兜底
+  操作：设 globalThis.__dshElementPickerForceFallback = true 后点确定；或在浏览器里拒绝剪贴板权限。
+  期望：先试 navigator.clipboard.writeText；失败转 execCommand(copy) 的离屏 textarea；再失败弹出只读 textarea 并显示「剪贴板被拦截：请按 Ctrl+C 复制」，面板不关闭。
+  源码：extension/content.js:739-766（writeClipboard 三级）+ extension/content.js:768-786（manual 面板与提示）
+[UB-D-12] 键盘：Enter 提交、Shift+Enter 换行、输入法不误发、Backspace 删 chip
+  操作：在输入区用中文输入法打「确定」并按 Enter；再按 Shift+Enter；再按 Backspace。
+  期望：组字中的 Enter 只上屏不提交（isComposing / composing / keyCode 229 三重判断）；Shift+Enter 插入换行；Backspace 或 Delete 删除紧邻的 chip 一次到位；Esc 取消整个面板。
+  源码：extension/content.js:469-483（onFieldKey）+ extension/content.js:437-457（相邻 chip 判定）
+[UB-D-13] 浏览模式把页面事件交还，Esc 两种模式都退出
+  操作：点「浏览」，打开页面上的下拉菜单或链接；再按 Esc。
+  期望：浏览模式下点击、滚轮都归页面（block 直接 return），工具栏 data-dsh-element-picker-mode 为 browse；Esc 在两种模式下都关闭面板并撤销全部监听。
+  源码：extension/content.js:798-819（onKey）+ extension/content.js:855-858（browsing 早退）+ extension/content.js:212-236（模式与广播）
+[UB-D-14] 端到端：扩展产出的 token 粘进 composer 成 chip
+  操作：用扩展选 DSH 页面里的一个按钮 → 确定 → 粘进 composer → 发送。
+  期望：composer 里是标签为 <button> 的 chip；发送后消息正文是 token 原文；历史气泡里也是 chip；悬停 tooltip 是那三行。
+  源码：extension/content.js:552-560（产出）+ client.js:348-365（入稿成 chip）+ client.js:522-531（历史 chip）
+
+======================================================================
+六、宿主路由　UB-E
+======================================================================
+
+  说明：以下端口按实例替换（3080 / 4000）。除 E-06 外全部只读，可以随便跑；E-06 会弹资源管理器，放最后。
+
+[UB-E-01] GET /ui-block-extension 返回 200 与五个字段
+  操作：Invoke-RestMethod http://127.0.0.1:3080/ui-block-extension。
+  期望：200，JSON 含 ok:true、dir、version、name、manifestVersion；3080 实测为 {"ok":true,"dir":"...\\profiles\\web\\node_modules\\dsh-ui-block\\extension","version":"0.2.2","name":"dsh-element-picker","manifestVersion":3}；dir 以 \extension 结尾且是绝对路径。
+  源码：index.js:802-815（info 分支与字段）+ index.js:69-71（extensionDir）
+[UB-E-02] 根路径、尾部斜杠、/info 三种写法等价
+  操作：分别 GET /ui-block-extension、/ui-block-extension/、/ui-block-extension///、/ui-block-extension/info。
+  期望：四条都是 200，body 完全相同（尾部斜杠先被 replace(/\/+$/,"") 吃掉；action 为空或 /info 都走同一分支）。
+  源码：index.js:801-802（action 归一化与分支条件）
+[UB-E-03] 非 GET 打 info → 405 GET only
+  操作：POST /ui-block-extension（无 body）。
+  期望：405，JSON {ok:false, error:"GET only"}；不读 manifest，不产生日志。
+  源码：index.js:803-806
+[UB-E-04] GET /reveal → 405 POST only
+  操作：GET /ui-block-extension/reveal。
+  期望：405，JSON {ok:false, error:"POST only"}。
+  源码：index.js:817-820
+[UB-E-05] POST /reveal 缺 CSRF 头 → 403，且不启动进程
+  操作：Invoke-WebRequest -Method Post http://127.0.0.1:3080/ui-block-extension/reveal（不带任何头）。
+  期望：403，JSON {ok:false, error:"missing reveal header"}；任务管理器里没有新的 explorer 进程；日志无 explorer 相关行。
+  源码：index.js:825-828（头部校验在任何副作用之前）
+[UB-E-06] POST /reveal 带头 → 200 + pid + command（会真的弹资源管理器）
+  操作：带请求头 x-dsh-ui-block-reveal: 1 POST /ui-block-extension/reveal。
+  期望：200，JSON {ok:true, dir, pid, command}；command 逐字是 explorer.exe /select,"<dir>"（逗号在引号外）；资源管理器打开并选中 extension 目录；pid 可能是 null（进程已退出）。
+  源码：index.js:829-849（windowsVerbatimArguments 与响应）
+[UB-E-07] 未知 action → 404 unknown extension action
+  操作：GET /ui-block-extension/nope。
+  期望：404，JSON {ok:false, error:"unknown extension action"}。
+  源码：index.js:852
+[UB-E-08] GET /ui-blocks/<name>.uiblock → 200 纯文本 + 四个响应头
+  操作：GET /ui-blocks/delete-pack-confirm.uiblock（或任一块）。
+  期望：200；Content-Type 为 text/plain; charset=utf-8；Cache-Control 为 no-store；Last-Modified 等于文件 mtime；x-uiblock-at 为 live；body 与文件内容逐字节相同。
+  源码：index.js:763-770（writeHead 四个头）
+[UB-E-09] 缺文件、非法名、没有 .uiblock 后缀 → 404 not found
+  操作：GET /ui-blocks/nope.uiblock、/ui-blocks/..%2Fpackage.json.uiblock、/ui-blocks/foo、/ui-blocks/。
+  期望：四条都 404，body 文本是 not found；不泄漏目录内容；不是 500。
+  源码：index.js:722-728（三个条件合并成 404）
+[UB-E-10] ?at=<epoch 毫秒> 还原那一刻，头里写回该毫秒
+  操作：GET /ui-blocks/<name>.uiblock?at=<某次修改前的时间戳>；再试 ?at=abc。
+  期望：前者 200，body 是那一刻的版本，x-uiblock-at 等于该数字；后者 Number.isFinite 为假，按「最新」返回，x-uiblock-at 为 live。
+  源码：index.js:751-754（at 解析）+ index.js:756-770（回放与头）
+[UB-E-11] ?pin=<nodeKey>&i=<n> 首次钉住，之后不再变
+  操作：GET /ui-blocks/<name>.uiblock?pin=14:assistant-step1:11&i=0 两次，中间改一次文件内容。
+  期望：两次返回同一版本，x-uiblock-at 两次相同；<DSH_HOME>\ui-blocks\.pins.json 出现键 <name>|14:assistant-step1:11|0，值是毫秒数；i 缺省按 0；不同 i 是不同钉子。
+  源码：index.js:371-388（pinMoment）+ index.js:745-747（参数解析）+ index.js:768（头里写 moment）
+[UB-E-12] 读取也会补历史（write/edit 路径同样被记录）
+  操作：直接用编辑器改 .uiblock（不走 create_ui_block），再 GET 该块；同一内容再 GET 一次。
+  期望：ui-blocks\.history\<name>\ 下出现 base.uiblock 与 log.json；log 每行是 {at, patch}；同一内容重复 GET 不再追加行；?at= 能还原改前版本。
+  源码：index.js:733-737（读路由里调 recordChange）+ index.js:321-337（recordNow 只在内容变化时追加）
+[UB-E-13] 路由内部异常 → 500 read failed + 一条 warn
+  操作：测试环境把某个 .uiblock 改成不可读（或改成目录），GET 它。
+  期望：500，body 文本 read failed；实例日志出现 dsh-ui-block: /ui-blocks route failed: …；进程不崩，其它块照常可读。
+  源码：index.js:771-774（catch 里 500 与 logger.warn）
+
+======================================================================
+七、自检与探针　UB-F
+======================================================================
+
+[UB-F-01] self-check.mjs 必须在实例插件体里跑，26 条
+  操作：在 3080 插件体目录执行 node self-check.mjs；再到归档目录执行一次。
+  期望：插件体目录 exit 0，末行逐字 self-check: 26 checks OK；归档目录直接失败，报 ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-tools'（归档没有实例的 node_modules 解析链）。
+  源码：self-check.mjs:40-47（临时 DSH_HOME 与 import）+ self-check.mjs:276-277（末行）+ index.js:32（唯一的外部依赖）
+[UB-F-02] self-check.mjs 的五节各断言什么
+  操作：看输出分节标题与 ok 行。
+  期望：第 1 节 11 条：两个工具注册、create 描述逐字含 CREATING vs UPDATING 契约、read 有 timeoutMs 与 width/height、create 无尺寸参数、输出 schema、两条 prefix 路由；第 2 节 5 条：只写 body、无 BOM、无 CRLF、sha 可复现；第 3 节 1 条：同名写先备份；第 4 节 3 条：路径穿越、空 body、缺块报 known 列表；第 5 节 6 条：与 client.js 的常量/接缝/指令/旧写法死亡/代码块外壳对齐。
+  源码：self-check.mjs:64-126（1）+ 128-155（2）+ 157-165（3）+ 167-182（4）+ 184-213（5）
+[UB-F-03] --shot 的截图腿与 SKIPPED 的区别
+  操作：node self-check.mjs --shot（4000 在跑 / 不在跑各一次）。
+  期望：先探 http://127.0.0.1:4000/json/version；不在跑打印 SKIPPED - no app listening at …（不算通过）；在跑则断言 PNG 签名 89504e470d0a1a0a、尺寸 1440×900、tokens 大于 100、scheme 是 light 或 dark；token 从 D:/dsh-fallback/logs/dsh-4000.log 的 token= 行取。
+  源码：self-check.mjs:215-241（腿与三条断言）+ self-check.mjs:248-273（取 token 与桩）
+[UB-F-04] self-check-uiblock-directive.mjs：46 条、13 节
+  操作：node self-check-uiblock-directive.mjs。
+  期望：exit 0，末行逐字 self-check-uiblock-directive: 46 assertions passed；13 节覆盖：指令命中、尺寸、空白容错、行内多余内容、代码块不读、旧写法死亡、非法 res、路径映射、diff 无损、历史只存基线+补丁、?at= 回放、pin 幂等、客户端请求形态。
+  源码：self-check-uiblock-directive.mjs:72-174（1-8 节）+ 188-329（9-13 节）
+[UB-F-05] 解析器沙箱把 [directive-parsers] 区原样抬进 Function
+  操作：读脚本头；再在 client.js 的该区里临时加一行 document.title（测试环境）。
+  期望：正常 exit 0；加了 DOM 引用后脚本打印 the parser region must stay DOM-free 并 exit 2；区段标记缺失时打印 [directive-parsers] region not found 并 exit 2。这条保证「解析器不碰 DOM」是可测的契约。
+  源码：self-check-uiblock-directive.mjs:35-47（区段与 DOM 检查）+ 51-62（常量抬升与 new Function）
+[UB-F-06] self-check-element-chip.mjs：用假 ModuleLoader 跑真 client.js
+  操作：node self-check-element-chip.mjs。
+  期望：exit 0，末行逐字 dsh-ui-block element-chip self-check: all assertions passed；它断言 bundle 只注册一个入口（load( 出现 1 次）、__pure 暴露、token 标签与畸形拒绝、nextEdit 与 offset 折算、序列化恒等且不 reject、草稿逐字节往返、气泡切分、扩展卡片的 subject 过滤。
+  源码：self-check-element-chip.mjs:40-60（加载与入口唯一性）+ 79-134（标签与畸形）+ 143-195（序列化）+ 246-271（气泡）+ 306-319（卡片）
+[UB-F-07] 三个脚本各红在哪一段，红了代表什么
+  操作：对照失败行。
+  期望：self-check.mjs 红 = 工具契约、路由或写盘契约变了（模型侧行为会变）；directive 红 = 指令语法或历史/pin 变了（老消息会错版或重绘）；element-chip 红 = token 解析或序列化变了（发出去的文本会变）。三者都不覆盖真实 DOM 渲染，渲染问题只能靠 UB-A/B 的界面条目。
+  源码：self-check.mjs:6-18 + self-check-uiblock-directive.mjs:6-20 + self-check-element-chip.mjs:6-24（三份文件头的自述）
+[UB-F-08] 运行时探针 sweep() 的形状
+  操作：控制台执行 __dshPageBlock.sweep()。
+  期望：返回 {stats:{blocks, converted, tokenCount, refWait, lastRefError}, tokenCount, scheme, live:[{ref, pinned, pin, res, zoom, autoFit, declared, hDeclared, viewH, hostWidth, shellHeight}]}；stats.blocks 等于当前页引用行数；live 顺序与文档序一致。
+  源码：client.js:2160-2182（sweep 返回值）+ client.js:1136（stats 初值）
+[UB-F-09] 运行时探针 picker.state() / ref() / render.*
+  操作：控制台依次执行 __dshPageBlock.picker.state(0)、__dshPageBlock.ref("ui-blocks/x.uiblock")、__dshPageBlock.render.defaultRes()、__dshPageBlock.render.srcdoc("<b>x</b>")。
+  期望：picker.state 返回 {armed, hovered, stack, buttonLit, boxVisible, sandbox}；ref 返回 {text, fetchedAt, pending, error}（从未请求过是 null）；render.defaultRes() 是 {w:1440,h:900}；render.srcdoc 返回含 CSP meta 的完整 HTML 字符串。
+  源码：client.js:2124-2128（render 三个方法）+ client.js:2143-2158（picker.state）+ client.js:2129-2141（ref）
+[UB-F-10] 自检不碰真实 ui-blocks，也不写仓库
+  操作：跑 self-check.mjs 前后比对 %DSH_HOME%\ui-blocks 的修改时间与仓库文件哈希。
+  期望：脚本把 DSH_HOME 指向 mkdtemp 临时目录，结束时 rm 掉；真实 ui-blocks 的 mtime 不变；仓库里没有任何文件被改写（git status 干净）。
+  源码：self-check.mjs:40-41（mkdtemp 赋给 DSH_HOME）+ self-check.mjs:276（rm 收尾）
+
+======================================================================
+八、边界与不变量　UB-G
+======================================================================
+
+[UB-G-01] files 白名单只放运行时需要的五项
+  操作：读 package.json 的 files，对照仓库实际文件。
+  期望：名单是 index.js、client.js、cordis.patch.yml、README.md、extension/；自检脚本与 .bak-* 都不在名单里（但仓库里确实存在 README.md.bak-timeline-20261025 等）。
+  源码：package.json:5-11（files）+ 仓库根目录实际文件
+[UB-G-02] bundle 声明只有一行 insert，没有 override
+  操作：读 cordis.patch.yml 与 package.json 的 dsh.bundle。
+  期望：patch 文件只有一条 - insert: 下面 id 与 name 都是 dsh-ui-block；没有 override、没有 disabled、没有第二行；profile 的 bundles 列表里出现同名条目。
+  源码：cordis.patch.yml:1-4 + package.json:38-41
+[UB-G-03] client 声明：web 平台、立即加载、依赖两个官方 UI 包
+  操作：读 dsh.client。
+  期望：platform 为 web；immediately 为 true；inject 恰为 [@deepseek-ai/dsh-client-ui-chat, @deepseek-ai/dsh-client-ui-conversation]；这两条是加载顺序依赖，不是安装依赖。
+  源码：package.json:42-49
+[UB-G-04] 包内零依赖：没有 dependencies 段，运行时只 require 三个宿主模块
+  操作：读 package.json 全部顶层键；grep 所有 import/require。
+  期望：没有 dependencies / devDependencies / peerDependencies；宿主只 import defineTool from @deepseek-ai/dsh-tools；客户端只 require react、react-dom/client、@deepseek-ai/dsh-client-ui-primitives，三者都 try/catch 兜底（缺 primitives 时退化成裸画布，不整块失败）。
+  源码：package.json:1-51 + index.js:25-32 + client.js:87-93（三处 try/catch）+ client.js:1810-1817（无代码块时的降级）
+[UB-G-05] 写盘只落在 ui-blocks 下，不碰官方包
+  操作：grep 所有 writeFile / appendFile / rename / rm 的路径来源；看 node_modules 的 mtime。
+  期望：全部写操作都经 blocksDir() 或 historyDir()（<DSH_HOME>\ui-blocks）；没有任何对 node_modules 的写；没有改写官方 client bundle；跑一轮全量测试后 node_modules 的 mtime 不变。
+  源码：index.js:55-58（blocksDir）+ index.js:100-114（writeBlock）+ index.js:321-337（recordNow）+ index.js:376-381（pins 临时文件与 rename）
+[UB-G-06] 每个 slot 注册点都有自己的 id / key / order
+  操作：看四处注册。
+  期望：conversation.input.overlay 两个座位 id 分别是 dsh-element-chip（order 5）与 dsh-ui-block-picker（order 6）；plugins.detail.section 是 ui-block-extension（order 100）；conversation.user.text.node 的 key 是 element；唯一「抢占」是 conversation.chat.node 的 key=user、priority=-1（有意覆盖，靠 slot 的 lowest-priority-wins），不改上游文件。
+  源码：client.js:879-885 + client.js:1170-1176 + client.js:2254 + client.js:788-793 + client.js:734-743
+[UB-G-07] 卸载干净：监听、观察者、全局都撤掉
+  操作：禁用插件后看 DOM 与 window。
+  期望：style[data-plugin-css=dsh-ui-block] 被移除；MutationObserver、1.5 秒 interval、resize 与 document 级监听全部断开；window.__dshPageBlock 被 delete；所有 .dshpb-seat 被移除，原引用行 display 还原。
+  源码：client.js:2186-2207（install 的 dispose）+ client.js:1956-1968（disposeState）
+[UB-G-08] 归档、3080、4000 三份代码一致（package.json 除外）
+  操作：对 index.js、client.js、extension 三件、cordis.patch.yml 做 SHA256。
+  期望：本次实测三份全部相同（index.js BFE49D54…、client.js 8FCE9E6E…、manifest E8E9CE20…、content 8D2C3484…、background 87630350…、cordis.patch.yml BCC96172…）；package.json 不同：归档 51 行（有 exports、无 private），两个实例体 31 行（有 private:true、无 exports）——行为等价，见已知问题 1。
+  源码：package.json:1-51 + 三份文件哈希实测
+[UB-G-09] 备份文件与历史目录不会被当成块
+  操作：看 ui-blocks 目录里的 .history、.pins.json、*.uiblock.bak-*；再读缺块报错的 known 列表。
+  期望：.history、.pins.json、*.uiblock.bak-* 都不出现在 known 列表里（只认以 .uiblock 结尾的条目）；GET /ui-blocks/disk-audit-questionnaire.uiblock.bak-2026-10-20T15-11-16-236Z 返回 404；备份文件仍留在磁盘上，没有清理机制（见已知问题 12）。
+  源码：index.js:117-124（listBlocks 后缀过滤）+ index.js:722-724（路由同名规则）
+
+======================================================================
+九、已知问题 / 待观察
+======================================================================
+
+这一节只记录，不修。每条写「现在是什么样」和「看哪里」，供下次动手时定位。
+
+K1. package.json 三份不一致（行为等价，发布前要统一）
+   归档是 51 行：有 exports 段、没有 private；3080 与 4000 的插件体是 31 行：有 private:true、没有 exports。
+   其余文件三份哈希完全相同，所以运行行为一致；但下次发布（npm pack / 打包归档）会以归档那份为准，
+   实例体缺 exports 意味着按包名解析子路径（dsh-ui-block/client）在实例里不可用。
+   相关条目：UB-G-08。
+
+K2. 版本号三处不同步
+   package.json 是 0.2.2、extension/manifest.json 是 0.2.2，但 client.js 暴露的 window.__dshPageBlock.version
+   写的是 0.6.0（client.js:2116），README 里又出现 v0.4.0、0.2.3、0.2.0-rc.2 等字样。
+   卡片文案「与插件 package.json 同版」并不做校验，它读的其实是 manifest；当前两者恰好相同，
+   只改一处就会让这句文案变成假话。
+   相关条目：UB-C-03、UB-F-09。
+
+K3. README 说 node_modules 里是 junction，实测不是
+   README:44 写「3080 的 profiles\web\node_modules\dsh-ui-block junction 指向 D:\dsh-plugins\dsh-ui-block」。
+   2026-10-30 实测：该目录是普通目录（fsutil reparsepoint query 报 4390「不是重解析点」），
+   且内容与归档哈希一致。也就是说现在有三份实体副本（归档、3080、4000），改代码必须三处同步，
+   而 index.js:63-67 的注释仍按「junction 会被 realpathSync 折回包体」来论证路由安全。
+   路由安全结论仍成立（extensionDir 只由模块自身位置推导，不接受请求值），但注释的前提已经变了。
+   相关条目：UB-C-04、UB-E-01、UB-G-08。
+
+K4. 归档目录跑不了 self-check
+   归档没有实例的 node_modules 解析链，node self-check.mjs 直接 ERR_MODULE_NOT_FOUND（@deepseek-ai/dsh-tools）。
+   必须在实例插件体目录跑；README 的「安装到 4000」一节没有写这一点。
+   相关条目：UB-F-01。
+
+K5. README 有大段已退役实现的记录，容易照着旧文档测
+   「触发与元信息（v0.3.0）」「围栏块 / 横栏钩子」「scripts/check-meta.mjs」等段落描述的是旧围栏方案；
+   现码只有 ::dsh-ui 行触发，scripts/ 目录已不存在。测试以本清单与源码为准，README 只当历史读。
+   相关条目：UB-A-04、UB-A-05、UB-A-06。
+
+K6. 工具描述里「用 write 创建的文件找不到」与实现不符
+   create_ui_block 的说明写「a block that was not created through this tool has no registered metadata,
+   so read_ui_block and the reference line cannot find it」，但代码里没有任何元数据登记表：
+   读路由只查文件是否存在（index.js:496-503、722-724），客户端只按路径取（client.js:2054-2075）。
+   直接 write 出来的 .uiblock 能正常渲染、也能被 read_ui_block 截图，只是历史基线在首次读取时才建。
+   风险：模型被这段描述约束，用户手工放进去的块会被误认为「不生效」。
+   相关条目：UB-A-18。
+
+K7. 截图工具硬依赖 Windows 上的 Edge
+   screenshotBlock 只认两条固定路径（Program Files 与 Program Files (x86) 下的 msedge.exe），找不到就抛
+   no Microsoft Edge found at …；另外还要求 profile 里同时有 webServer、connection、attachments 三个服务，
+   缺一个就直接报错并且明确要求不要重试（index.js:662-670）。UI 渲染不受影响，只有 read_ui_block 受影响。
+   相关条目：UB-F-03。
+
+K8. 历史补丁链超过 4MB 会被截断，?at= 可能给出错版
+   readHistory 对超过 LOG_MAX_BYTES（4MB）的 log 只读前 4MB（index.js:259-263），被切掉的补丁不再回放；
+   对截断点之后的 ?at= 请求会安静地返回较旧的版本，不报错也不打日志。
+   代码自己标了 ponytail，升级路径是定期 checkpoint 新基线，但计划里被推迟了。
+   相关条目：UB-E-10、UB-E-12。
+
+K9. ?pin= 写 pins 失败时仍回 live，客户端无从察觉
+   pinMoment 抛错时被 catch 住，moment 保持 null（index.js:745-750），于是返回最新内容并把
+   x-uiblock-at 写成 live；客户端只按 200 处理，会以为拿到的是冻结版本。
+   .pins.json 也只增不减：删掉块之后对应的键仍在，任意 nodeKey 都能让它长一条。
+   相关条目：UB-A-10、UB-E-11。
+
+K10. 跨 frame 选区只支持同源、一层嵌套
+    content.js:61-75 的 ponytail 注释写明：跨源或更深嵌套的 iframe 上报的坐标是 (0,0)，
+    高亮框会画错位置（选中本身仍可能成功）。这是已声明的上限，不是新缺陷。
+    相关条目：UB-D-03。
+
+K11. 扩展 manifest 的 default_title 是英文，卡片文案是中文
+    manifest 里是 Pick an element → clipboard，卡片标题是「浏览器扩展 dsh-element-picker」。
+    不影响功能，只是同一个东西两个名字，用户按中文名去工具栏找会找不到。
+    相关条目：UB-C-07、UB-D-01。
+
+K12. 备份文件只增不减
+    create_ui_block 每次覆盖同名块都会留一份 <name>.uiblock.bak-<ISO 时间>（index.js:105-108），
+    3080 的 ui-blocks 里已经有 50KB 级的备份；没有任何清理或上限。
+    这些文件不会被当成块（UB-G-09），但会一直占盘。
+    相关条目：UB-G-09。
+
+======================================================================
+十、统计与维护
+======================================================================
+
+条目数（本次编写）：UB-A 18、UB-B 13、UB-C 9、UB-D 14、UB-E 13、UB-F 10、UB-G 9，合计 86 条；
+文末已知问题 12 条。每条都带「操作 / 期望 / 源码」三行，源码行是 2026-10-30 逐行核对过的行号。
+
+维护约定：
+
+  · 包版本变了先重跑 S0，把三个数字（26 / 46 / 全通过）写进记录，不要沿用上次的。
+  · 改 client.js 的 [directive-parsers] 区，必须同时改 self-check-uiblock-directive.mjs 的期望，
+    否则自检会红在「区域被改过」而不是「行为错了」。
+  · 改 extension/manifest.json 的 version，要同步 package.json，否则卡片文案（K2）会说谎。
+  · 任何条目被证伪（源码已经改成别的行为），先改本清单的「期望」，再跑；不要让清单和代码各说一套。
+  · 新增块级能力（例如画布交互回流）时，在 UB-A 末尾追加条目，并把已知问题里对应的上限条目改掉。
