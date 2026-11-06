@@ -1,0 +1,4 @@
+# Loader patch for the dsh-ui-block bundle: one row, named after the package.
+- insert:
+    - id: dsh-ui-block
+      name: dsh-ui-block
