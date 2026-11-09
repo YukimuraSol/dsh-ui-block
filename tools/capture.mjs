@@ -48,6 +48,10 @@ async function grab(opts) {
     droppedSamples: [], mediaKept: 0, fontFaces: 0, keyframes: 0, imports: 0,
     shadowHosts: 0, resources: [], failed: [], scriptsRemoved: 0, styleTagsRemoved: 0,
     unresolved: 0,
+    // 令牌固化的账：unresolvedVars 必须为空（空即证明产物不再问宿主要值）
+    unresolvedVars: [], invalidAtComputedValue: [], varsUsed: 0, varsFromElements: [],
+    varNamesUndeclared: [], skinSelectorRewrites: 0, skinSelectorKept: 0,
+    skinAttrsDropped: 0, skinDeclsDropped: 0, bodyVarsFrozen: 0, emptyRulesDropped: 0,
   };
 
   // 0) 等 DOM 定型：会话列表、插件卡这类异步内容都是后到的。
@@ -76,14 +80,202 @@ async function grab(opts) {
   window.scrollTo(0, 0);
   report.shadowHosts = [...document.querySelectorAll('*')].filter((e) => e.shadowRoot).length;
 
-  // 1) :root 变量（当前主题的实测值）
+  // 1) :root 变量（当前主题的实测值）。--columbina-* 是皮肤自己的实现细节，不进素材：
+  //    它带来的颜色已经在下面「令牌固化」里写成字面值了。
   const cs = getComputedStyle(document.documentElement);
   const vars = [];
   for (let i = 0; i < cs.length; i++) {
     const p = cs[i];
+    if (p.startsWith('--columbina-')) continue;
     if (p.startsWith('--')) vars.push(p + ':' + cs.getPropertyValue(p).trim() + ';');
   }
   const rootVars = ':root{' + vars.join('') + '}';
+
+  // ---- 令牌固化：把「用到的」变量写死，不只抄「声明过的」 ---------------------
+  // 老做法只把 :root/body 上声明过的变量抄成令牌表，正文里的 var(--x) 原样留着。
+  // 于是两种变量会在渲染时去问宿主的活令牌表（= 又跟着皮肤变）：
+  //   ① 只在某个子树里声明的（根元素上抄不到）；
+  //   ② 根本没声明的，靠 var(--x, fallback) 的兜底生效。
+  // 这里改成按名字逐个解析：文档根 → body → 声明该名字的那个元素，拿到此刻的实际值。
+  // 判据（写进 report）：unresolvedVars 为空，且产物里 var(--dsw-) / var(--dsh-) 残留为 0。
+  const SKIN_ATTR = 'data-dsh-columbina';
+  const SKIN_SEL_RE = new RegExp('\\[\\s*' + SKIN_ATTR + '(?:\\s*[~|^$*]?=\\s*(?:"[^"]*"|\'[^\']*\'|[^\\]]*))?\\s*\\]', 'gi');
+  let varMap = new Map();
+
+  const readCustomVars = (el) => {
+    const m = new Map();
+    if (!el) return m;
+    let s;
+    try { s = getComputedStyle(el); } catch { return m; }
+    for (let i = 0; i < s.length; i++) {
+      const p = s[i];
+      if (!p || p.slice(0, 2) !== '--') continue;
+      const v = s.getPropertyValue(p).trim();
+      if (v) m.set(p, v);
+    }
+    return m;
+  };
+
+  // var( 里面可能还套 var(，所以要找配对括号，不能按 indexOf(')') 切。
+  const findVar = (text, from) => {
+    let i = text.indexOf('var(', from || 0);
+    while (i >= 0) {
+      if (i === 0 || !/[\w-]/.test(text[i - 1])) {
+        let depth = 0, q = null;
+        for (let j = i + 3; j < text.length; j++) {
+          const ch = text[j];
+          if (q) { if (ch === q) q = null; continue; }
+          if (ch === '"' || ch === "'") { q = ch; continue; }
+          if (ch === '(') depth++;
+          else if (ch === ')') { depth--; if (depth === 0) return { start: i, end: j + 1, inside: text.slice(i + 4, j) }; }
+        }
+        return null;
+      }
+      i = text.indexOf('var(', i + 4);
+    }
+    return null;
+  };
+  const varNamesIn = (text) => {
+    const set = new Set();
+    const re = /var\(\s*(--[A-Za-z0-9_-]+)/g;
+    let m;
+    while ((m = re.exec(text))) set.add(m[1]);
+    return set;
+  };
+  const missingNames = [];
+  const resolveVars = (text, map, depth) => {
+    if ((depth || 0) > 12) return { ok: false, text };
+    let out = String(text);
+    for (let guard = 0; guard < 500; guard++) {
+      const hit = findVar(out, 0);
+      if (!hit) return { ok: true, text: out };
+      const args = splitSel(hit.inside);
+      const name = (args[0] || '').trim();
+      const fb = args.length > 1 ? args.slice(1).join(',').trim() : '';
+      const raw = map.has(name) ? String(map.get(name)).trim() : '';
+      const src = raw || fb;
+      // 没有声明、也没有 fallback：整条声明在浏览器里是「计算值阶段无效」，
+      // 属性退到 unset（继承属性照旧继承，其余取初始值）。交给下面的 healDecl 处理。
+      if (!src) { if (missingNames.indexOf(name) < 0) missingNames.push(name); return { ok: false, text: out, name }; }
+      const sub = resolveVars(src, map, (depth || 0) + 1);
+      if (!sub.ok) return { ok: false, text: out, name: sub.name || name };
+      out = out.slice(0, hit.start) + sub.text + out.slice(hit.end);
+    }
+    return { ok: true, text: out };
+  };
+
+  const buildVarMap = (names) => {
+    const map = new Map();
+    for (const src of [readCustomVars(document.documentElement), readCustomVars(document.body)]) {
+      for (const [k, v] of src) map.set(k, v);
+    }
+    // 自定义属性不一定出现在 getComputedStyle 的 length 枚举里（实测 Chrome 只枚举长写属性），
+    // 所以还得按名字问：body 先问（最近的声明就是后代实际用的值），根元素兜底。
+    const rcs = getComputedStyle(document.documentElement);
+    const bcs = getComputedStyle(document.body);
+    for (const n of names) {
+      if (map.has(n)) continue;
+      const v = (bcs.getPropertyValue(n) || '').trim() || (rcs.getPropertyValue(n) || '').trim();
+      if (v) map.set(n, v);
+    }
+    // 还是没有的名字，逐个元素问一遍（有些令牌只挂在某个子树或行内 style 上）
+    let pending = [...names].filter((n) => !map.has(n));
+    if (pending.length) {
+      for (const el of document.querySelectorAll('body, body *')) {
+        if (!pending.length) break;
+        const left = [];
+        for (const n of pending) {
+          let v = '';
+          try { v = getComputedStyle(el).getPropertyValue(n).trim(); } catch { v = ''; }
+          if (v) {
+            map.set(n, v);
+            report.varsFromElements.push(n + ' @ ' + el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + ' = ' + v.slice(0, 60));
+          } else left.push(n);
+        }
+        pending = left;
+      }
+    }
+    report.varNamesUndeclared = pending.slice();
+    report.varsUsed = names.size;
+    return map;
+  };
+
+  // 把「解析不掉」的那条声明改写成浏览器当时真正生效的等价物：
+  //   · 普通属性 → 值换成 unset（= 计算值阶段无效的结果）
+  //   · 自定义属性 → 整条删掉（它只会被别处消费，而消费处已经写死成字面值）
+  const healDecl = (text, pos) => {
+    let a = pos;
+    while (a > 0 && text[a - 1] !== '{' && text[a - 1] !== ';' && text[a - 1] !== '}') a--;
+    let b = pos;
+    while (b < text.length && text[b] !== ';' && text[b] !== '}') b++;
+    const decl = text.slice(a, b);
+    const colon = decl.indexOf(':');
+    if (colon < 0) return null;
+    const prop = decl.slice(0, colon).trim();
+    if (!prop || /[\s(]/.test(prop)) return null; // 不是普通声明（@media 头之类）
+    if (prop.slice(0, 2) === '--') return { text: text.slice(0, a) + text.slice(b + (text[b] === ';' ? 1 : 0)), op: 'drop' };
+    return { text: text.slice(0, a) + prop + ':unset' + text.slice(b), op: 'unset' };
+  };
+
+  const noteUnresolved = (name) => {
+    if (name && report.unresolvedVars.indexOf(name) < 0) report.unresolvedVars.push(name);
+  };
+  const noteInvalid = (name) => {
+    if (name && report.invalidAtComputedValue.indexOf(name) < 0) report.invalidAtComputedValue.push(name);
+  };
+
+  // 一段 CSS 文本：删皮肤自定义属性声明 → 逐个 var() 写字面值 → 清理空规则
+  const freezeCssText = (text) => {
+    let out = text.replace(/(^|[{;])\s*--columbina-[A-Za-z0-9_-]*\s*:\s*[^;}]*/g, (m, lead) => {
+      report.skinDeclsDropped++;
+      return lead;
+    });
+    for (let guard = 0; guard < 20000; guard++) {
+      const hit = findVar(out, 0);
+      if (!hit) break;
+      const args = splitSel(hit.inside);
+      const name = (args[0] || '').trim();
+      const fb = args.length > 1 ? args.slice(1).join(',').trim() : '';
+      const raw = varMap.has(name) ? String(varMap.get(name)).trim() : '';
+      const src = raw || fb;
+      if (!src) {
+        const h = healDecl(out, hit.start);
+        if (!h) { noteUnresolved(name); break; }
+        out = h.text;
+        noteInvalid(name);
+        continue;
+      }
+      const r = resolveVars(src, varMap, 0);
+      if (!r.ok) {
+        const h = healDecl(out, hit.start);
+        if (!h) { noteUnresolved(r.name || name); break; }
+        out = h.text;
+        noteInvalid(r.name || name);
+        continue;
+      }
+      out = out.slice(0, hit.start) + r.text + out.slice(hit.end);
+    }
+    // 皮肤属性从选择器里摘掉后，body[data-dsh-columbina]{--columbina-…} 会只剩空壳
+    const before = out.length;
+    out = out.replace(/[^{}]+\{\s*\}/g, '');
+    if (out.length !== before) report.emptyRulesDropped++;
+    return out;
+  };
+
+  // 选择器里的皮肤开关属性：把属性条件摘掉，规则本体照旧生效。
+  // 视觉效果已经由字面值固定，块不该再靠「宿主是否开着皮肤」来命中。
+  const stripSkinSelector = (sel) => {
+    if (sel.indexOf(SKIN_ATTR) < 0) return sel;
+    // :not([data-dsh-columbina]) 这类反向条件不能摘，摘了语义会反过来 → 留名不改
+    if (/:not\([^)]*data-dsh-columbina/i.test(sel)) {
+      report.skinSelectorKept++;
+      (report.skinSelectorsKept = report.skinSelectorsKept || []).push(sel.slice(0, 120));
+      return sel;
+    }
+    const out = sel.replace(SKIN_SEL_RE, '').replace(/\s+/g, ' ').trim();
+    report.skinSelectorRewrites++;
+    return out;
+  };
 
   // 2) CSS：按“这份 DOM 里真能命中”过滤
   const STATE = /:(hover|focus-visible|focus-within|focus|active|visited|target|checked|indeterminate|disabled|enabled|read-only|read-write|placeholder-shown|default|required|optional|valid|invalid|in-range|out-of-range|user-invalid|user-valid|autofill|open|popover-open|modal|fullscreen|picture-in-picture|playing|paused|muted|seeking|buffering|stalled|defined|link|any-link|local-link|scope)\b/gi;
@@ -107,8 +299,8 @@ async function grab(opts) {
     try { return document.querySelector(p) !== null; } catch { return false; }
   };
   const keepSelectorText = (selText) => {
-    const parts = splitSel(selText);
-    const kept = parts.filter(probe);
+    const parts = splitSel(selText).map(stripSkinSelector);
+    const kept = parts.filter(Boolean).filter(probe);
     if (!kept.length) {
       report.droppedSamples.push(selText.slice(0, 100));
       return null;
@@ -187,7 +379,25 @@ async function grab(opts) {
   const allSheets = [...document.styleSheets, ...(document.adoptedStyleSheets || [])];
   for (const sheet of allSheets) walkSheet(sheet);
   let cssElsAtCollect = countEls();
-  let cssText = chunks.join('\n');
+  // 收完就固化：先把这批规则里出现过的所有 var(--x) 名字解析成当下的字面值，再写回每个 chunk
+  let cssText = '';
+  const declaredCustomProps = (text) => {
+    // 规则里「声明过」的自定义属性名也要进名字表：有的令牌值本身就是另一层令牌拼的，
+    // 只问用到的名字会把中间那层漏掉。
+    const set = new Set();
+    const re = /(?:^|[{;])\s*(--[A-Za-z0-9_-]+)\s*:/g;
+    let m;
+    while ((m = re.exec(text))) set.add(m[1]);
+    return set;
+  };
+  const collectCss = () => {
+    const names = varNamesIn(chunks.join('\n'));
+    for (const n of declaredCustomProps(chunks.join('\n'))) if (!names.has(n)) names.add(n);
+    varMap = buildVarMap(names);
+    for (let i = 0; i < chunks.length; i++) chunks[i] = freezeCssText(chunks[i]);
+    cssText = chunks.join('\n');
+  };
+  collectCss();
 
   // 3) 内联资源：图片 / 背景图 / 字体
   const fetchCache = new Map();
@@ -313,6 +523,32 @@ async function grab(opts) {
     if (elements.length >= 500) break;
   }
 
+  // 5.4) 正文里的变量与皮肤标记
+  //      行内 style、SVG 呈现属性（fill="var(--dsw-…)"）都不在样式表里，只固化规则会漏掉；
+  //      逐个用「这个元素此刻的实际值」写死。皮肤开关属性（data-dsh-columbina）不进素材：
+  //      它带来的外观已经由字面值固定，块不该再靠宿主是否开着皮肤来命中。
+  {
+    const els = [document.documentElement, ...document.querySelectorAll('body, body *')];
+    for (const el of els) {
+      for (const attr of [...el.attributes]) {
+        if (attr.value.indexOf('var(') < 0) continue;
+        const map = readCustomVars(el);
+        for (const [k, v] of varMap) if (!map.has(k)) map.set(k, v);
+        const r = resolveVars(attr.value, map, 0);
+        if (r.ok && r.text.indexOf('var(') < 0) {
+          if (r.text !== attr.value) { el.setAttribute(attr.name, r.text); report.bodyVarsFrozen++; }
+        } else {
+          noteInvalid(r.name || 'attr:' + attr.name);
+          el.removeAttribute(attr.name);
+          report.bodyVarsDropped = (report.bodyVarsDropped || 0) + 1;
+        }
+      }
+    }
+    for (const el of [document.body, ...document.querySelectorAll('[' + SKIN_ATTR + ']')]) {
+      if (el && el.hasAttribute && el.hasAttribute(SKIN_ATTR)) { el.removeAttribute(SKIN_ATTR); report.skinAttrsDropped++; }
+    }
+  }
+
   // 5) 去掉会执行/会影响样式来源的节点，再取 body 结构
   const stripTags = (html) => html;
   for (const n of document.querySelectorAll('script')) n.remove();
@@ -394,7 +630,7 @@ async function grab(opts) {
       chunks.length = 0; seen.clear(); resetStats();
       for (const sheet of allSheets) walkSheet(sheet);
       cssElsAtCollect = countEls();
-      cssText = chunks.join('\n');
+      collectCss();
       report.cssRecollect = pass;
     }
   }
@@ -505,7 +741,8 @@ async function grab(opts) {
     doc: {
       lang: document.documentElement.getAttribute('lang') || 'zh-CN',
       htmlAttrs: attrList(document.documentElement),
-      bodyAttrs: attrList(document.body),
+      // 皮肤开关属性不进素材（块里的外观已经全部是字面值）
+      bodyAttrs: attrList(document.body).filter(([k]) => k !== SKIN_ATTR),
       title: document.title,
       bodyHtml,
       rootVars,

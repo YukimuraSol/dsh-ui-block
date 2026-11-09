@@ -66,12 +66,13 @@
     var args = splitTopLevel(hit.inside, ',');
     var name = String(args[0] || '').trim();
     var fb = args.length > 1 ? args.slice(1).join(',').trim() : '';
-    var raw = Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]).trim() : '';
+    var raw = Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]).trim()
+      : (typeof vars.lookup === 'function' ? String(vars.lookup(name) || '').trim() : '');
     var sub;
     if (raw !== '') sub = resolveText(raw, vars, depth + 1);
     else if (fb !== '') sub = resolveText(fb, vars, depth + 1);
-    else return { ok: false, text: text };
-    if (!sub.ok) return { ok: false, text: text };
+    else return { ok: false, text: text, name: name };
+    if (!sub.ok) return { ok: false, text: text, name: sub.name || name };
     return resolveText(text.slice(0, hit.start) + sub.text + text.slice(hit.end), vars, depth + 1);
   }
 
@@ -90,7 +91,14 @@
       if (!prop || !val) continue;
       if (prop.slice(0, 2) === '--') { st.customPropsDropped++; continue; }
       var r = resolveText(val, vars, 0);
-      if (!r.ok || /var\(\s*--/.test(r.text)) { st.declarationsDropped++; continue; }
+      if (!r.ok || /var\(\s*--/.test(r.text)) {
+        // 没声明、也没 fallback：浏览器在「计算值阶段」判整条声明无效，属性退到 unset
+        // （继承属性照旧继承，其余取初始值）。写成 unset 才等价，也不留悬空的 var()。
+        st.declarationsInvalid++;
+        st.invalidAtComputedValue.push((r.name || '?') + ' -> ' + prop);
+        out.push(prop + ':unset');
+        continue;
+      }
       out.push(prop + ':' + r.text);
     }
     return out.join(';');
@@ -192,7 +200,10 @@
       rulesTotal: 0, rulesKept: 0, rulesDead: 0, rulesEmpty: 0,
       declarationsDropped: 0, customPropsDropped: 0,
       fontFaces: 0, keyframes: 0, sheets: 0, sheetsFailed: 0,
-      elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0
+      elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0,
+      // 令牌固化：解析不到的名字不再静默丢声明，而是按浏览器的实际行为写成 unset 并记名
+      declarationsInvalid: 0, invalidAtComputedValue: [],
+      skinSelectorRewrites: 0, skinSelectorKept: 0, skinAttrsStripped: 0
     };
     var dropped = [];
     var drop = function (s) { if (dropped.length < 40) dropped.push(String(s).slice(0, 220)); };
@@ -215,6 +226,25 @@
       var bodyVars = readVars(win.getComputedStyle(doc.body));
       for (var k in bodyVars) if (Object.prototype.hasOwnProperty.call(bodyVars, k)) vars[k] = bodyVars[k];
     }
+    // 只在子树里声明的令牌（根与 body 上抄不到）：解析时按名字现问一遍元素，问到了就写进表。
+    var probeCache = {};
+    var varsFromElements = [];
+    var lookupVar = function (name) {
+      if (Object.prototype.hasOwnProperty.call(vars, name)) return String(vars[name]).trim();
+      if (Object.prototype.hasOwnProperty.call(probeCache, name)) return probeCache[name];
+      var found = '';
+      try {
+        var all = doc.querySelectorAll('body, body *');
+        for (var i = 0; i < all.length && i < 4000; i++) {
+          var v = win.getComputedStyle(all[i]).getPropertyValue(name);
+          if (v && String(v).trim() !== '') { found = String(v).trim(); break; }
+        }
+      } catch (e) { found = ''; }
+      probeCache[name] = found;
+      if (found) { vars[name] = found; varsFromElements.push(name + ' = ' + found.slice(0, 60)); }
+      return found;
+    };
+    Object.defineProperty(vars, 'lookup', { value: lookupVar, enumerable: false });
     var varCount = Object.keys(vars).length;
 
     // 1) 祖先链：从目标元素往上走到 body 的直系子元素为止（不要把整个 document 塞进去）
@@ -247,8 +277,20 @@
       if (!p) return true;
       try { return doc.querySelector(p) !== null; } catch (e) { return false; }
     };
+    // 皮肤开关属性（body[data-dsh-columbina]）不进素材：视觉已经由字面值固定，块不该再靠
+    // 「宿主有没有开着皮肤」来命中。做法是把属性条件从选择器里摘掉，规则本体照旧生效；
+    // :not([data-dsh-columbina]) 这种反向条件不能摘（摘了语义反转），留名不改。
+    var SKIN_ATTR = 'data-dsh-columbina';
+    var SKIN_SEL_RE = /\[\s*data-dsh-columbina(?:\s*[~|^$*]?=\s*(?:"[^"]*"|'[^']*'|[^\]]*))?\s*\]/gi;
+    var stripSkinSelector = function (sel) {
+      if (String(sel).indexOf(SKIN_ATTR) < 0) return sel;
+      if (/:not\([^)]*data-dsh-columbina/i.test(sel)) { st.skinSelectorKept++; return sel; }
+      st.skinSelectorRewrites++;
+      return String(sel).replace(SKIN_SEL_RE, '').replace(/\s+/g, ' ').trim();
+    };
     var keepSelector = function (selText) {
-      var parts = splitTopLevel(selText, ',').map(function (s) { return s.trim(); }).filter(Boolean);
+      var parts = splitTopLevel(selText, ',').map(function (s) { return s.trim(); }).filter(Boolean)
+        .map(stripSkinSelector).filter(Boolean);
       var kept = parts.filter(probe);
       if (!kept.length) { st.rulesDead++; return null; }
       return kept.join(', ');
@@ -372,6 +414,7 @@
       Array.prototype.slice.call(n.attributes).forEach(function (a) {
         var nm = String(a.name || '').toLowerCase();
         var v = String(a.value || '');
+        if (nm === 'data-dsh-columbina') { n.removeAttribute(a.name); st.skinAttrsStripped++; return; }
         if (nm.slice(0, 2) === 'on') { n.removeAttribute(a.name); return; }
         if (BAD_ATTR[nm]) { n.removeAttribute(a.name); return; }
         if (nm === 'href' && /^\s*(javascript|data):/i.test(v)) { n.removeAttribute(a.name); return; }
@@ -393,7 +436,11 @@
         if (v.indexOf('var(') >= 0) {
           var rv = resolveText(v, vars, 0);
           if (rv.ok && rv.text.indexOf('var(') < 0) n.setAttribute(a.name, rv.text);
-          else { n.removeAttribute(a.name); drop('属性里的变量解析不了，已去掉 ' + nm + '=' + v.slice(0, 60)); }
+          else {
+            st.invalidAtComputedValue.push((rv.name || '?') + ' -> @' + nm);
+            n.removeAttribute(a.name);
+            drop('属性里的变量解析不了，已去掉 ' + nm + '=' + v.slice(0, 60));
+          }
         }
       });
     });
@@ -643,7 +690,16 @@
       keyframes: st.keyframes,
       customPropsDropped: st.customPropsDropped,
       declarationsDropped: st.declarationsDropped,
+      declarationsInvalid: st.declarationsInvalid,
+      // 判据：unresolvedVars 为空（没有悬空的 var() 留给宿主令牌表），且产物里
+      // data-dsh-columbina / --columbina- 计数为 0。
+      unresolvedVars: [],
+      invalidAtComputedValue: st.invalidAtComputedValue,
+      skinSelectorRewrites: st.skinSelectorRewrites,
+      skinSelectorKept: st.skinSelectorKept,
+      skinAttrsStripped: st.skinAttrsStripped,
       varsResolved: varCount,
+      varsFromElements: varsFromElements,
       elements: st.elements,
       computedRules: st.computedRules,
       assetsInlined: st.assetsInlined,
