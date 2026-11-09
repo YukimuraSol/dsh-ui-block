@@ -1,0 +1,156 @@
+{
+  "name": "DSH 多文件块演示（3 页 · 4 次切页 · 含回退）",
+  "timeline": {
+    "loop": true,
+    "duration": 14000,
+    "steps": [
+      {
+        "at": 0,
+        "do": "switch",
+        "snapshot": "home"
+      },
+      {
+        "at": 250,
+        "do": "move",
+        "to": {
+          "text": "插件"
+        }
+      },
+      {
+        "at": 900,
+        "do": "highlight",
+        "to": {
+          "text": "插件"
+        },
+        "ms": 600
+      },
+      {
+        "at": 1600,
+        "do": "click",
+        "to": {
+          "text": "插件"
+        }
+      },
+      {
+        "at": 2150,
+        "do": "switch",
+        "snapshot": "plugins"
+      },
+      {
+        "at": 2500,
+        "do": "move",
+        "to": {
+          "sel": "[role='tablist'] button:nth-of-type(2)"
+        }
+      },
+      {
+        "at": 3050,
+        "do": "highlight",
+        "to": {
+          "sel": "[role='tablist'] button:nth-of-type(2)"
+        },
+        "ms": 700
+      },
+      {
+        "at": 3650,
+        "do": "click",
+        "to": {
+          "sel": "[role='tablist'] button:nth-of-type(2)"
+        }
+      },
+      {
+        "at": 4150,
+        "do": "switch",
+        "snapshot": "market"
+      },
+      {
+        "at": 4500,
+        "do": "move",
+        "to": {
+          "text": "dsh-market"
+        }
+      },
+      {
+        "at": 5050,
+        "do": "highlight",
+        "to": {
+          "text": "dsh-market"
+        },
+        "ms": 800
+      },
+      {
+        "at": 5900,
+        "do": "click",
+        "to": {
+          "sel": "[role='tablist'] button:nth-of-type(1)"
+        }
+      },
+      {
+        "at": 6350,
+        "do": "switch",
+        "snapshot": "plugins"
+      },
+      {
+        "at": 6750,
+        "do": "move",
+        "to": {
+          "text": "智能体团队"
+        }
+      },
+      {
+        "at": 7300,
+        "do": "highlight",
+        "to": {
+          "text": "智能体团队"
+        },
+        "ms": 800
+      },
+      {
+        "at": 8100,
+        "do": "click",
+        "to": {
+          "text": "智能体团队"
+        }
+      },
+      {
+        "at": 8650,
+        "do": "switch",
+        "snapshot": "home"
+      },
+      {
+        "at": 9000,
+        "do": "move",
+        "to": {
+          "sel": "[data-composer-input]"
+        }
+      },
+      {
+        "at": 9400,
+        "do": "type",
+        "to": {
+          "sel": "[data-composer-input]"
+        },
+        "hide": [
+          "[data-composer-placeholder]"
+        ],
+        "text": "这套演示分了三页",
+        "cps": 16
+      },
+      {
+        "at": 11250,
+        "do": "highlight",
+        "to": {
+          "text": "发送消息"
+        },
+        "ms": 700
+      },
+      {
+        "at": 11950,
+        "do": "click",
+        "to": {
+          "text": "发送消息"
+        }
+      }
+    ]
+  }
+}

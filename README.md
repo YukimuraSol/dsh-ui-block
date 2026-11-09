@@ -174,6 +174,39 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 - srcdoc 里 CSP `default-src none; style-src unsafe-inline; img-src data: blob:; font-src data:; media-src data:; form-action none; base-uri none`，`referrerpolicy="no-referrer"`。
 - 主题令牌：读宿主 `document.body` / `documentElement` 上的全部 `--dsw-*`（0.1.7 时 384 个，0.2.0-rc.2 实测 413 个）注入 srcdoc 的 `:root`，并写 `color-scheme`。主题切换后 1.5s 内自动重绘（已验证：不刷新页面，深→浅会自己重绘）。
 
+## 素材抓取脚本怎么跑（tools/）
+
+脚本从 ui-snapshot 并进来，相对路径按启动目录解析，所以统一在插件目录里跑；插件目录的 `out\` 已在 `.gitignore` 里。
+
+```powershell
+# token（3080）
+Select-String -LiteralPath 'D:\DSH Pack Launcher\dsh-packs\dsh-origin-3080\logs\launcher.out.log' -Pattern 'dsh web: http' | Select-Object -Last 1
+
+# 1) 抓（--split = 多文件模式）
+node tools\capture.mjs --url "http://127.0.0.1:3080/?token=<token>" --split out\parts\home --shot out\parts\home\live.png --settle 2500
+
+# 2) 组装多文件站 + 块
+node tools\assemble.mjs --parts out\parts --names home,plugins,market --out out\site --timeline tools\timeline-multi.json
+
+# 3) 起服务看：http://127.0.0.1:3911/out/site/index.html
+node tools\serve.mjs 3911
+
+# 块校验（--allow-html 给多页块用；--selftest 期望 "selftest": "PASS"）
+node tools\blockcheck.mjs out\data.uiblock --allow-html
+node tools\blockcheck.mjs --selftest
+
+# 验收（服务与目标实例都要在）
+node tools\verify2.mjs "http://127.0.0.1:3911/out/site/index.html"
+node tools\pixels.mjs home,plugins,market
+node tools\plugpix.mjs http://127.0.0.1:4000 <4000 的 token> <块名> home,plugins,market
+
+# 单文件模式：抓一份自包含 html，看 harness.html
+node tools\capture.mjs --url "http://127.0.0.1:3080/?token=<token>" --out out\snap-home.html --settle 2500
+# 然后打开 http://127.0.0.1:3911/tools/harness.html
+```
+
+搬家前的产物还在 `..\ui-snapshot\out\`（含现成的 `data.uiblock`，可直接拿来试 `blockcheck`），新抓的一律写在插件目录的 `out\`。
+
 ## 安装到 4000
 
 文件清单：

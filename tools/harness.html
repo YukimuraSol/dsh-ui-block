@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ui-snapshot player harness</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: absolute; inset: 0; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script type="module">
+  import { createPlayer } from './player.mjs';
+  const demo = await (await fetch('./demo.json')).json();
+  const snapshots = {};
+  for (const [k, p] of Object.entries(demo.snapshots)) {
+    // "url:..." = 多文件页面（站点里的地址）；否则是单文件快照的路径，取成字符串
+    snapshots[k] = p.trim().startsWith('url:') ? p.trim() : await (await fetch(p)).text();
+  }
+  const player = createPlayer({
+    snapshots,
+    timeline: demo.timeline,
+    mount: document.getElementById('stage'),
+    onState: (s) => { window.__playerState = s; },
+  });
+  window.__player = player;
+  window.__playerReady = true;
+  window.__playerFrame = () => player.frameInfo();
+  if (new URLSearchParams(location.search).get('autoplay') !== '0') player.play();
+</script>
+</body>
+</html>

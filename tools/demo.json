@@ -1,0 +1,133 @@
+{
+  "name": "DSH 插件页演示（自包含快照 + 时间轴）",
+  "snapshots": {
+    "home": "out/snap-home.html",
+    "plugins": "out/snap-plugins.html"
+  },
+  "timeline": {
+    "loop": true,
+    "duration": 11000,
+    "steps": [
+      {
+        "at": 0,
+        "do": "switch",
+        "snapshot": "home"
+      },
+      {
+        "at": 250,
+        "do": "move",
+        "to": {
+          "text": "插件"
+        }
+      },
+      {
+        "at": 900,
+        "do": "highlight",
+        "to": {
+          "text": "插件"
+        },
+        "ms": 600
+      },
+      {
+        "at": 1600,
+        "do": "click",
+        "to": {
+          "text": "插件"
+        }
+      },
+      {
+        "at": 1850,
+        "do": "wait",
+        "ms": 350
+      },
+      {
+        "at": 2350,
+        "do": "switch",
+        "snapshot": "plugins"
+      },
+      {
+        "at": 2750,
+        "do": "move",
+        "to": {
+          "text": "添加插件"
+        }
+      },
+      {
+        "at": 3300,
+        "do": "click",
+        "to": {
+          "text": "添加插件"
+        }
+      },
+      {
+        "at": 3550,
+        "do": "highlight",
+        "to": {
+          "text": "插件市场"
+        },
+        "ms": 800
+      },
+      {
+        "at": 4400,
+        "do": "move",
+        "to": {
+          "text": "智能体团队"
+        }
+      },
+      {
+        "at": 5000,
+        "do": "highlight",
+        "to": {
+          "text": "智能体团队"
+        },
+        "ms": 700
+      },
+      {
+        "at": 5900,
+        "do": "click",
+        "to": {
+          "text": "智能体团队"
+        }
+      },
+      {
+        "at": 6300,
+        "do": "switch",
+        "snapshot": "home"
+      },
+      {
+        "at": 6600,
+        "do": "move",
+        "to": {
+          "sel": "[data-composer-input]"
+        }
+      },
+      {
+        "at": 7100,
+        "do": "type",
+        "to": {
+          "sel": "[data-composer-input]"
+        },
+        "hide": [
+          "[data-composer-placeholder]"
+        ],
+        "text": "帮我把插件页做成演示",
+        "cps": 14
+      },
+      {
+        "at": 9200,
+        "do": "highlight",
+        "to": {
+          "text": "发送消息"
+        },
+        "ms": 700
+      },
+      {
+        "at": 9900,
+        "do": "click",
+        "to": {
+          "text": "发送消息"
+        }
+      }
+    ]
+  }
+}
