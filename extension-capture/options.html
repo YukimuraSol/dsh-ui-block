@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>dsh-page-capture 选项</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 620px; margin: 28px auto; padding: 0 18px; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 20px; opacity: .72; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input[type=text] { width: 100%; padding: 7px 9px; border: 1px solid #8884; border-radius: 6px; font: inherit; box-sizing: border-box; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 18px 0 0; }
+  .row input { width: auto; }
+  .btns { display: flex; gap: 10px; margin: 22px 0 0; }
+  button { padding: 7px 14px; border: 1px solid #8886; border-radius: 6px; background: #2563eb11; font: inherit; cursor: pointer; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  pre { margin: 14px 0 0; padding: 10px; border-radius: 6px; background: #8881; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 1em; }
+  .warn { background: #b4530922; border: 1px solid #b4530966; padding: 10px 12px; border-radius: 6px; margin: 18px 0 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>dsh-page-capture</h1>
+<p class="hint">把当前页整页抽成素材包，交给本地 DSH（<code>list_pages</code> / <code>capture_page</code> 的原料来源）。</p>
+
+<label for="baseUrl">base URL（DSH 实例地址）</label>
+<input type="text" id="baseUrl" placeholder="http://127.0.0.1:4000" spellcheck="false">
+
+<label for="instance">instance 名（同一浏览器只填一个，用来区分 Chrome A / Edge B）</label>
+<input type="text" id="instance" placeholder="chrome" spellcheck="false">
+
+<label for="token">配对码（可选；插件侧 agent.requireToken 打开时才需要）</label>
+<input type="text" id="token" placeholder="留空 = 不带 token" spellcheck="false">
+
+<div class="row">
+  <input type="checkbox" id="enabled">
+  <label for="enabled" style="margin:0;font-weight:600">上报开关（关掉 = 扩展一个请求都不发，DSH 那边看不见它）</label>
+</div>
+
+<div class="btns">
+  <button class="primary" id="save">保存</button>
+  <button id="test">测试连接</button>
+</div>
+
+<pre id="out">（未测试）</pre>
+
+<div class="warn">
+  装好之后不用点任何按钮：后台每 2 秒轮询一次，你点到想抓的那一页，DSH 的 <code>list_pages</code> 就能看见它。
+  改了 base URL 立刻生效，不用重装扩展。
+</div>
+
+<script src="options.js"></script>
+</body>
+</html>

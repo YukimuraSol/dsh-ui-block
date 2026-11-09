@@ -1,0 +1,205 @@
+// dsh-page-capture / background.js  (MV3 service worker)
+// 只做三件事：
+//   1. 每 2 秒 poll 一次 /ui-blocks/agent/poll，顺带把 chrome.tabs.query({}) 的精简清单带上；
+//   2. 拿到任务就激活目标标签（坑 1）→ 注入 extractor.js → 取回素材包；
+//   3. 把结果 POST 回 /ui-blocks/agent/result。
+// 上报开关关掉时：一个请求都不发（连轮询都不发）。
+// ponytail: 用 setTimeout 自链代替 chrome.alarms（省一个权限）；2 秒一次的 fetch 本身就是
+// 心跳，SW 不会 30 秒闲置被回收。真要长期关着再打开也能立刻恢复（storage.onChanged）。
+
+const DEFAULTS = { baseUrl: 'http://127.0.0.1:4000', instance: 'chrome', token: '', enabled: true }
+const POLL_MS = 2000
+const ACTIVATE_WAIT_MS = 300
+const GONE = '目标已消失，请重新 list_pages'
+
+let cfg = Object.assign({}, DEFAULTS)
+let timer = null
+let busy = false
+
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+
+function log() {
+  try { console.log.apply(console, ['[dsh-page-capture]'].concat(Array.prototype.slice.call(arguments))) } catch (e) {}
+}
+
+function badge(text, color) {
+  try {
+    chrome.action.setBadgeText({ text: text || '' })
+    if (color) chrome.action.setBadgeBackgroundColor({ color: color })
+  } catch (e) {}
+}
+
+async function readCfg() {
+  const got = await chrome.storage.local.get(DEFAULTS)
+  cfg = Object.assign({}, DEFAULTS, got)
+  if (!cfg.baseUrl) cfg.baseUrl = DEFAULTS.baseUrl
+  if (!cfg.instance) cfg.instance = DEFAULTS.instance
+  return cfg
+}
+
+function endpoint(path) {
+  let base = String(cfg.baseUrl || DEFAULTS.baseUrl).replace(/\/+$/, '')
+  let u = base + path
+  if (cfg.token) u += (u.indexOf('?') < 0 ? '?' : '&') + 'token=' + encodeURIComponent(cfg.token)
+  return u
+}
+
+// ---- 坑 3：有些页永远抓不到 ------------------------------------------------
+const BAD_SCHEME = /^(chrome|edge|brave|opera|vivaldi|devtools|about|view-source|chrome-extension|moz-extension|safari-extension|chrome-search):/i
+const STORE = /^https?:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore|microsoftedge\.microsoft\.com\/addons|addons\.mozilla\.org)/i
+const PDF = /\.pdf([?#]|$)/i
+
+function capturable(tab) {
+  const url = String((tab && tab.url) || '')
+  if (!url) return { ok: false, reason: '该标签还没有 URL（可能在加载中）' }
+  const m = /^([a-z0-9+.-]+):/i.exec(url)
+  const scheme = m ? m[1].toLowerCase() : ''
+  if (BAD_SCHEME.test(url)) return { ok: false, reason: '浏览器内部页或扩展页（' + scheme + '://）不是 DOM 页面' }
+  if (STORE.test(url)) return { ok: false, reason: '扩展商店页不允许注入脚本' }
+  if (scheme === 'http' || scheme === 'https') {
+    if (PDF.test(url)) return { ok: false, reason: '内嵌 PDF 不是 DOM 页面' }
+    return { ok: true }
+  }
+  if (scheme === 'file') {
+    if (PDF.test(url)) return { ok: false, reason: '本地 PDF 不是 DOM 页面' }
+    return { ok: true }
+  }
+  return { ok: false, reason: '不支持的协议：' + (scheme || '未知') }
+}
+
+async function listTabs() {
+  let focusedWindow = -1
+  try { focusedWindow = (await chrome.windows.getLastFocused({ windowTypes: ['normal'] })).id } catch (e) {}
+  const tabs = await chrome.tabs.query({})
+  const out = []
+  for (const t of tabs) {
+    if (t.id === undefined || t.id === null) continue
+    const c = capturable(t)
+    const row = { tabId: t.id, url: String(t.url || ''), title: String(t.title || ''), focused: !!t.active && t.windowId === focusedWindow, capturable: c.ok }
+    if (!c.ok) row.reason = c.reason
+    out.push(row)
+  }
+  return out
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    cache: 'no-store'
+  })
+  let json = null
+  try { json = await res.json() } catch (e) { json = null }
+  return { status: res.status, json: json }
+}
+
+async function poll(tabs) {
+  const r = await postJson(endpoint('/ui-blocks/agent/poll'), { instance: cfg.instance, tabs: tabs })
+  if (r.status !== 200) throw new Error('poll HTTP ' + r.status)
+  if (!r.json || typeof r.json !== 'object') throw new Error('poll 返回的不是 JSON')
+  return r.json.task || null
+}
+
+async function sendResult(taskId, payload) {
+  const body = Object.assign({ instance: cfg.instance, taskId: taskId }, payload)
+  const r = await postJson(endpoint('/ui-blocks/agent/result'), body)
+  if (!r.json) throw new Error('result HTTP ' + r.status + '（无 JSON）')
+  if (r.json.ok === false) throw new Error('DSH 拒收：' + (r.json.error || '未知原因'))
+  log('result ok ->', r.json.dir)
+  return r.json
+}
+
+async function runTask(task) {
+  const tabId = task && task.tabId
+  if (typeof tabId !== 'number') return sendResult(task && task.id, { ok: false, error: '任务缺 tabId' })
+
+  // 坑 2：目标标签可能已经被关掉——不猜替代品
+  let tab
+  try { tab = await chrome.tabs.get(tabId) } catch (e) { return sendResult(task.id, { ok: false, error: GONE }) }
+  if (!tab) return sendResult(task.id, { ok: false, error: GONE })
+
+  const c = capturable(tab)
+  if (!c.ok) return sendResult(task.id, { ok: false, error: '该页抓不了：' + c.reason })
+
+  // 坑 1：后台标签会偷懒（不在前台时不渲染/延迟加载），先切到前台再等 300ms
+  try {
+    await chrome.tabs.update(tabId, { active: true })
+    try { await chrome.windows.update(tab.windowId, { focused: true }) } catch (e) {}
+    await sleep(ACTIVATE_WAIT_MS)
+    badge('..', '#b45309')
+  } catch (e) {
+    return sendResult(task.id, { ok: false, error: '该页在后台且拒绝激活，请手动切过去：' + String(e && e.message || e) })
+  }
+
+  const opts = { origin: String(tab.url || ''), title: String(tab.title || '') }
+  if (task.includes) opts.includes = String(task.includes)
+  if (task.maxBytes) opts.maxBytes = Number(task.maxBytes)
+
+  let out
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['extractor.js'] })
+    const res = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: function (o) { return globalThis.dshPageCapture.extract(document, o) },
+      args: [opts]
+    })
+    out = res && res[0] ? res[0].result : null
+    if (!out || !out.files) throw new Error('抽取函数没有返回 files（页面可能禁止注入）')
+  } catch (e) {
+    return sendResult(task.id, { ok: false, error: '抓取失败：' + String(e && e.message || e) })
+  }
+
+  return sendResult(task.id, { ok: true, files: out.files, report: out.report })
+}
+
+async function tick() {
+  timer = null
+  if (busy) { schedule(POLL_MS); return }
+  busy = true
+  try {
+    await readCfg()
+    if (!cfg.enabled) { badge('off', '#6b7280'); return }   // 关掉就一个请求都不发
+    badge('on', '#2563eb')
+    const tabs = await listTabs()
+    const task = await poll(tabs)
+    if (task) {
+      log('task', task.id, 'tab', task.tabId)
+      await runTask(task)
+    }
+  } catch (e) {
+    badge('!', '#b91c1c')
+    log('tick failed: ' + String(e && e.message || e))
+  } finally {
+    busy = false
+    schedule(POLL_MS)
+  }
+}
+
+function schedule(ms) {
+  if (timer) clearTimeout(timer)
+  timer = setTimeout(function () { tick() }, ms === undefined ? POLL_MS : ms)
+}
+
+function stop() {
+  if (timer) { clearTimeout(timer); timer = null }
+}
+
+// ---- 唤醒点 ----------------------------------------------------------------
+chrome.runtime.onInstalled.addListener(function () { schedule(0) })
+chrome.runtime.onStartup.addListener(function () { schedule(0) })
+chrome.action.onClicked.addListener(function () { chrome.runtime.openOptionsPage() })
+chrome.storage.onChanged.addListener(function () { stop(); schedule(0) })
+
+// options 页问一句"现在什么状态"
+chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+  if (msg && msg.type === 'dsh-capture-status') {
+    reply({ enabled: !!cfg.enabled, baseUrl: cfg.baseUrl, instance: cfg.instance, busy: busy })
+    return false
+  }
+  return false
+})
+
+// 测试钩子：CDP / 断点里可以直接调 __dshCaptureTick() 跑一轮
+globalThis.__dshCaptureTick = function () { return tick() }
+schedule(0)
