@@ -45,6 +45,14 @@
  * DEFAULT_RES (1440x900) — the same default the host's read_ui_block screenshots
  * at, so the model sees the picture the user sees.
  *
+ * Demo blocks (2026-11-09, route 1: host-driven): a block file that carries a
+ * demo.json section is a DEMO BLOCK. The one criterion is that section; nothing
+ * is probed at runtime, and a block without it takes exactly the old path — no
+ * player, no transport, no rAF, no extra node. A demo block keeps the same
+ * security model (sandbox allow-same-origin only, frame pointer-events:none):
+ * the plugin projects the timeline from outside, onto the same-origin snapshot
+ * pages the vendored player mounts, and the banner says 演示 · 非交互.
+ *
  * Sandbox: allow-same-origin ONLY, never allow-scripts (both together disable the
  * sandbox). The draft stays script-inert and its CSP still blocks external loads,
  * but the parent can read the frame's DOM — which is what the canvas picker needs.
@@ -976,10 +984,102 @@ window.__ModuleLoader__.load({
 
     var CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:; form-action 'none'; base-uri 'none'";
 
+    // A section marker as the CLIENT sees it: only its presence matters here (the
+    // host does the parsing and the guard), and it decides srcdoc vs served URL.
+    var SECTION_LINE_RE = /^[ \t]*<!--[ \t]*@@file[ \t]+\S/m;
+    var TOKEN_STYLE_ID = 'dshpb-tokens';
+
+    /** The one token sheet: live theme properties plus the shared base rules. */
+    function tokenSheet(tokens) {
+      return ':root{' + tokens.css + '}html{color-scheme:' + tokens.scheme + '}' + BASE_CSS;
+    }
+
+    /**
+     * Write the token sheet into a document this page owns. The srcdoc frame gets
+     * it inline at build time; a SERVED block document (same origin, see the
+     * sandbox value) gets it here, once, right after its load event.
+     * @returns whether the document accepted it.
+     */
+    function applyTokens(doc, tokens) {
+      if (!doc || !doc.head) return false;
+      var style = doc.getElementById(TOKEN_STYLE_ID);
+      if (style === null) {
+        style = doc.createElement('style');
+        style.id = TOKEN_STYLE_ID;
+        // FIRST in head: the block's own stylesheet must be able to win, and a
+        // later copy of BASE_CSS would silently outrank it at equal specificity.
+        doc.head.insertBefore(style, doc.head.firstChild);
+      }
+      style.textContent = tokenSheet(tokens);
+      return true;
+    }
+
+    // Host body attributes a served block document needs to see. Real component CSS
+    // keys on them (`body[data-ds-dark-theme] .card{...}`), and a served document has
+    // its OWN body, so without this mirror every such rule silently misses and the
+    // block paints the light variant no matter what the app around it shows.
+    //
+    // Prefix whitelist, not a blanket dataset copy: `data-dshpb-*` is this plugin's
+    // own marker space, and the block has no business reading anything else.
+    var MIRROR_PREFIXES = ['data-ds-', 'data-dsh-'];
+    function mirrorName(name) {
+      for (var i = 0; i < MIRROR_PREFIXES.length; i += 1) {
+        if (name.indexOf(MIRROR_PREFIXES[i]) === 0) return name.indexOf('data-dshpb-') !== 0;
+      }
+      return false;
+    }
+    /** Live view of the host body's mirrored attributes, sorted by name. */
+    function mirrorPairs() {
+      var pairs = [];
+      var attrs = document.body ? document.body.attributes : null;
+      if (attrs === null) return pairs;
+      for (var i = 0; i < attrs.length; i += 1) {
+        var name = String(attrs[i].name === undefined ? '' : attrs[i].name).toLowerCase();
+        if (!mirrorName(name)) continue;
+        pairs.push([name, String(attrs[i].value)]);
+      }
+      pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+      return pairs;
+    }
+    /** The mirrored set as one string, so a theme or skin switch has a cheap key. */
+    function attrsKeyNow() {
+      var pairs = mirrorPairs();
+      var parts = [];
+      for (var i = 0; i < pairs.length; i += 1) parts.push(pairs[i][0] + '=' + pairs[i][1]);
+      return parts.join(';');
+    }
+    /**
+     * Write the host's mirrored attributes onto a served document's body, and drop
+     * the ones the host no longer has — a switch back to light must remove the dark
+     * flag, or the block would never leave dark mode.
+     * @returns the attribute key that was applied.
+     */
+    function mirrorAttrs(doc) {
+      if (!doc || !doc.body) return '';
+      var pairs = mirrorPairs();
+      var want = {};
+      var parts = [];
+      for (var i = 0; i < pairs.length; i += 1) {
+        want[pairs[i][0]] = pairs[i][1];
+        parts.push(pairs[i][0] + '=' + pairs[i][1]);
+      }
+      var have = doc.body.attributes;
+      for (var d = have.length - 1; d >= 0; d -= 1) {
+        var old = String(have[d].name === undefined ? '' : have[d].name).toLowerCase();
+        if (!mirrorName(old)) continue;
+        if (want[old] === undefined) { try { doc.body.removeAttribute(old); } catch (e) { /* keep going */ } }
+      }
+      for (var n in want) {
+        if (!Object.prototype.hasOwnProperty.call(want, n)) continue;
+        try { doc.body.setAttribute(n, want[n]); } catch (e) { /* keep going */ }
+      }
+      return parts.join(';');
+    }
+
     function buildSrcdoc(state, tokens) {
       var head = '<!doctype html><html><head><meta charset="utf-8">' +
         '<meta http-equiv="Content-Security-Policy" content="' + CSP + '">' +
-        '<style>:root{' + tokens.css + '}html{color-scheme:' + tokens.scheme + '}' + BASE_CSS + '</style>' +
+        '<style>' + tokenSheet(tokens) + '</style>' +
         '</head><body>';
       return head + state.body + '</body></html>';
     }
@@ -1006,6 +1106,11 @@ window.__ModuleLoader__.load({
       '.dshpb-shell.dshpb-grabbing{cursor:grabbing}',
       '.dshpb-frame{display:block;border:0;transform-origin:top left;background:var(--dsw-alias-bg-base);',
       'pointer-events:none;box-shadow:0 0 0 .5px var(--dsw-alias-border-l1)}',
+      // A demo stage is the player's own canvas: an absolute overlay that copies
+      // the frame's geometry, so it pans and zooms with the block instead of
+      // floating over it. pointer-events stays none, exactly like the frame.
+      '.dshpb-stage{position:absolute;left:0;top:0;transform-origin:top left;overflow:hidden;pointer-events:none;z-index:1}',
+      '.dshpb-stage-mount{position:relative;width:100%;height:100%;overflow:hidden}',
       '.dshpb-handle{position:absolute;left:0;right:0;bottom:0;height:7px;cursor:ns-resize;z-index:3;touch-action:none}',
       '.dshpb-handle::after{content:"";position:absolute;left:50%;top:2px;width:36px;height:3px;margin-left:-18px;',
       'border-radius:2px;background:var(--dsw-alias-border-l1);opacity:0;transition:opacity .15s}',
@@ -1293,14 +1398,638 @@ window.__ModuleLoader__.load({
         state.frame.style.height = state.res.h + 'px';
         state.frame.style.transform = 'translate(' + x + 'px,' + y + 'px) scale(' + zoom + ')';
         updateControls(state);
+        // The demo stage copies the frame's geometry exactly, so pan / zoom /
+        // height keep moving the canvas as one thing.
+        if (state.stage) {
+          state.stage.style.width = state.frame.style.width;
+          state.stage.style.height = state.frame.style.height;
+          state.stage.style.transform = state.frame.style.transform;
+        }
+      }
+      // ── demo blocks: the HOST plays the timeline (route 1) ──────────────────
+      // A block file that carries a demo.json section is a DEMO BLOCK. The block
+      // stays pure data — sandbox: allow-same-origin only, no allow-scripts, the
+      // block frame still pointer-events:none — and this plugin is the projector:
+      // cursor, highlight, synthetic click, page switch and per-character typing
+      // all run from here on the snapshot documents the player mounts. A block
+      // without that section never reaches a line of this code.
+      var DEMO_FILE_RE = /(^|\/)demo\.json$/;
+
+      /** One block body's sections in file order; index 0 is the entry (path ''). */
+      function blockSections(body) {
+        var text = String(body == null ? '' : body);
+        var out = [];
+        var re = /^[ \t]*<!--[ \t]*@@file[ \t]+([^\s>]+)[ \t]*(?:base64)?[ \t]*-->[ \t]*$/gm;
+        var at = 0, current = '', m;
+        while ((m = re.exec(text)) !== null) {
+          out.push({ path: current, text: text.slice(at, m.index) });
+          current = m[1];
+          at = m.index + m[0].length;
+        }
+        out.push({ path: current, text: text.slice(at) });
+        return out;
+      }
+
+      /**
+       * The demo spec of a block, or null for an ordinary block. Anything that is
+       * not a sectioned body with a parseable demo.json carrying a timeline stays
+       * on the old path — a typo must never cost a block its canvas.
+       */
+      function readDemo(body) {
+        if (!hasSections(body)) return null;
+        var sections = blockSections(body);
+        for (var i = 0; i < sections.length; i += 1) {
+          if (!DEMO_FILE_RE.test(sections[i].path)) continue;
+          var spec = null;
+          try { spec = JSON.parse(sections[i].text); } catch (e) {
+            // An unreadable timeline must never blank the block: one warning, then
+            // the ordinary static canvas shows its own markup.
+            console.warn('[dsh-ui-block] demo.json 解析失败，按静态块显示：' + String((e && e.message) || e));
+            return null;
+          }
+          if (!spec || !spec.snapshots || !spec.timeline) return null;
+          var snaps = Object.keys(spec.snapshots);
+          var steps = spec.timeline.steps;
+          // No snapshot or no step is not a demo: an empty timeline falls back to
+          // the static page instead of a blank stage.
+          if (snaps.length === 0 || !Array.isArray(steps) || steps.length === 0) return null;
+          return spec;
+        }
+        return null;
+      }
+
+      /** A snapshot's address, resolved against the block's own served directory. */
+      function blockUrl(state, rel) {
+        var dir = entryUrl(state);
+        var cut = dir.indexOf('?');
+        if (cut >= 0) dir = dir.slice(0, cut);
+        return new URL(String(rel).replace(/^url:/, ''), new URL(dir, window.location.href)).href;
+      }
+
+      function destroyPlayer(state) {
+        if (state.io) { try { state.io.disconnect(); } catch (e) { /* already gone */ } state.io = null; }
+        if (state.player) { try { state.player.destroy(); } catch (e) { /* already gone */ } state.player = null; }
+        state.playerState = null;
+        if (state.mount) { try { state.mount.innerHTML = ''; } catch (e) { /* already gone */ } }
+      }
+
+      /** The overlay layer the player mounts into (once per seat). */
+      function ensureStage(state) {
+        if (state.stage && state.stage.isConnected && state.mount) return;
+        var stage = document.createElement('div');
+        stage.className = 'dshpb-stage';
+        stage.setAttribute('data-dshpb-stage', 'true');
+        var mount = document.createElement('div');
+        mount.className = 'dshpb-stage-mount';
+        stage.appendChild(mount);
+        if (state.shell) state.shell.insertBefore(stage, state.handle || null);
+        state.stage = stage;
+        state.mount = mount;
+      }
+
+      /** A demo block paints the PLAYER; the raw block document never shows. */
+      function paintDemo(state) {
+        if (state.paintedBody === state.body && state.player) return;
+        state.paintedBody = state.body;
+        state.frame.style.visibility = 'hidden';
+        state.frame.style.display = 'none';
+        destroyPlayer(state);
+        ensureStage(state);
+        var spec = state.demoSpec;
+        var snapshots = {};
+        for (var name in spec.snapshots) {
+          if (!Object.prototype.hasOwnProperty.call(spec.snapshots, name)) continue;
+          snapshots[name] = blockUrl(state, spec.snapshots[name]);
+        }
+        state.userPaused = false;
+        state.player = createPlayer({
+          snapshots: snapshots,
+          timeline: spec.timeline,
+          mount: state.mount,
+          onState: function (next) { state.playerState = next; }
+        });
+        armAutoplay(state);
+        applySize(state);
+        state.player.play();
+      }
+
+      /**
+       * Autoplay by visibility: scrolling the block into view starts the show,
+       * scrolling it away pauses it. A pause the user asked for survives both —
+       * only 播放 / 重新开始 clears it.
+       */
+      function armAutoplay(state) {
+        if (typeof IntersectionObserver !== 'function' || !state.stage) return;
+        if (state.io) { try { state.io.disconnect(); } catch (e) { /* already gone */ } }
+        state.io = new IntersectionObserver(function (entries) {
+          for (var i = 0; i < entries.length; i += 1) {
+            if (!state.player) continue;
+            if (entries[i].isIntersecting) { if (!state.userPaused) state.player.play(); }
+            else state.player.pause();
+          }
+        }, { threshold: 0.05 });
+        state.io.observe(state.stage);
+      }
+
+      /**
+       * The transport: 播放 / 暂停 / 重新开始. Same class as the existing controls
+       * (no new style), appended AFTER them, and only on a demo block — a static
+       * block's banner is untouched.
+       */
+      function buildTransport(state, controls) {
+        if (!state.demoSpec || state.transport) return;
+        var bar = document.createElement('span');
+        bar.className = 'dshpb-ctl';
+        bar.setAttribute('data-dshpb-demo-bar', 'true');
+        var actions = [['play', '播放'], ['pause', '暂停'], ['restart', '重新开始']];
+        for (var i = 0; i < actions.length; i += 1) {
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'dshpb-btn';
+          button.setAttribute('data-dshpb-demo', actions[i][0]);
+          button.setAttribute('aria-label', actions[i][1]);
+          button.textContent = actions[i][1];
+          button.addEventListener('click', (function (action) {
+            return function (event) {
+              event.preventDefault();
+              event.stopPropagation();
+              demoSet(state, action);
+            };
+          })(actions[i][0]));
+          bar.appendChild(button);
+        }
+        // Placement is measured, not guessed: the banner's action group is
+        // right-aligned, so a fourth item inside it pushes 分辨率 / 选取元素 left by
+        // the transport's whole width. The heading (which holds the dsh-ui label)
+        // has free room to its right, so nothing that existed before moves.
+        var heading = state.block && state.header ? state.header.firstElementChild : null;
+        if (heading && heading !== controls) heading.appendChild(bar);
+        else controls.appendChild(bar);
+        state.transport = bar;
+      }
+
+      function demoSet(state, action) {
+        if (!state.player) return null;
+        if (action === 'pause') { state.userPaused = true; state.player.pause(); }
+        else if (action === 'restart') { state.userPaused = false; state.player.restart(); }
+        else { state.userPaused = false; state.player.play(); }
+        return state.player.state();
+      }
+
+      /** Test seam helper: one demo block's live facts, or null for a plain block. */
+      function demoInfoOf(index) {
+        var s = live[index || 0];
+        if (!s || !s.demoSpec) return null;
+        var st = s.player ? s.player.state() : null;
+        return {
+          demo: true,
+          playing: st ? st.playing : false,
+          t: st ? st.t : null,
+          snapshot: st ? st.snapshot : null,
+          duration: st ? st.duration : null,
+          stepsFired: st ? st.stepsFired : null,
+          stage: !!(s.stage && s.stage.isConnected),
+          transport: s.transport ? s.transport.querySelectorAll('button').length : 0,
+          frame: s.player ? s.player.frameInfo() : null
+        };
+      }
+
+    // ── vendored player (ui-snapshot/player.mjs) — host-driven timeline ──────
+    // [vendored-player] copied 2026-11-09; keep byte-identical to player.mjs in
+    // this plugin directory (self-check-player-vendor.mjs asserts it).
+// dsh-ui-block — vendored copy of ui-snapshot/player.mjs (copied 2026-11-09).
+// Route 1 (host-driven): a demo BLOCK stays pure data — sandbox keeps
+// allow-same-origin only, the block frame keeps pointer-events:none — and this
+// player projects the timeline from outside, on the block's own snapshot pages.
+// Independent on purpose: nothing in the plugin points back at ui-snapshot.
+// Differences from the source, both deliberate:
+//   * the player's own iframe carries sandbox="allow-same-origin" (no scripts);
+//   * the text normalizer uses /\s+/ (the source lost its backslash);
+//   * frameInfo() tolerates a frame whose body does not exist yet.
+// The same text is embedded in client.js between the [vendored-player] markers;
+// self-check-player-vendor.mjs asserts the two copies are identical.
+// player.mjs — 宿主侧时间轴播放器（路线 1：块只当素材，外面演）
+// 用法：createPlayer({ snapshots, timeline, mount }) → { play, pause, seek, restart, destroy, state }
+// 快照是纯数据 HTML，用 blob: 装进同源 iframe；播放器在 iframe 之上画光标/高亮/涟漪，
+// 并直接改 iframe 里的 DOM（同源）来演示“填字 / 按下”。
+
+const STYLE_ID = 'snap-player-style';
+
+function ensureStyle() {
+  if (document.getElementById(STYLE_ID)) return;
+  const st = document.createElement('style');
+  st.id = STYLE_ID;
+  st.textContent = `
+  .snap-stage { position: relative; overflow: hidden; background: #000; }
+  .snap-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
+  .snap-overlay { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 5; }
+  .snap-cursor { position: absolute; left: 0; top: 0; width: 22px; height: 22px; margin: -2px 0 0 -2px;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,.45)); transition: transform .55s cubic-bezier(.33,.02,.2,1); z-index: 3; }
+  .snap-cursor.press { transform-origin: 2px 2px; }
+  .snap-cursor.press::after { content: ''; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px;
+    border: 2px solid rgba(255,255,255,.9); border-radius: 50%; animation: snap-press .28s ease-out forwards; }
+  .snap-ring { position: absolute; border: 2px solid #4da3ff; border-radius: 6px; opacity: 0;
+    box-shadow: 0 0 0 3px rgba(77,163,255,.28), 0 0 18px rgba(77,163,255,.5);
+    transition: opacity .18s ease, transform .18s ease, width .18s ease, height .18s ease; }
+  .snap-ring.show { opacity: 1; }
+  .snap-ripple { position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.85); opacity: 0; z-index: 2; }
+  .snap-ripple.go { animation: snap-ripple .5s ease-out forwards; }
+  @keyframes snap-ripple { 0% { opacity: .9; transform: scale(.4); } 100% { opacity: 0; transform: scale(4.2); } }
+  @keyframes snap-press { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.9); } }
+  `;
+  document.head.appendChild(st);
+}
+
+const CURSOR_SVG =
+  '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 2 L4 20 L9.2 15.3 L12.4 21.6 L15.6 20 L12.3 13.8 L19 13.4 Z" fill="#fff" stroke="#1b1b1b" stroke-width="1.2" stroke-linejoin="round"/></svg>';
+
+const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+// 目标三种写法：直接给选择器字符串 / {sel:'...'} / {text:'按钮上的字'}
+function resolveTarget(doc, to) {
+  if (!to || !doc) return null;
+  if (typeof to === 'string') { try { return doc.querySelector(to); } catch { return null; } }
+  if (to.sel) { try { return doc.querySelector(to.sel); } catch { return null; } }
+  if (to.text) {
+    const want = norm(to.text);
+    let best = null, bestArea = Infinity, bestExact = null;
+    for (const el of doc.body.querySelectorAll('*')) {
+      const txt = norm(el.innerText);
+      if (!txt) continue;
+      const exact = txt === want;
+      if (!exact && !txt.includes(want)) continue;
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      const area = r.width * r.height;
+      if (exact && area < (bestExact ? bestExact.area : Infinity)) bestExact = { el, area };
+      if (area < bestArea) { bestArea = area; best = el; }
+    }
+    return bestExact ? bestExact.el : best;
+  }
+  return null;
+}
+
+function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) {
+  if (!mount) throw new Error('createPlayer: mount 必填');
+  ensureStyle();
+
+  const steps = [...(timeline.steps || [])].sort((a, b) => a.at - b.at).map((s, i) => ({ ...s, _i: i }));
+  const loopEnabled = timeline.loop !== false;
+  const duration = timeline.duration || Math.max(0, ...steps.map((s) => s.at)) + 1500;
+
+  // 快照两种形态，接口不变（仍是"换一份已抓快照"）：
+  //   HTML 字符串  → 装进 blob:
+  //   "url:<地址>" → 直接当站点里的多文件页面加载（共用 CSS/素材各是一份文件）
+  const blobUrls = new Map();
+  const srcFor = (key) => {
+    if (!(key in snapshots)) throw new Error('未知快照: ' + key);
+    const raw = snapshots[key];
+    if (typeof raw === 'string' && !raw.trim().startsWith('<')) {
+      return raw.trim().startsWith('url:') ? raw.trim().slice(4) : raw.trim();
+    }
+    if (!blobUrls.has(key)) blobUrls.set(key, URL.createObjectURL(new Blob([raw], { type: 'text/html' })));
+    return blobUrls.get(key);
+  };
+
+  mount.classList.add('snap-stage');
+  const iframe = document.createElement('iframe');
+  iframe.className = 'snap-frame';
+  iframe.setAttribute('scrolling', 'no');
+  iframe.setAttribute('title', 'snapshot');
+  // Route 1 keeps the block script-inert: the SNAPSHOT runs in a frame that
+  // may be read (same origin) but never runs scripts either.
+  iframe.setAttribute('sandbox', 'allow-same-origin');
+  const overlay = document.createElement('div');
+  overlay.className = 'snap-overlay';
+  const ring = document.createElement('div');
+  ring.className = 'snap-ring';
+  const ripple = document.createElement('div');
+  ripple.className = 'snap-ripple';
+  const cursor = document.createElement('div');
+  cursor.className = 'snap-cursor';
+  cursor.innerHTML = CURSOR_SVG;
+  overlay.append(ripple, ring, cursor);
+  mount.append(iframe, overlay);
+
+  const state = { t: 0, playing: false, snapshot: null, fired: 0, done: 0 };
+  let raf = 0, last = 0, fired = new Set(), updates = [], retries = [], switchWait = null;
+  let cursorAt = { x: 120, y: 120 }, timers = [];
+
+  const later = (ms, fn) => { const id = setTimeout(() => { timers = timers.filter((x) => x !== id); fn(); }, ms); timers.push(id); return id; };
+  const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
+
+  const doc = () => { try { return iframe.contentDocument; } catch { return null; } };
+
+  function setCursor(x, y, instant) {
+    cursorAt = { x, y };
+    if (instant) cursor.style.transition = 'none';
+    cursor.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+    if (instant) { void cursor.offsetWidth; cursor.style.transition = ''; }
+  }
+
+  function centerOf(el) {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), r };
+  }
+
+  function showRing(el, ms) {
+    const d = doc();
+    if (!el || !d) return;
+    const c = centerOf(el);
+    const pad = 4;
+    ring.style.left = (c.r.left - pad) + 'px';
+    ring.style.top = (c.r.top - pad) + 'px';
+    ring.style.width = (c.r.width + pad * 2) + 'px';
+    ring.style.height = (c.r.height + pad * 2) + 'px';
+    ring.classList.add('show');
+    later(ms || 700, () => ring.classList.remove('show'));
+  }
+
+  function doClick(el) {
+    const c = centerOf(el);
+    ripple.style.left = c.x + 'px';
+    ripple.style.top = c.y + 'px';
+    ripple.classList.remove('go');
+    void ripple.offsetWidth;
+    ripple.classList.add('go');
+    cursor.classList.add('press');
+    later(300, () => cursor.classList.remove('press'));
+    // 按下反馈：直接改 iframe 里的目标元素
+    if (el && el.style) {
+      const prev = el.getAttribute('data-snap-pressed');
+      el.setAttribute('data-snap-pressed', '1');
+      const d = doc();
+      if (d) {
+        let st = d.getElementById('snap-press-style');
+        if (!st) { st = d.createElement('style'); st.id = 'snap-press-style';
+          st.textContent = '[data-snap-pressed]{transform:scale(.965)!important;filter:brightness(1.15);transition:transform .1s ease, filter .1s ease!important;}';
+          d.head.appendChild(st); }
+      }
+      later(180, () => { if (prev === null) el.removeAttribute('data-snap-pressed'); else el.setAttribute('data-snap-pressed', prev); });
+    }
+  }
+
+  function doType(el, text, cps, at) {
+    if (!el || !text) return;
+    const tag = el.tagName;
+    const isInput = tag === 'INPUT' || tag === 'TEXTAREA';
+    if (isInput) el.value = '';
+    else el.textContent = '';
+    const chars = [...text];
+    const total = (chars.length * 1000) / (cps || 12);
+    const t0 = at !== undefined ? at : state.t;
+    updates.push(() => {
+      const p = Math.min(1, (state.t - t0) / Math.max(1, total));
+      const n = Math.round(p * chars.length);
+      const val = chars.slice(0, n).join('');
+      if (isInput) el.value = val;
+      else if (el.textContent !== val) el.textContent = val;
+      return p >= 1;
+    });
+  }
+
+  function switchSnapshot(key) {
+    if (!(key in snapshots)) return Promise.resolve(false);
+    state.snapshot = key;
+    return new Promise((res) => {
+      switchWait = res;
+      iframe.addEventListener('load', onLoad, { once: true });
+      iframe.src = srcFor(key);
+    });
+  }
+  function onLoad() {
+    const cb = switchWait; switchWait = null;
+    // 切页后 overlay 状态清掉，避免上一页的框残留
+    ring.classList.remove('show');
+    cb && cb(true);
+  }
+
+  function fire(step) {
+    const d = doc();
+    const to = step.to;
+    const el = () => resolveTarget(d, to);
+    switch (step.do) {
+      case 'switch':
+        switchSnapshot(step.snapshot);
+        break;
+      case 'move': {
+        const e = el();
+        if (!e) return false;
+        const c = centerOf(e);
+        setCursor(c.x, c.y);
+        break;
+      }
+      case 'highlight': {
+        const e = el();
+        if (!e) return false;
+        showRing(e, step.ms);
+        break;
+      }
+      case 'click': {
+        const e = el();
+        if (!e) return false;
+        const c = centerOf(e);
+        setCursor(c.x, c.y);
+        doClick(e);
+        break;
+      }
+      case 'type': {
+        const e = el();
+        if (!e) return false;
+        const c = centerOf(e);
+        setCursor(c.x, c.y);
+        // 占位符先藏起来，免得和打字叠在一起
+        for (const hs of step.hide || []) {
+          try { const h = d.querySelector(hs); if (h) h.style.display = 'none'; } catch {}
+        }
+        doType(e, step.text, step.cps, step.at);
+        break;
+      }
+      case 'wait':
+        break;
+      default:
+        console.warn('[player] 未知步骤', step);
+    }
+    return true;
+  }
+
+  function fireDue() {
+    for (const s of steps) {
+      if (fired.has(s._i)) continue;
+      if (s.at > state.t) continue;
+      fired.add(s._i);
+      if (fire(s) === false) retries.push({ step: s, until: state.t + 2500 });
+      state.fired = fired.size;
+    }
+    if (retries.length) {
+      retries = retries.filter((r) => {
+        if (state.t > r.until) { console.warn('[player] 目标找不到，跳过', r.step); return false; }
+        return fire(r.step) !== true;
+      });
+    }
+  }
+
+  function resetPlayback() {
+    clearTimers();
+    updates = [];
+    retries = [];
+    fired.clear();
+    state.t = 0;
+    state.fired = 0;
+    ring.classList.remove('show');
+    ripple.classList.remove('go');
+    // 回到第一帧应当的画面：第一个 switch 步骤
+    const first = steps.find((s) => s.do === 'switch');
+    if (first) switchSnapshot(first.snapshot);
+    setCursor(120, 120, true);
+  }
+
+  function tick(now) {
+    if (!state.playing) return;
+    if (!last) last = now;
+    const dt = now - last;
+    last = now;
+    state.t += dt;
+    fireDue();
+    updates = updates.filter((fn) => fn() !== true);
+    if (state.t >= duration) {
+      if (loopEnabled) { resetPlayback(); last = now; }
+      else { state.playing = false; onState && onState(publicState()); return; }
+    }
+    onState && onState(publicState());
+    raf = requestAnimationFrame(tick);
+  }
+
+  function publicState() {
+    return { t: Math.round(state.t), playing: state.playing, snapshot: state.snapshot, duration, stepsFired: state.fired, steps: steps.length };
+  }
+
+  const api = {
+    play() {
+      if (state.playing) return;
+      state.playing = true;
+      last = 0;
+      raf = requestAnimationFrame(tick);
+    },
+    pause() {
+      state.playing = false;
+      cancelAnimationFrame(raf);
+      return publicState();
+    },
+    // 一次性把时间轴推到 ms 处（用于逐帧核对/截图）：先落定最后一个 switch，再补跑其余步骤。
+    // 必须 await：iframe 换源是异步的，加载完会把之前的 DOM 改动冲掉。
+    async seek(ms) {
+      clearTimers();
+      updates = [];
+      retries = [];
+      fired.clear();
+      const due = steps.filter((s) => s.at <= ms);
+      const lastSwitch = [...due].reverse().find((s) => s.do === 'switch');
+      if (lastSwitch) await switchSnapshot(lastSwitch.snapshot);
+      state.t = ms;
+      for (const s of due) {
+        fired.add(s._i);
+        if (s.do !== 'switch') fire(s);
+      }
+      state.fired = fired.size;
+      updates = updates.filter((fn) => fn() !== true);
+      onState && onState(publicState());
+      return publicState();
+    },
+    restart() { resetPlayback(); api.play(); return publicState(); },
+    destroy() {
+      cancelAnimationFrame(raf);
+      clearTimers();
+      blobUrls.forEach((u) => URL.revokeObjectURL(u));
+      iframe.remove();
+      overlay.remove();
+    },
+    state: publicState,
+    // 核对用：当前帧里 iframe 的可见文本，证明演的是哪一份快照
+    frameInfo() {
+      const d = doc();
+      return { snapshot: state.snapshot, src: iframe.src.slice(0, 40), text: d && d.body ? norm(d.body.innerText).slice(0, 160) : null, size: d && d.body ? d.body.getBoundingClientRect().width + 'x' + d.body.getBoundingClientRect().height : null };
+    },
+  };
+
+  resetPlayback();
+  return api;
+}
+    // [/vendored-player]
+      /** A sectioned body is served as its own document; a plain one stays srcdoc. */
+      function hasSections(text) { return SECTION_LINE_RE.test(String(text == null ? '' : text)); }
+      /** The document URL of one block, carrying the same pin the text read used. */
+      function entryUrl(state) {
+        var boot = window.__DSH_BOOT__ || {};
+        var base = String(boot.basePath || '').replace(/\/$/, '');
+        var token = '';
+        try { token = new URLSearchParams(window.location.search).get('token') || ''; } catch (e) { token = ''; }
+        var name = String(state.refPath || '').replace(/^ui-blocks\//, '').replace(/\.uiblock$/, '');
+        var query = [];
+        if (state.pin !== null && state.pin !== undefined) {
+          query.push('pin=' + encodeURIComponent(state.pin.key));
+          query.push('i=' + String(state.pin.index));
+        }
+        if (token !== '') query.push('token=' + encodeURIComponent(token));
+        // Trailing slash on purpose: it is the directory the entry lives in, so the
+        // entry's own ./logo.svg resolves inside the block instead of one level up.
+        var url = base + '/ui-blocks/' + encodeURIComponent(name) + '/';
+        return query.length === 0 ? url : url + '?' + query.join('&');
       }
       function paint(state) {
-        var key = state.res.w + 'x' + state.res.h + '|' + state.tokensKey + '|' + state.body;
-        if (state.paintedKey === key) return;
+        // A demo block is played from here, never painted as a document.
+        if (state.demoSpec) { paintDemo(state); return; }
+        var served = hasSections(state.body);
+        // Served branch: what renders is the SERVER's copy, so the key carries a
+        // hash of the body (an edit must still repaint) and the pin. The token
+        // sheet stays out of it on purpose — a theme switch re-injects into the
+        // live document instead of reloading it.
+        var key = served
+          ? state.res.w + 'x' + state.res.h + '|' + (state.pin === null || state.pin === undefined ? '' : state.pin.key + '#' + state.pin.index) + '|' + hashString(state.body)
+          : state.res.w + 'x' + state.res.h + '|' + state.tokensKey + '|' + state.body;
+        if (state.paintedKey === key) {
+          // A served document carries two live copies of host state: the token sheet
+          // and the mirrored body attributes. Either one moving re-injects; reloading
+          // the document for it would only buy a visible flash.
+          if (served && (state.appliedTokensKey !== state.tokensKey || state.appliedAttrsKey !== attrsKeyNow())) injectFrame(state);
+          return;
+        }
         state.paintedKey = key;
         state.frame.setAttribute('width', String(state.res.w));
         state.frame.setAttribute('height', String(state.res.h));
-        state.frame.setAttribute('srcdoc', buildSrcdoc(state, tokenCache));
+        state.urlMode = served;
+        if (!served) {
+          state.frame.removeAttribute('src');
+          state.frame.setAttribute('srcdoc', buildSrcdoc(state, tokenCache));
+          return;
+        }
+        state.frame.removeAttribute('srcdoc');
+        // Hidden until the sheet is in: a served document paints on its own first,
+        // and a flash of unstyled white is the one thing that cannot be undone.
+        state.frame.style.visibility = 'hidden';
+        state.frame.setAttribute('src', entryUrl(state));
+      }
+      /** Inject the live token sheet into the served document currently loaded. */
+      function injectFrame(state) {
+        if (!state.urlMode || !state.frame) return;
+        var doc = null;
+        try { doc = state.frame.contentDocument; } catch (e) { doc = null; }
+        if (!doc || !doc.documentElement) return;
+        // Attributes FIRST: the block's own rules gate on them (dark variant, skin),
+        // and the token sheet only decides what the tokens inside them resolve to.
+        var attrsKey = '';
+        try { attrsKey = mirrorAttrs(doc); } catch (e) { attrsKey = ''; }
+        state.appliedAttrsKey = attrsKey;
+        var applied = false;
+        try { applied = applyTokens(doc, tokenCache); } catch (e) { applied = false; }
+        if (applied === true) {
+          state.appliedTokensKey = state.tokensKey;
+          try { doc.documentElement.setAttribute('data-dshpb-ready', '1'); } catch (e) { /* marker is a nicety */ }
+        }
+        // Visible either way: a document that refused the sheet still shows its
+        // own markup instead of leaving an empty canvas.
+        state.frame.style.visibility = '';
       }
       function relayout(state) {
         applySize(state);
@@ -1404,6 +2133,9 @@ window.__ModuleLoader__.load({
         note.textContent = '未声明，使用默认';
         controls.appendChild(resButton);
         controls.appendChild(pickButton);
+        // Demo transport goes leftmost: it is the only part of a demo block a
+        // pointer can reach, because the frame never takes the pointer.
+        buildTransport(state, controls);
         if (!state.declared || !state.hDeclared) controls.appendChild(note);
         if (slot === header) slot.appendChild(controls);
         else slot.insertBefore(controls, slot.firstChild);
@@ -1676,6 +2408,7 @@ window.__ModuleLoader__.load({
         hidePickBox();
         state.frame.style.pointerEvents = '';
         state.shell.style.cursor = '';
+        if (state.player && state.pickWasPlaying) { state.pickWasPlaying = false; state.player.play(); }
         if (state.pickButton) {
           state.pickButton.classList.remove('dshpb-pick-on');
           state.pickButton.setAttribute('aria-pressed', 'false');
@@ -1722,6 +2455,12 @@ window.__ModuleLoader__.load({
         // hold focus: without this they land on the host page and the layer
         // navigation silently never runs. preventScroll keeps the view still.
         try { state.frame.focus({ preventScroll: true }); } catch (e) { /* focus is best-effort */ }
+        // A pick must not fight the running timeline: the player would keep
+        // switching pages under the pointer. Remember, pause, restore on disarm.
+        if (state.player) {
+          state.pickWasPlaying = !!(state.playerState && state.playerState.playing);
+          if (state.pickWasPlaying) state.player.pause();
+        }
         pickBoxNode();
         if (state.pickButton) {
           state.pickButton.classList.add('dshpb-pick-on');
@@ -1773,6 +2512,7 @@ window.__ModuleLoader__.load({
         frame.className = 'dshpb-frame';
         frame.setAttribute('sandbox', 'allow-same-origin');
         frame.setAttribute('referrerpolicy', 'no-referrer');
+        frame.addEventListener('load', function () { injectFrame(state); });
         var handle = document.createElement('div');
         handle.className = 'dshpb-handle';
         handle.setAttribute('role', 'separator');
@@ -1796,6 +2536,15 @@ window.__ModuleLoader__.load({
         state.pickButton = null;
         state.note = null;
         state.paintedKey = null;
+        state.appliedTokensKey = null;
+        state.appliedAttrsKey = null;
+        state.urlMode = false;
+        destroyPlayer(state);
+        state.stage = null;
+        state.mount = null;
+        state.transport = null;
+        state.userPaused = false;
+        state.paintedBody = null;
         attachInteractions(state);
         mountCodeBlockShell(state);
       }
@@ -1912,8 +2661,10 @@ window.__ModuleLoader__.load({
             pinned: pin !== null,
             pin: pin,
             body: body,
+            demoSpec: readDemo(body),
             paintedKey: null,
-            tokensKey: ''
+            tokensKey: '',
+            appliedAttrsKey: ''
           };
           states.set(lineNode, state);
           live.push(state);
@@ -1934,6 +2685,9 @@ window.__ModuleLoader__.load({
         // and the canvas size, so either change re-renders).
         state.firstLine = line;
         state.body = body;
+        // A timeline in the block file makes it a demo block; anything else is
+        // the ordinary canvas, untouched.
+        state.demoSpec = readDemo(body);
         if (directive.res && (directive.res.w !== state.res.w || directive.res.h !== state.res.h)) {
           state.res = directive.res;
           state.declared = true;
@@ -1957,6 +2711,7 @@ window.__ModuleLoader__.load({
         try { if (state.resObserver) state.resObserver.disconnect(); } catch (e) { /* keep tearing down */ }
         try {
           unbindPan(state);
+          destroyPlayer(state);
           unmountCodeBlockShell(state);
           if (state.block) state.block.classList.remove('dshpb-active');
           if (state.seat && state.seat.parentNode) state.seat.parentNode.removeChild(state.seat);
@@ -1998,7 +2753,7 @@ window.__ModuleLoader__.load({
             if (again !== null) ensureSeat(state.root, again);
             continue;
           }
-          if (state.frame.getAttribute('srcdoc') === null) { state.paintedKey = null; paint(state); }
+          if (!state.demoSpec && state.frame.getAttribute('srcdoc') === null && state.frame.getAttribute('src') === null) { state.paintedKey = null; paint(state); }
           if (!state.controls || !state.controls.isConnected) { buildControls(state); applySize(state); }
           else if (!state.drag) applySize(state); // never fight an active rubber-band drag
           // TTL re-read: an edited file repaints without a page reload. A pinned
@@ -2124,6 +2879,8 @@ window.__ModuleLoader__.load({
         render: {
           tokens: function () { return readTokens(); },
           srcdoc: function (body) { return buildSrcdoc({ body: String(body == null ? '' : body) }, readTokens()); },
+          /** The token sheet alone: a served block document gets it injected. */
+          sheet: function () { return tokenSheet(readTokens()); },
           defaultRes: function () { return { w: DEFAULT_RES.w, h: DEFAULT_RES.h }; }
         },
         /** Test seam: what the ref cache holds for one path (or a pinned variant). */
@@ -2157,6 +2914,18 @@ window.__ModuleLoader__.load({
             };
           }
         },
+        /**
+         * Test seam: one demo block's clock and transport (null for a plain
+         * block). Read-only except play/pause/restart, which are the same
+         * functions the banner buttons call.
+         */
+        demos: {
+          count: function () { var n = 0; for (var i = 0; i < live.length; i += 1) if (live[i].demoSpec) n += 1; return n; },
+          state: function (index) { return demoInfoOf(index); },
+          play: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'play'); return demoInfoOf(index); },
+          pause: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'pause'); return demoInfoOf(index); },
+          restart: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'restart'); return demoInfoOf(index); }
+        },
         sweep: function () {
           sweep();
           return {
@@ -2166,6 +2935,7 @@ window.__ModuleLoader__.load({
             live: live.map(function (s) {
               return {
                 ref: s.refPath,
+                demo: !!s.demoSpec,
                 pinned: !!s.pinned,
                 pin: s.pin === null || s.pin === undefined ? null : { key: s.pin.key, index: s.pin.index },
                 res: formatRes(s.res),
@@ -2218,7 +2988,11 @@ window.__ModuleLoader__.load({
     var EXTENSION_ROUTE = '/ui-block-extension';
     var EXT_SETTINGS_CSS = [
       '.dshub-ext{display:flex;flex-direction:column;gap:12px}',
+      '.dshub-ext-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}',
+      '.dshub-ext-card{display:flex;flex-direction:column;gap:8px;min-width:0;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px}',
       '.dshub-ext-title{margin:0;font-size:14px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary)}',
+      '.dshub-ext-tag{align-self:flex-start;height:18px;line-height:18px;padding:0 6px;border-radius:4px;background:var(--dsw-alias-interactive-bg);color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12)}',
+      '.dshub-ext-line{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);line-height:1.6}',
       '.dshub-ext-ver{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}',
       '.dshub-ext-row{display:flex;align-items:center;gap:8px}',
       '.dshub-ext-path{flex:1 1 auto;min-width:0;height:28px;padding:0 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}',
@@ -2266,62 +3040,41 @@ window.__ModuleLoader__.load({
         && subject.pkg.name === 'dsh-ui-block';
     }
 
-    /** Plugins -> dsh-ui-block: locate, copy, reveal, and the 3 loading steps. */
-    function ExtensionSettingsCard(props) {
-      if (!extensionSubjectMatch(props ? props.subject : undefined)) return null;
-      if (react === null || typeof react.useState !== 'function') return null;
+    /** One card: name, one line of purpose, path, copy, reveal, the three steps. */
+    function ExtensionCard(props) {
       var h = react.createElement;
-      var infoState = react.useState({ phase: 'loading', dir: '', version: '' });
-      var info = infoState[0];
-      var setInfo = infoState[1];
-      var noteState = react.useState('');
-      var note = noteState[0];
-      var setNote = noteState[1];
       var copiedState = react.useState(false);
       var copied = copiedState[0];
       var setCopied = copiedState[1];
-
-      react.useEffect(function () {
-        var live = true;
-        window.fetch(EXTENSION_ROUTE, { credentials: 'same-origin', cache: 'no-store' })
-          .then(function (res) {
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return res.json();
-          })
-          .then(function (body) {
-            if (!live) return;
-            setInfo({ phase: 'ready', dir: String(body.dir || ''), version: String(body.version || '') });
-          })
-          .catch(function (error) {
-            if (!live) return;
-            setInfo({ phase: 'error', dir: '', version: '' });
-            setNote('读取扩展目录失败：' + errorText(error));
-          });
-        return function () { live = false; };
-      }, []);
+      var noteState = react.useState('');
+      var note = noteState[0];
+      var setNote = noteState[1];
+      var dir = String(props.dir || '');
 
       function copyDir() {
-        if (info.dir === '') return;
+        if (dir === '') return;
         var done = function () {
           setCopied(true);
           window.setTimeout(function () { setCopied(false); }, 1600);
         };
         try {
           if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-            navigator.clipboard.writeText(info.dir).then(done, function () {
-              fallbackCopy(info.dir);
+            navigator.clipboard.writeText(dir).then(done, function () {
+              fallbackCopy(dir);
               done();
             });
             return;
           }
         } catch (e) { /* fall through to the textarea path */ }
-        fallbackCopy(info.dir);
+        fallbackCopy(dir);
         done();
       }
 
+      /** Reveal THIS card's directory: the host picks it by name, never by a path from here. */
       function reveal() {
         setNote('正在打开文件夹…');
-        window.fetch(EXTENSION_ROUTE + '/reveal', {
+        var query = props.kind === 'capture' ? '?which=extension-capture' : '';
+        window.fetch(EXTENSION_ROUTE + '/reveal' + query, {
           method: 'POST',
           credentials: 'same-origin',
           cache: 'no-store',
@@ -2337,16 +3090,20 @@ window.__ModuleLoader__.load({
           .catch(function (error) { setNote('打开失败：' + errorText(error)); });
       }
 
-      var pathValue = info.phase === 'ready' ? info.dir : (info.phase === 'error' ? '（读取失败）' : '读取中…');
-      return h('div', { className: 'dshub-ext', 'data-dsh-ui-block-extension': 'card' },
-        h('div', { className: 'dshub-ext-title' }, '浏览器扩展 dsh-element-picker'),
-        h('div', { className: 'dshub-ext-ver' }, info.version === '' ? '扩展版本未知' : '扩展版本 ' + info.version + ' · 与插件 package.json 同版'),
+      var pathValue = dir === ''
+        ? (props.phase === 'error' ? '（读取失败）' : '读取中…')
+        : dir;
+      return h('div', { className: 'dshub-ext-card', 'data-dsh-ui-block-extension': props.kind },
+        h('div', { className: 'dshub-ext-title' }, props.title),
+        h('span', { className: 'dshub-ext-tag' }, props.tag),
+        h('p', { className: 'dshub-ext-line' }, props.line),
+        h('div', { className: 'dshub-ext-ver' }, props.version === '' ? '扩展版本未知' : '扩展版本 ' + props.version + ' · 与插件 package.json 同版'),
         h('div', { className: 'dshub-ext-row' },
           h('input', {
             className: 'dshub-ext-path',
             value: pathValue,
             readOnly: true,
-            'aria-label': '扩展目录',
+            'aria-label': props.title + ' 的安装目录',
             onFocus: function (event) { event.target.select(); }
           }),
           h('button', { type: 'button', className: 'dshub-ext-btn', onClick: copyDir }, copied ? '已复制' : '复制路径'),
@@ -2357,7 +3114,84 @@ window.__ModuleLoader__.load({
           h('li', null, '打开右上角的「开发者模式」'),
           h('li', null, '点「加载已解压的扩展程序」，选上面这个目录')
         ),
-        h('div', { className: 'dshub-ext-hint' }, '插件换目录（重装、换实例）后要回到 chrome://extensions 重新加载一次扩展，否则浏览器里跑的还是旧目录那份。'),
+        props.extra === '' ? null : h('div', { className: 'dshub-ext-hint' }, props.extra),
+        props.missing === true && dir !== '' ? h('div', { className: 'dshub-ext-bad' }, '目录不存在：' + dir) : null,
+        note === '' ? null : h('div', { className: /失败/.test(note) ? 'dshub-ext-bad' : 'dshub-ext-note' }, note)
+      );
+    }
+
+    /**
+     * Plugins -> dsh-ui-block: the two companion extensions, side by side.
+     * One takes a single element, the other takes the whole page — the tag on
+     * each card says which, because picking the wrong one is the only way this
+     * page can fail its user.
+     */
+
+    function ExtensionSettingsCard(props) {
+      if (!extensionSubjectMatch(props ? props.subject : undefined)) return null;
+      if (react === null || typeof react.useState !== 'function') return null;
+      var h = react.createElement;
+      var infoState = react.useState({
+        phase: 'loading', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false
+      });
+      var info = infoState[0];
+      var setInfo = infoState[1];
+      var noteState = react.useState('');
+      var note = noteState[0];
+      var setNote = noteState[1];
+
+      react.useEffect(function () {
+        var live = true;
+        window.fetch(EXTENSION_ROUTE, { credentials: 'same-origin', cache: 'no-store' })
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+          })
+          .then(function (body) {
+            if (!live) return;
+            setInfo({
+              phase: 'ready',
+              dir: String(body.dir || ''),
+              version: String(body.version || ''),
+              captureDir: String(body.captureDir || ''),
+              captureVersion: String(body.captureVersion || ''),
+              captureExists: body.captureExists === true
+            });
+          })
+          .catch(function (error) {
+            if (!live) return;
+            setInfo({ phase: 'error', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false });
+            setNote('读取扩展目录失败：' + errorText(error));
+          });
+        return function () { live = false; };
+      }, []);
+
+      var ready = info.phase === 'ready';
+      return h('div', { className: 'dshub-ext' },
+        h('div', { className: 'dshub-ext-grid' },
+          h(ExtensionCard, {
+            kind: 'picker',
+            title: '浏览器扩展 dsh-element-picker',
+            tag: '取一个元素',
+            line: '点页面上某一个按钮、卡片或输入框，把它的样子连同样式复制成一段素材。改单个组件、做局部对齐时用它。',
+            phase: info.phase,
+            dir: ready ? info.dir : '',
+            version: info.version,
+            extra: ''
+          }),
+          h(ExtensionCard, {
+            kind: 'capture',
+            title: '浏览器扩展 dsh-page-capture',
+            tag: '取整页',
+            line: '把当前这一整页抽成素材包（HTML + 样式 + 图片 + 字体），交给 DSH 装成块。复刻一整页、做页面级草稿时用它。',
+            phase: info.phase,
+            dir: ready ? info.captureDir : '',
+            version: info.captureVersion,
+            missing: ready && info.captureExists !== true,
+            extra: '装好后打开这个扩展的「扩展程序选项」，把 baseURL 指到当前实例的端口（http://127.0.0.1:3080 或 http://127.0.0.1:4000）。指到另一个实例时，这边的 list_pages 永远是空的。'
+          })
+        ),
+        h('div', { className: 'dshub-ext-hint' }, '插件换目录（重装、换实例）后，两张扩展都要回到 chrome://extensions 重新加载一次，否则浏览器里跑的仍是旧目录那份。'),
         note === '' ? null : h('div', { className: /失败/.test(note) ? 'dshub-ext-bad' : 'dshub-ext-note' }, note)
       );
     }
