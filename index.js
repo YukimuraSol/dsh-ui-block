@@ -2932,7 +2932,8 @@ export function apply(ctx, config) {
           height: { type: 'number', required: true },
           bytes: { type: 'number', required: true },
           tokens: { type: 'number', required: true },
-          scheme: { type: 'string', required: true },
+          // Not the page's own colours: `scheme` is the skin the CLIENT renders blocks in (render.tokens().scheme), so a light page painted in the dark canvas still reports "dark".
+          scheme: { type: 'string', required: true, description: 'The skin the client rendered this block in (window.__dshPageBlock.render.tokens().scheme: "dark" or "light"). It describes the CANVAS the block was wrapped in, NOT the captured page\'s own colours — a light page rendered in the dark skin still reads "dark" here.' },
           measurements: {
             type: 'string',
             description: 'One line per probed selector: match count, then the first match box. Present only when probe was passed.'
@@ -2954,7 +2955,7 @@ export function apply(ctx, config) {
       },
       render: (args, value) => [{
         type: 'text',
-        text: '<path>' + value.path + '</path>\n<type>image</type>\n<content>PNG image, ' + value.width + 'x' + value.height + ' px, ' + value.bytes + ' bytes; rendered with ' + value.tokens + ' theme tokens, color-scheme ' + value.scheme + '</content>'
+        text: '<path>' + value.path + '</path>\n<type>image</type>\n<content>PNG image, ' + value.width + 'x' + value.height + ' px, ' + value.bytes + ' bytes; rendered with ' + value.tokens + ' theme tokens, skin: ' + value.scheme + '</content>'
           + (value.measurements === undefined ? '' : '\n<measurements>\n' + value.measurements + '\n</measurements>')
       }, { type: 'image', attachment: value.image }]
     },
