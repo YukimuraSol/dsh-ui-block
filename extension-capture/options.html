@@ -26,8 +26,8 @@
 <label for="baseUrl">base URL（DSH 实例地址；留空 = 自动发现，打登记表里每个实例）</label>
 <input type="text" id="baseUrl" placeholder="留空自动发现，或 http://127.0.0.1:4000" spellcheck="false">
 
-<label for="instance">instance 名（同一浏览器只填一个，用来区分 Chrome A / Edge B）</label>
-<input type="text" id="instance" placeholder="chrome" spellcheck="false">
+<label for="instance">instance 名（留空 = 自动生成 <code>chrome-xxxx</code>；手填则优先，只为一个浏览器填）</label>
+<input type="text" id="instance" placeholder="留空即可（每台浏览器各生成一个）" spellcheck="false">
 
 <label for="token">配对码（可选；插件侧 agent.requireToken 打开时才需要）</label>
 <input type="text" id="token" placeholder="留空 = 不带 token" spellcheck="false">

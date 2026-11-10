@@ -8,7 +8,14 @@
 // ponytail: 用 setTimeout 自链代替 chrome.alarms（省一个权限）；2 秒一次的 fetch 本身就是
 // 心跳，SW 不会 30 秒闲置被回收。真要长期关着再打开也能立刻恢复（storage.onChanged）。
 
-const DEFAULTS = { baseUrl: '', instance: 'chrome', token: '', enabled: true, registryUrl: 'http://127.0.0.1:38520' }
+const DEFAULTS = { baseUrl: '', instance: '', token: '', enabled: true, registryUrl: 'http://127.0.0.1:38520' }
+// instance 名是插件侧 agentHub 的键：两台浏览器都叫 "chrome" 时清单会互相覆盖，
+// 所以默认名字由每个浏览器自己生成一次（chrome-3f2a），存进 storage.local 的
+// instanceId，之后一直用它。options 里手填的 instance 仍然优先，留空才用这个。
+const INSTANCE_KEY = 'instanceId'
+const INSTANCE_PREFIX = 'chrome'
+// 老版本把默认值 'chrome' 直接写进了 storage：那是"没填"的痕迹，不是用户选的名字。
+const LEGACY_INSTANCE = 'chrome'
 const POLL_MS = 2000
 const ACTIVATE_WAIT_MS = 300
 const GONE = '目标已消失，请重新 list_pages'
@@ -130,10 +137,39 @@ function badge(text, color) {
   } catch (e) {}
 }
 
+function randomSuffix() {
+  const bytes = new Uint8Array(2)
+  crypto.getRandomValues(bytes)
+  return Array.prototype.map.call(bytes, function (b) { return b.toString(16).padStart(2, '0') }).join('')
+}
+
+let instanceIdCache = ''
+
+/** 本浏览器的默认实例名：第一次读时生成 chrome-xxxx 并落盘，之后一直复用。 */
+async function ensureInstanceId() {
+  if (instanceIdCache) return instanceIdCache
+  let id = ''
+  try {
+    const got = await chrome.storage.local.get(INSTANCE_KEY)
+    id = String(got && got[INSTANCE_KEY] || '').trim()
+  } catch (e) { id = '' }
+  if (id === '') {
+    id = INSTANCE_PREFIX + '-' + randomSuffix()
+    try { await chrome.storage.local.set({ [INSTANCE_KEY]: id }) } catch (e) {}
+  }
+  instanceIdCache = id
+  return id
+}
+
 async function readCfg() {
   const got = await chrome.storage.local.get(DEFAULTS)
   cfg = Object.assign({}, DEFAULTS, got)
-  if (!cfg.instance) cfg.instance = DEFAULTS.instance
+  let manual = String(cfg.instance || '').trim()
+  if (manual === LEGACY_INSTANCE) manual = ''
+  const instanceId = await ensureInstanceId()
+  cfg.instanceId = instanceId
+  cfg.instanceAuto = manual === ''
+  cfg.instance = manual === '' ? instanceId : manual
   return cfg
 }
 
@@ -474,6 +510,7 @@ chrome.storage.onChanged.addListener(function (changes) {
   // 只变了实例表缓存（我们自己写的）→ 不重启轮询
   const keys = Object.keys(changes || {})
   if (keys.length > 0 && keys.every(function (key) { return key === TABLE_KEY })) return
+  if (changes && changes[INSTANCE_KEY]) instanceIdCache = ''
   targets = []
   targetsAt = 0
   lastFullByTarget.clear()   // 配置变了：下一轮给每个实例都发整份
@@ -484,7 +521,8 @@ chrome.storage.onChanged.addListener(function (changes) {
 chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
   if (msg && msg.type === 'dsh-capture-status') {
     reply({
-      enabled: !!cfg.enabled, baseUrl: cfg.baseUrl, instance: cfg.instance, busy: busy,
+      enabled: !!cfg.enabled, baseUrl: cfg.baseUrl, instance: cfg.instance,
+      instanceId: cfg.instanceId || '', instanceAuto: !!cfg.instanceAuto, busy: busy,
       registry: {
         source: targetsSource, at: targetsAt,
         instances: targets.map(function (r) { return { port: r.port, instance: r.instance, bootAt: r.bootAt } })

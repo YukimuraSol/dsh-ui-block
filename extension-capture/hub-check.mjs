@@ -240,6 +240,23 @@ export async function runHubChecks(assert) {
     '台已关；重启后 A 又收到 ' + (instanceA.polls.length - pollsABefore) + ' 次 poll、B 又收到 ' +
       (instanceB.polls.length - pollsBBefore) + ' 次；status.registry.source=' + String(status && status.registry && status.registry.source))
 
+  // ---- 4b. instance 自动名：两台浏览器（两份独立 storage）各自生成，不许撞 ----
+  // 直接钉 baseUrl，免得跑到本机端口探测上去（那会碰到真实的 DSH 实例）。
+  const autoNames = []
+  for (let i = 0; i < 2; i += 1) {
+    const fresh = new Map()
+    fresh.set('baseUrl', 'http://127.0.0.1:' + aPort)
+    const fake = makeChrome(fresh, { badge: '' })
+    const run = loadBackground(fake.api)
+    await run()
+    const lastBody = instanceA.polls[instanceA.polls.length - 1].body
+    autoNames.push({ stored: String(fresh.get('instanceId') || ''), used: String(lastBody.instance || '') })
+  }
+  const wellFormed = autoNames.every((row) => /^chrome-[0-9a-f]{4}$/.test(row.stored) && row.used === row.stored)
+  assert('instance 自动名：两份独立 storage 各生成 chrome-xxxx、互不相同，poll 里用的就是它',
+    wellFormed && autoNames[0].stored !== autoNames[1].stored,
+    '浏览器1=' + JSON.stringify(autoNames[0]) + '；浏览器2=' + JSON.stringify(autoNames[1]))
+
   // ---- 5. options.html?baseURL= 写进 storage ------------------------------
   const optionsStore = new Map()
   const elements = {}

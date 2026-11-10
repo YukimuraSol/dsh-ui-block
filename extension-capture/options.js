@@ -1,8 +1,20 @@
 // dsh-page-capture / options.js
 // 四件事：读/写 chrome.storage.local、把 ?baseURL= 查询参数写进 storage（launch.mjs
 // 用这条精确指定实例）、按当前设置试一次 poll、点「自动发现」问后台要实例表。
-const DEFAULTS = { baseUrl: '', instance: 'chrome', token: '', enabled: true }
+const DEFAULTS = { baseUrl: '', instance: '', token: '', enabled: true }
+// 老版本把默认值 'chrome' 写进了 storage：两台浏览器都这么叫会互相覆盖清单，
+// 所以它按"没填"处理，交给后台的自动名字（chrome-xxxx）。
+const LEGACY_INSTANCE = 'chrome'
 const $ = function (id) { return document.getElementById(id) }
+
+/** 后台当前的有效实例名（手填优先，留空则自动生成的那个）。 */
+async function effectiveInstance() {
+  try {
+    const status = await chrome.runtime.sendMessage({ type: 'dsh-capture-status' })
+    if (status && status.instance) return String(status.instance)
+  } catch (e) {}
+  return ''
+}
 
 function say(text) { $('out').textContent = text }
 
@@ -29,13 +41,16 @@ async function applyQueryBaseUrl() {
 async function load() {
   const got = await chrome.storage.local.get(DEFAULTS)
   const cfg = Object.assign({}, DEFAULTS, got)
+  const raw = String(cfg.instance || '').trim()
+  const manual = raw === LEGACY_INSTANCE ? '' : raw
   $('baseUrl').value = cfg.baseUrl
-  $('instance').value = cfg.instance
+  $('instance').value = manual
   $('token').value = cfg.token
   $('enabled').checked = !!cfg.enabled
-  let line = '当前：' + (cfg.enabled ? '上报中' : '已关闭（不发请求）') + ' → ' + (cfg.baseUrl || '自动发现（打登记表里每个实例）') + ' / ' + cfg.instance
+  let line = '当前：' + (cfg.enabled ? '上报中' : '已关闭（不发请求）') + ' → ' + (cfg.baseUrl || '自动发现（打登记表里每个实例）')
   try {
     const status = await chrome.runtime.sendMessage({ type: 'dsh-capture-status' })
+    line += ' / 实例名 ' + String((status && status.instance) || manual || '（后台还没生成）') + (status && status.instanceAuto ? '（自动）' : '')
     const reg = status && status.registry
     if (reg && !cfg.baseUrl) {
       const rows = reg.instances || []
@@ -48,14 +63,16 @@ async function load() {
 async function save() {
   const base = cleanBase($('baseUrl').value)
   if (base === null) { say('base URL 只能是 http(s) 地址，或留空 = 自动发现'); return }
+  const manual = String($('instance').value || '').trim()
   const cfg = {
     baseUrl: base,
-    instance: String($('instance').value || '').trim() || DEFAULTS.instance,
+    instance: manual === LEGACY_INSTANCE ? '' : manual,   // 留空 = 后台自动生成的名字
     token: String($('token').value || '').trim(),
     enabled: !!$('enabled').checked
   }
   await chrome.storage.local.set(cfg)
-  say('已保存：' + (cfg.enabled ? '上报中' : '已关闭') + ' → ' + (cfg.baseUrl || '自动发现') + ' / ' + cfg.instance)
+  say('已保存：' + (cfg.enabled ? '上报中' : '已关闭') + ' → ' + (cfg.baseUrl || '自动发现') + ' / 实例名 ' +
+    (cfg.instance || (await effectiveInstance()) || '（后台还没生成）'))
 }
 
 async function discover() {
@@ -74,7 +91,7 @@ async function discover() {
 
 async function test() {
   const target = cleanBase($('baseUrl').value)
-  const instance = String($('instance').value || '').trim() || DEFAULTS.instance
+  const instance = String($('instance').value || '').trim() || (await effectiveInstance())
   const token = String($('token').value || '').trim()
   if (!target) { say('没有填 base URL：后台按实例表多播上报，不需要在这里测单个端口。'); return }
   let url = target + '/ui-blocks/agent/poll'

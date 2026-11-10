@@ -17,11 +17,13 @@
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
 | base URL | 空（自动发现） | 留空就打发现出来的**每一个**实例；填了就只打它（钉死单个实例，测试时用） |
-| instance 名 | `chrome` | `tabId` 只在单个浏览器内唯一，对外身份是 `instance + tabId` |
+| instance 名 | 自动生成 `chrome-xxxx` | `tabId` 只在单个浏览器内唯一，对外身份是 `instance + tabId`；插件侧按 instance 名分开记账，**两台浏览器都叫 `chrome` 会互相覆盖清单**，所以每台首次运行各自生成一个 4 位十六进制后缀存进 `instanceId`，之后一直用它。手填仍然优先，留空 = 用自动的那个 |
 | 配对码 | 空 | 插件侧 `agent.requireToken` 打开时才需要；填了就以 `?token=` 带上 |
 | 上报开关 | 开 | **关掉 = 一个请求都不发**（连轮询都不发），DSH 那边自然看不见它 |
 
 配置存 `chrome.storage.local`，改完立即生效（`storage.onChanged` 会重启轮询），不用重装。
+
+老版本把 `chrome` 写进了 storage 当默认值；这一版把它当"没填"处理（换成自动生成的名字），所以升级后两台浏览器不会因为都叫 `chrome` 而打架。
 
 ## 没有配置时怎么找实例（发现）
 

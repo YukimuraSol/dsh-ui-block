@@ -200,17 +200,25 @@ const STORAGE_EXPR = "chrome.storage.local.get('baseUrl').then(function (v) { re
  * 这次打开的那个标签页的身份：capture_page 要的 { instance, tabId } 就是它。
  * 在扩展自己的上下文里问 chrome.tabs（页面被重定向时按"第一个 http(s) 标签"兜底，
  * matched 会说明是哪一种）。
+ *
+ * instance 必须是插件侧记账用的那个名字：手填的 instance 优先，留空就用后台自动生成的
+ * instanceId（chrome-xxxx）。老版本写进 storage 的 "chrome" 当"没填"看，跟 background.js
+ * 同一口径——两边口径不一致的话，这个 tabId 在插件侧根本对不上号。
  */
 function tabInfoExpr(wantUrl) {
   return '(async function () {' +
-    ' var cfg = await chrome.storage.local.get({ instance: "chrome" });' +
+    ' var s = await chrome.storage.local.get({ instance: "", instanceId: "" });' +
+    ' var manual = String(s.instance || "").trim();' +
+    ' if (manual === "chrome") manual = "";' +
+    ' var name = manual || String(s.instanceId || "").trim();' +
+    ' if (name === "") return { pending: true };' +
     ' var tabs = await chrome.tabs.query({});' +
     ' var want = ' + JSON.stringify(String(wantUrl)) + ';' +
     ' var hit = null, matched = "";' +
     ' for (var i = 0; i < tabs.length; i += 1) { if (String(tabs[i].url || "") === want) { hit = tabs[i]; matched = "exact"; break } }' +
     ' if (!hit) { for (var j = 0; j < tabs.length; j += 1) { if (/^https?:/i.test(String(tabs[j].url || ""))) { hit = tabs[j]; matched = "fallback"; break } } }' +
     ' if (!hit) return null;' +
-    ' return { instance: String(cfg.instance || "chrome"), tabId: hit.id, url: String(hit.url || ""), title: String(hit.title || ""), matched: matched };' +
+    ' return { instance: name, manual: manual !== "", tabId: hit.id, url: String(hit.url || ""), title: String(hit.title || ""), matched: matched };' +
     '})()'
 }
 
@@ -262,23 +270,36 @@ async function main() {
     command: [quote(chrome)].concat(args.map(quote)).join(' ')
   }
 
+  let openedTargetId = ''
   if (baseUrl !== '') {
     const opened = await openOptionsPage(port, extensionId, baseUrl)
     out.optionsUrl = opened.url
+    openedTargetId = opened.target && opened.target.id ? String(opened.target.id) : ''
     out.storageBack = await evaluateUntil(port, ['options.html'], STORAGE_EXPR, function (v) { return v === baseUrl }, 8000)
     out.baseUrl = baseUrl
   }
 
   if (page !== '') {
     const needles = ['/background.js', 'options.html']
-    let info = await evaluateUntil(port, needles, tabInfoExpr(page), function (v) { return !!v && v.tabId !== undefined && v.tabId !== null }, 15000)
+    const tabReady = function (v) { return !!v && v.tabId !== undefined && v.tabId !== null && !!v.instance }
+    let info = await evaluateUntil(port, needles, tabInfoExpr(page), tabReady, 15000)
     if (info && info.error) {
       // 背景页在睡、又没有 options 页可借时，开一个（不写 baseURL）再问一次
       await openOptionsPage(port, extensionId, '')
-      info = await evaluateUntil(port, needles, tabInfoExpr(page), function (v) { return !!v && v.tabId !== undefined && v.tabId !== null }, 8000)
+      info = await evaluateUntil(port, needles, tabInfoExpr(page), tabReady, 8000)
     }
     out.tab = info
     out.url = page
+  }
+
+  // 配置页写完就关掉：它是扩展自己的页面（抓不了），留在标签页清单里只会多一行噪声，
+  // 而这一趟真正要报的是 --url 打开的那个页面。
+  if (openedTargetId !== '') {
+    try {
+      const res = await fetch('http://127.0.0.1:' + port + '/json/close/' + openedTargetId, { cache: 'no-store' })
+      out.optionsClosed = res.ok
+    } catch (e) { out.optionsClosed = false }
+    await sleep(300)
   }
 
   console.log(JSON.stringify(out, null, 2))
