@@ -1,7 +1,8 @@
 // blockcheck.mjs — 用 .uiblock 的**正式解析规则**检查块文件
-// 规则来自 dsh-ui-block/index.js：SECTION_RE(L56)、sectionType(L190)、
-// bytes=binary?base64解码后:utf8(L245)、SECTION_MAX_BYTES=256KB(L58)、BLOCK_MAX_BYTES=2MB(L59)、
-// 段标记伪造检查(L263)、块总量按落盘文本(L299)。
+// 规则来自 dsh-ui-block/index.js：SECTION_RE、sectionType()、SECTION_TYPES、
+// bytes=binary?base64解码后:utf8、段标记伪造检查、块总量按落盘文本。
+// 两条上限与 index.js 的 LIMIT_DEFAULTS **同值**（sectionBytes 2 MB / blockBytes 64 MB）：
+// 那边改了（可用 limits 配置覆盖），这里跟着改，不在本工具另立一套默认值。
 // 再加两条**生成侧**规则（插件侧不动，数据侧自己保证）：
 //   ① 段内资源路径必须段相对：src="/…"、href="/…"、url(/…) 一律报错
 //      （块挂在 /ui-blocks/<name>/ 下，根绝对路径必然 404）；
@@ -10,11 +11,13 @@
 import { readFile } from 'node:fs/promises';
 
 const SECTION_RE = /^<!--\s*@@file\s+(\S+?)(\s+base64)?\s*-->\s*$/;
-const SECTION_MAX_BYTES = 256 * 1024;
-const BLOCK_MAX_BYTES = 2 * 1024 * 1024;
-const SECTION_TYPES = { css: 1, svg: 1, json: 1, woff2: 1, woff: 1, ttf: 1, png: 1, jpg: 1, jpeg: 1, webp: 1 };
-// 4000 正在给插件加 html 段类型；--allow-html 用新版规则预演（那边验收完再默认）
-if (process.argv.includes('--allow-html')) { SECTION_TYPES.html = 1; SECTION_TYPES.htm = 1; }
+// 与 index.js LIMIT_DEFAULTS.sectionBytes / .blockBytes 同值，见文件头注释。
+const SECTION_MAX_BYTES = 2 * 1024 * 1024;
+const BLOCK_MAX_BYTES = 64 * 1024 * 1024;
+// html/htm 是正式段类型（index.js SECTION_TYPES 已收）：一个块可以带整页。
+const SECTION_TYPES = { html: 1, htm: 1, css: 1, svg: 1, json: 1, woff2: 1, woff: 1, ttf: 1, png: 1, jpg: 1, jpeg: 1, webp: 1 };
+// --allow-html 是旧调用的兼容开关，现在什么也不做（html 恒为合法段类型），也绝不报错。
+void process.argv.includes('--allow-html');
 const BINARY = new Set(['woff2', 'woff', 'ttf', 'png', 'jpg', 'jpeg', 'webp']);
 const TEXTY = new Set(['html', 'htm', 'css', 'svg']);
 const ext = (p) => p.slice(p.lastIndexOf('.') + 1).toLowerCase();
@@ -100,7 +103,7 @@ function checkBlock(text) {
     const binary = BINARY.has(ext(s.path));
     const bytes = binary ? Buffer.from(body.trim(), 'base64').length : Buffer.byteLength(body, 'utf8');
     if (binary !== s.declaredBase64) errs.push('base64 flag mismatch: ' + s.path);
-    if (bytes > SECTION_MAX_BYTES) errs.push('section over 256KB: ' + s.path + ' = ' + bytes);
+    if (bytes > SECTION_MAX_BYTES) errs.push('section over 2MB: ' + s.path + ' = ' + bytes);
     if (s.lines.some((l) => SECTION_RE.test(l))) errs.push('body contains a section marker: ' + s.path);
     if (TEXTY.has(ext(s.path))) {
       const abs = scanAbsolutePaths(body);
@@ -131,7 +134,7 @@ function checkBlock(text) {
   }
   resolved.push(...entryRefs.map((r) => ({ where: 'index.html', ...r })));
   const total = Buffer.byteLength(text, 'utf8');
-  if (total > BLOCK_MAX_BYTES) errs.push('block over 2MB: ' + total);
+  if (total > BLOCK_MAX_BYTES) errs.push('block over 64MB: ' + total);
   const present = new Set(['index.html', ...sections.map((s) => s.path)]);
   const links = [...entryText.matchAll(/(?:src|href)="([^"]+)"/g)].map((m) => m[1])
     .filter((u) => !u.startsWith('data:') && !u.startsWith('#') && !u.startsWith('http'));
@@ -164,14 +167,23 @@ if (process.argv.includes('--selftest')) {
   const res = checkBlock(planted);
   const linkEscape = '<!doctype html><html><head><link rel="stylesheet" href="../../shared/app.css"></head><body></body></html>\n<!-- @@file demo.json -->\n{"snapshots":{"home":"url:./"}}';
   const resLink = checkBlock(linkEscape);
+  // 上限用例：植入一段刚好超过 SECTION_MAX_BYTES 的文本，证明"超单段"确实会拦。
+  // 体积跟着常量走（SECTION_MAX_BYTES），所以上限再变也不会悄悄失效。
+  const overSection = checkBlock('<!doctype html><html><body></body></html>\n<!-- @@file assets/big.css -->\n/*' + 'x'.repeat(SECTION_MAX_BYTES) + '*/');
+  // html/htm 是正式段类型：同样的段不再报 unknown section type。
+  const withPage = checkBlock('<!doctype html><p>a</p>\n<!-- @@file pages/one.html -->\n<!doctype html><p>b</p>\n<!-- @@file demo.json -->\n{"snapshots":{"home":"url:./"}}');
   const ok = hits.length === 3 && falsePos.length === 0 && !res.ok
     && res.errors.some((e) => e.includes('escapes block root'))
     && res.errors.some((e) => e.includes('resolved outside block'))
-    && resLink.errors.some((e) => e.includes('resolved outside block') || e.includes('escapes block root'));
-  console.log(JSON.stringify({ selftest: ok ? 'PASS' : 'FAIL', plantedHits: hits.length, falsePositivesOnClean: falsePos, plantedBlockErrors: res.errors, plantedLinkEscapeErrors: resLink.errors }, null, 1));
+    && resLink.errors.some((e) => e.includes('resolved outside block') || e.includes('escapes block root'))
+    && overSection.errors.some((e) => e.includes('section over 2MB'))
+    && overSection.perFileLimit === SECTION_MAX_BYTES && overSection.blockLimit === BLOCK_MAX_BYTES
+    && withPage.errors.every((e) => !e.includes('unknown section type'));
+  console.log(JSON.stringify({ selftest: ok ? 'PASS' : 'FAIL', plantedHits: hits.length, falsePositivesOnClean: falsePos, plantedBlockErrors: res.errors, plantedLinkEscapeErrors: resLink.errors, limits: { perFileLimit: SECTION_MAX_BYTES, blockLimit: BLOCK_MAX_BYTES }, overSectionErrors: overSection.errors, withPageErrors: withPage.errors }, null, 1));
   process.exit(ok ? 0 : 1);
 }
 
-const file = process.argv[2] || 'out/data.uiblock';
+// 第一个非开关参数才是块文件：老调用常写 `--allow-html <file>`，开关不能被当成路径。
+const file = process.argv.slice(2).find((arg) => !arg.startsWith('--')) || 'out/data.uiblock';
 const out = checkBlock(await readFile(file, 'utf8'));
 console.log(JSON.stringify({ file, ...out }, null, 1));
