@@ -2029,6 +2029,17 @@ function quietLines(args) {
   return instanceStates(args).quiet.slice(0, 5).map((item) => 'instance ' + item.instance + ' went quiet ' + ageText(now - item.at) + ' ago and is not listed.')
 }
 
+/**
+ * The parts of the rendered text a PTC caller cannot see, as data: which
+ * instances went quiet and how long ago, and — when nothing is listed — the one
+ * move that comes first. At most three, always an array.
+ */
+function pageHints(rows, args) {
+  const hints = quietLines(args).slice(0, 2)
+  if (rows.length === 0) hints.push('No tab to capture: call open_page({ url }) first — capture_page only targets a tab that is already open.')
+  return hints.slice(0, 3)
+}
+
 /** One compact time for the recent-request trail: HH:MM:SS, local. */
 function shortTime(at) {
   const date = new Date(at)
@@ -2819,7 +2830,18 @@ export function apply(ctx, config) {
             description: 'fromDir only: references that point at a file this block left out — one line each, "where:line ref -> path".',
             items: { type: 'string' }
           },
-          warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' }
+          warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' },
+          next: {
+            type: 'string',
+            required: true,
+            description: 'The one call to make with this block, spelled out: read_ui_block({ name }).'
+          },
+          warnings: {
+            type: 'array',
+            required: true,
+            description: 'At most 3 short strings, for callers that never see the rendered text: files kept only because a srcset/imagesrcset candidate loads them (so not skipped), and files left out although something still references them. Empty array when neither happened.',
+            items: { type: 'string' }
+          }
         }
       },
       render: (args, value) => [{
@@ -2866,6 +2888,14 @@ export function apply(ctx, config) {
         assembled = await assembleBlock(args.files, args.entry)
       }
       const written = await writeBlock(blockName, assembled.text)
+      // The two facts the rendered text spells out and a PTC caller cannot read.
+      const warnings = []
+      if (Array.isArray(srcsetReferenced) && srcsetReferenced.length > 0) {
+        warnings.push(String(srcsetReferenced.length) + ' file(s) are loaded only through a srcset/imagesrcset candidate, so nothing here calls them unreferenced: ' + srcsetReferenced.slice(0, 3).join(', '))
+      }
+      if (Array.isArray(referencedSkipped) && referencedSkipped.length > 0) {
+        warnings.push(String(referencedSkipped.length) + ' referenced file(s) were left out of the block, so they 404 where the entry loads them.')
+      }
       return {
         path: blockPath(blockName),
         name: blockName,
@@ -2878,7 +2908,9 @@ export function apply(ctx, config) {
         ...skipped === undefined ? {} : { skipped },
         ...srcsetReferenced === undefined || srcsetReferenced.length === 0 ? {} : { srcsetReferenced },
         ...referencedSkipped === undefined || referencedSkipped.length === 0 ? {} : { referencedSkipped },
-        ...assembled.warning === undefined ? {} : { warning: assembled.warning }
+        ...assembled.warning === undefined ? {} : { warning: assembled.warning },
+        next: 'read_ui_block({ name: "' + blockName + '" })',
+        warnings: warnings.slice(0, 3)
       }
     },
     presentCall: (args) => {
@@ -3031,25 +3063,38 @@ export function apply(ctx, config) {
     },
     output: {
       schema: {
-        type: 'array',
-        description: 'One row per capturable-or-not tab the extensions reported. Empty when nothing is connected, and the rendered text then says what to check.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            instance: { type: 'string', required: true, description: 'Which extension reported it.' },
-            tabId: { type: 'number', required: true, description: 'Unique inside its instance only; pass the pair to capture_page.' },
-            url: { type: 'string', required: true },
-            title: { type: 'string', required: true },
-            focused: { type: 'boolean', required: true },
-            capturable: { type: 'boolean', required: true, description: 'False for pages with no extractable DOM (chrome://, extension pages, the store, embedded PDFs).' },
-            reason: { type: 'string', description: 'Why the tab cannot be captured. Present only when capturable is false.' },
-            seenAt: { type: 'string', required: true, description: 'When this list was reported, ISO 8601.' },
-            stale: { type: 'boolean', required: true, description: 'True when the report is older than 10 minutes: the tab may be closed by now.' }
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          pages: {
+            type: 'array',
+            required: true,
+            description: 'One row per capturable-or-not tab the extensions reported. Empty when nothing is connected; hints then says what to check.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                instance: { type: 'string', required: true, description: 'Which extension reported it.' },
+                tabId: { type: 'number', required: true, description: 'Unique inside its instance only; pass the pair to capture_page.' },
+                url: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                focused: { type: 'boolean', required: true },
+                capturable: { type: 'boolean', required: true, description: 'False for pages with no extractable DOM (chrome://, extension pages, the store, embedded PDFs).' },
+                reason: { type: 'string', description: 'Why the tab cannot be captured. Present only when capturable is false.' },
+                seenAt: { type: 'string', required: true, description: 'When this list was reported, ISO 8601.' },
+                stale: { type: 'boolean', required: true, description: 'True when the report is older than 10 minutes: the tab may be closed by now.' }
+              }
+            }
+          },
+          hints: {
+            type: 'array',
+            required: true,
+            description: 'At most 3 short strings, for callers that never see the rendered text: an instance that went quiet and how long ago, and — when pages is empty — the first call to make. Empty array when there is nothing to say.',
+            items: { type: 'string' }
           }
         }
       },
-      render: (args, value) => [{ type: 'text', text: pagesText(value, args) }]
+      render: (args, value) => [{ type: 'text', text: pagesText(value.pages, args) }]
     },
     execute: async (args) => {
       const wanted = String(args.instance === undefined || args.instance === null ? '' : args.instance).trim()
@@ -3075,7 +3120,7 @@ export function apply(ctx, config) {
           })
         }
       }
-      return rows
+      return { pages: rows, hints: pageHints(rows, args) }
     }
   }))
 
@@ -3138,6 +3183,17 @@ export function apply(ctx, config) {
             type: 'json',
             required: true,
             description: 'The material index: files grouped by type (html/css/images/fonts/other) with bytes, the totals, report.dropped summarised, and "dangling" — every reference the captured documents make to something that was NOT captured (where, line, ref, resolved path).'
+          },
+          next: {
+            type: 'string',
+            required: true,
+            description: 'The one call this material is for, spelled out: create_ui_block({ name, fromDir }).'
+          },
+          dangling: {
+            type: 'array',
+            required: true,
+            description: 'The first 5 references these documents make to files the capture does NOT have, one per item as "where:line ref -> path". Empty when every reference resolves — these are what 404 if the block is built as-is.',
+            items: { type: 'string' }
           }
         }
       },
@@ -3188,13 +3244,16 @@ export function apply(ctx, config) {
       if (done.files.length === 0) {
         throw new Error(CAPTURE_TOOL + ': the extension answered but sent no files, so there is nothing to build a block from. Directory: ' + done.dir + '.')
       }
+      const index = await indexMaterial(done.dir, done.files, report)
       return {
         dir: done.dir,
         files: done.files.map((file) => ({ path: file.path, bytes: file.bytes, from: join(done.dir, file.path) })),
         report,
         summary: captureSummary(done.files, report),
         fromDir: done.dir,
-        index: await indexMaterial(done.dir, done.files, report)
+        index,
+        next: 'create_ui_block({ name: "' + index.suggestedName + '", fromDir: "' + index.dir + '" })',
+        dangling: index.dangling.slice(0, 5).map((row) => row.where + ':' + String(row.line) + ' ' + row.ref + ' -> ' + row.path)
       }
     }
   }))

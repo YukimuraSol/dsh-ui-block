@@ -482,13 +482,18 @@
       var k = keyOf(t);
       if (urls.indexOf(k) < 0) urls.push(k);
     };
-    // link[rel=preload][imagesrcset]：link 是死标签、元素会被删，但它预载的最大那张图
-    // 也是这份素材的一部分，先记进清单，别让「删死标签」顺手吃掉它。
-    Array.prototype.slice.call(clone.querySelectorAll('link[imagesrcset], link[srcset]')).forEach(function (n) {
-      addUrl(pickSrcsetMax(n.getAttribute('imagesrcset') || n.getAttribute('srcset') || ''));
-    });
     var srcsetPick = new Map();
     var srcsetPickedUrls = [];
+    // link[rel=preload][imagesrcset]：link 是死标签、元素会被删，但它预载的最大那张图
+    // 也是这份素材的一部分，先记进清单，别让「删死标签」顺手吃掉它。选中的档位同时要
+    // 记进 srcsetPickedUrls：这个元素随后就被删掉，属性循环再也看不到它，漏记就等于
+    // 报告少算一个来源。
+    Array.prototype.slice.call(clone.querySelectorAll('link[imagesrcset], link[srcset]')).forEach(function (n) {
+      var best = pickSrcsetMax(n.getAttribute('imagesrcset') || n.getAttribute('srcset') || '');
+      if (!best) return;
+      addUrl(best);
+      srcsetPickedUrls.push(keyOf(best));
+    });
 
     var isBody = (topEl === doc.body);
     var deadTags = ['script', 'noscript', 'template', 'iframe', 'object', 'embed', 'link', 'meta', 'style', 'canvas'];

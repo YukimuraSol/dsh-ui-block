@@ -103,7 +103,13 @@ function buildFixture(P) {
   pics.innerHTML = '<img id="xlogo" class="thumb" src="' + P.logo + '">' +
     '<img id="sprite" class="thumb" src="' + P.sprite + '">' +
     '<img id="srcsetimg" class="thumb" src="' + P.w100 + '" srcset="' +
-    P.w100 + ' 100w, ' + P.w900 + ' 900w, ' + P.w300 + ' 300w">';
+    P.w100 + ' 100w, ' + P.w900 + ' 900w, ' + P.w300 + ' 300w">' +
+    // 第二个带 srcset 的元素：让「修复前 2 条 / 修复后 3 条」这个计数对比有基线。
+    '<img id="srcsetimg2" class="thumb" src="' + P.p400 + '" srcset="' + P.p400 + ' 400w, ' + P.p800 + ' 800w">' +
+    // preload/imagesrcset：link 是死标签、元素会被整个删掉，但它预载的最大那张图既要
+    // 下载、也要计入 report.srcsetPicked。修复前这条只下载不记账，报告少算 1 个来源。
+    // 放在 body 里，因为抽取只克隆 root（默认 body）那一棵子树。
+    '<link id="preloadx" rel="preload" as="image" imagesrcset="' + P.p400 + ' 1x, ' + P.p1200 + ' 2x">';
   document.querySelector('main').appendChild(pics);
 
   return { rules: document.styleSheets[0] ? document.styleSheets[0].cssRules.length : 0, noiseBytes: Math.round(noise.length * 0.75) };
@@ -291,11 +297,15 @@ async function main() {
       '/q100.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(100, '#a0c4ff'), 'utf8') },
       '/q300.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(300, '#9bf6ff'), 'utf8') },
       '/q900.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(900, '#caffbf'), 'utf8') },
+      '/p400.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(400, '#ffd6a5'), 'utf8') },
+      '/p800.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(800, '#fdffb6'), 'utf8') },
+      '/p1200.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(1200, '#bdb2ff'), 'utf8') },
     });
     srv = started.server;
     const hostA = 'http://127.0.0.1:' + started.port;
     const hostB = 'http://localhost:' + started.port;   // 同服务、不同主机名 = 另一个源
-    const P = { logo: hostB + '/logo.svg', sprite: hostA + '/sprite.png', w100: hostA + '/q100.svg', w300: hostA + '/q300.svg', w900: hostA + '/q900.svg' };
+    const P = { logo: hostB + '/logo.svg', sprite: hostA + '/sprite.png', w100: hostA + '/q100.svg', w300: hostA + '/q300.svg', w900: hostA + '/q900.svg',
+      p400: hostA + '/p400.svg', p800: hostA + '/p800.svg', p1200: hostA + '/p1200.svg' };
     console.log('[server] ' + hostA + ' 已就绪：sprite.png ' + spriteBytes.length + ' B（358x20870），logo.svg ' + logoBytes.length + ' B，srcset 三档 100w/300w/900w');
 
     const fx = await cdp.evaluate(s, '(' + buildFixture.toString() + ')(' + JSON.stringify(P) + ')', { isExpression: true });
@@ -412,6 +422,14 @@ async function main() {
     assert('带 srcset 的元素取最大候选（900w），100w/300w 不进资源清单',
       got900 && !gotSmall && /src="data:image\/svg\+xml/.test(pickTag) && pickTag.indexOf('srcset=') < 0,
       'srcsetPicked=' + JSON.stringify(picked) + '；img 标签：' + (pickTag || '没找到'));
+
+    // ---- 12. preload/imagesrcset：最大候选下载了，就必须进 srcsetPicked ------
+    // 修复前：link 先 addUrl() 进资源清单，随后作为死标签被删，属性循环再也看不到它，
+    // 于是图片下载了、report.srcsetPicked 里却没有这一条（少算 1 个来源）。
+    const preKept = entry.content.indexOf('preloadx') >= 0;
+    assert('preload imagesrcset 的最大候选计入 srcsetPicked（link 被删也不漏账）',
+      picked.length === 3 && picked.some((u) => String(u).indexOf('/p1200.svg') >= 0) && !preKept,
+      'srcsetPicked 长度 ' + picked.length + '：' + JSON.stringify(picked) + '；entry 里还有 link=' + preKept);
 
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });
