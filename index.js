@@ -43,6 +43,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -59,6 +60,7 @@ const CREATE_TOOL = 'create_ui_block'
 const READ_TOOL = 'read_ui_block'
 const LIST_TOOL = 'list_pages'
 const CAPTURE_TOOL = 'capture_page'
+const OPEN_PAGE_TOOL = 'open_page'
 const ROUTE_PATH = '/ui-blocks'
 const EXTENSION_ROUTE = '/ui-block-extension'
 const EXTENSION_DIR_NAME = 'extension'
@@ -166,6 +168,21 @@ const EDGE_CANDIDATES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
 ]
+/**
+ * Browsers open_page may drive. Chrome first: Edge ships the same CDP surface,
+ * but the extension path below was measured on Chrome 156. CHROME_PATH overrides
+ * both, for a machine that keeps it somewhere else.
+ */
+const BROWSER_CANDIDATES = [
+  process.env.CHROME_PATH,
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ...EDGE_CANDIDATES
+].filter((candidate) => candidate !== undefined && candidate !== '')
+/** open_page waits this long for the extension to report the tab it opened. */
+const OPEN_PAGE_DEFAULT_WAIT_MS = 15000
+const OPEN_PAGE_MIN_WAIT_MS = 1000
+const OPEN_PAGE_MAX_WAIT_MS = 120000
 
 /** The active Harness home: DSH_HOME when set, else ~/.dsh. */
 function harnessHome() {
@@ -390,7 +407,17 @@ function resolveRef(raw, ownPath) {
   return path
 }
 
-/** Every reference one text body makes: { line, ref, path }, with a 1-based line. */
+/**
+ * The URLs one srcset / imagesrcset value names: comma-separated candidates,
+ * each "URL [descriptor]". A descriptor never matters to us — the URL is what
+ * a block has to carry — so the first whitespace-delimited token wins. A data:
+ * URL containing a comma splits wrong here, and resolveRef rejects it anyway.
+ */
+function srcsetUrls(value) {
+  return String(value).split(',').map((candidate) => candidate.trim().split(/\s+/)[0]).filter((url) => url !== '')
+}
+
+/** Every reference one text body makes: { line, ref, path, via? }, with a 1-based line. */
 function collectRefs(body, ownPath) {
   const refs = []
   const lines = splitLines(body)
@@ -398,12 +425,18 @@ function collectRefs(body, ownPath) {
     // Inline style is serialized with &quot; / &#39;: unescape, or the entity
     // becomes part of the path.
     const line = lines[index].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
-    const push = (raw) => {
+    const push = (raw, via) => {
       const path = resolveRef(raw, ownPath)
-      if (path !== undefined) refs.push({ line: index + 1, ref: String(raw).trim(), path })
+      if (path !== undefined) refs.push({ line: index + 1, ref: String(raw).trim(), path, ...via === undefined ? {} : { via } })
     }
     for (const match of line.matchAll(/<link\b[^>]*?(?<![\w-])href\s*=\s*["']([^"']+)["']/gi)) push(match[1])
     for (const match of line.matchAll(/<(?:img|script|source|video|audio|iframe|embed|track)\b[^>]*?(?<![\w-])src\s*=\s*["']([^"']+)["']/gi)) push(match[1])
+    // srcset / imagesrcset are LOADS: a 2x candidate is the image a retina
+    // screen actually fetches, so leaving it out of the block breaks the page
+    // it was captured from. Each candidate is its own reference.
+    for (const match of line.matchAll(/(?<![\w-])(?:srcset|imagesrcset)\s*=\s*["']([^"']*)["']/gi)) {
+      for (const candidate of srcsetUrls(match[1])) push(candidate, 'srcset')
+    }
     for (const match of line.matchAll(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi)) push(match[1])
     for (const match of line.matchAll(/@import\s+["']([^"']+)["']/gi)) push(match[1])
   }
@@ -518,6 +551,9 @@ async function collectFromDir(dir, entryHint) {
   const reachable = new Set([entryPath])
   const queue = [entryPath]
   const bodies = new Map()
+  // path -> { direct, srcset }: HOW the page names each file. Kept apart because
+  // a file named only by srcset is loaded by a retina screen, not optional.
+  const referencedBy = new Map()
   while (queue.length > 0) {
     const current = queue.shift()
     if (!REFERENCE_TEXT_EXTENSIONS.has(extOf(current))) continue
@@ -530,21 +566,32 @@ async function collectFromDir(dir, entryHint) {
       }
     }
     for (const ref of collectRefs(bodies.get(current), current)) {
-      if (found.get(ref.path) === undefined || reachable.has(ref.path)) continue
+      const known = found.get(ref.path)
+      if (known === undefined) continue
+      const how = referencedBy.get(ref.path) ?? { direct: false, srcset: false }
+      if (ref.via === 'srcset') how.srcset = true
+      else how.direct = true
+      referencedBy.set(ref.path, how)
+      if (reachable.has(ref.path)) continue
       reachable.add(ref.path)
       queue.push(ref.path)
     }
   }
   const accepted = []
   const skipped = []
+  /** Files the entry loads ONLY through srcset: "not unreferenced" must be visible. */
+  const srcsetReferenced = []
   for (const [path, info] of found) {
     if (path === entryPath) continue
+    const how = referencedBy.get(path)
+    const srcsetOnly = how !== undefined && how.srcset && !how.direct
+    if (srcsetOnly) srcsetReferenced.push(path)
     if (SECTION_TYPES[extOf(path)] === undefined) {
-      skipped.push({ path, bytes: info.bytes, reason: 'unknown type', detail: 'no section type for ".' + extOf(path) + '"' })
+      skipped.push({ path, bytes: info.bytes, reason: 'unknown type', detail: 'no section type for ".' + extOf(path) + '"', ...srcsetOnly ? { via: 'srcset' } : {} })
       continue
     }
     if (info.bytes > limits.sectionBytes) {
-      skipped.push({ path, bytes: info.bytes, reason: 'over limit', detail: String(info.bytes - limits.sectionBytes) + ' bytes over the per-file limit ' + String(limits.sectionBytes) })
+      skipped.push({ path, bytes: info.bytes, reason: 'over limit', detail: String(info.bytes - limits.sectionBytes) + ' bytes over the per-file limit ' + String(limits.sectionBytes), ...srcsetOnly ? { via: 'srcset' } : {} })
       continue
     }
     if (!reachable.has(path)) {
@@ -554,12 +601,14 @@ async function collectFromDir(dir, entryHint) {
     accepted.push({ path, from: info.abs, bytes: info.bytes })
   }
   accepted.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  srcsetReferenced.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   return {
     root,
     entryPath,
     files: [{ path: entryPath, from: found.get(entryPath).abs }, ...accepted.map((file) => ({ path: file.path, from: file.from }))],
     loaded: [{ path: entryPath, bytes: found.get(entryPath).bytes, from: found.get(entryPath).abs }, ...accepted],
     skipped,
+    srcsetReferenced,
     tolerated: skipped.map((item) => item.path)
   }
 }
@@ -1209,7 +1258,7 @@ const READ_DESCRIPTION = [
 const LIST_DESCRIPTION = [
   'List the web pages a browser extension is reporting to this DSH instance right now, so a capture targets a page that exists instead of a URL someone guessed.',
   '',
-  'THE PAGE HAS TO BE OPEN FIRST. The extension reports open tabs, so the page must already be open in a browser that has dsh-page-capture installed: prefer a browser this agent starts itself and loads the extension into (the extension folder comes from GET /ui-block-extension/info), and fall back to the user\'s own browser when the page will not open there. The list is the same either way.',
+  'THE PAGE HAS TO BE OPEN FIRST. The extension reports open tabs, so the page must already be open in a browser that has dsh-page-capture installed: for a public page call open_page({ url }) and it starts that browser for you, then capture the pair it returns; a page that needs a login has to be open in the user\'s own browser. The list is the same either way.',
   '',
   'Call this first, then capture_page with one row\'s { instance, tabId }: a tab id is unique only inside one instance, so the pair is the identity. url and title say what the page is, focused says whether it is the active tab, and capturable:false carries the reason that tab can never be captured (a chrome:// page, the extension store, an extension page, an embedded PDF).',
   '',
@@ -1219,6 +1268,8 @@ const LIST_DESCRIPTION = [
 const CAPTURE_DESCRIPTION = [
   'Capture one web page — a row from list_pages, given as { instance, tabId } — into a material directory, and hand back a file list that create_ui_block can load straight off disk, so no page content has to pass through this conversation.',
   '',
+  'IF THE PAGE IS NOT OPEN YET: this tool can only target a tab that already exists in a browser with dsh-page-capture loaded, so call open_page({ url }) first — it returns the { instance, tabId } this tool takes.',
+  '',
   'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer (60 seconds; a tab closed or navigated since list_pages fails here, and a timeout means the extension never answered — either way call list_pages again instead of retrying the same tabId), and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
   '',
   'files[].from is the ABSOLUTE path of each file on disk. Pass those strings as create_ui_block\'s files[].from and the host copies the bytes itself: a few hundred KB of material then costs no context at all. Read a file only when the caller asked to change its content.',
@@ -1226,6 +1277,16 @@ const CAPTURE_DESCRIPTION = [
   'THE RESULT IS AN INDEX, NOT A PILE: files grouped by type with their bytes, the totals, report.dropped summarised, and "dangling" — every url()/src/link href the captured documents make to something the capture does NOT have. That list is the honest answer to "which icon is missing", so read it instead of re-capturing. fromDir names the directory to hand create_ui_block, so the whole material set becomes one block in one call: capture_page -> create_ui_block({ name, fromDir }) -> read_ui_block.',
   '',
   'A failure is always one concrete cause: the extension never reported in, it reported but never took the task, it took the task and never answered, the target tab is gone (call list_pages again — do not substitute another tab), or the extension itself failed, in which case its own message is repeated verbatim.'
+].join('\n')
+
+const OPEN_PAGE_DESCRIPTION = [
+  'Open one web page in a browser that has the dsh-page-capture extension loaded, and return the exact { instance, tabId } capture_page takes. Use it when the page is not already open in one: capture_page can only target a tab that already exists, and no other tool in this plugin can create one.',
+  '',
+  'It starts a headless Chrome with a throwaway profile (the user\'s cookies are never copied, so a page that needs a login has to be opened by the user in their own browser), loads the packaged extension through CDP, points that extension at THIS instance, opens the URL, and waits for the extension to report the tab. url and title in the answer are what the extension actually saw, so a redirect or a login wall shows up there rather than being guessed.',
+  '',
+  'THE BROWSER STAYS OPEN after the call — the extension lives in it, and capture_page still has to reach the page. It is closed by open_page({ close: true, name }), when this plugin is reloaded, or when the DSH process exits; it is NOT closed when a capture finishes. Reusing a name closes the earlier browser that reported under it.',
+  '',
+  'On failure the error names the extension directory, this instance\'s address, the browser\'s pid and debug port, and the last time that instance reported (or that it never did) — enough to tell "the page never loaded" from "the extension is not polling this instance". Then run list_pages: its checklist starts with the extension\'s baseURL.'
 ].join('\n')
 
 // ---------------------------------------------------------------------------
@@ -2005,7 +2066,7 @@ function pagesText(rows, args) {
   let capturePath = ''
   try { capturePath = extensionDir(EXTENSION_CAPTURE_DIR_NAME) } catch (error) { capturePath = 'the extension-capture folder inside this plugin package' }
   lines.push('', 'Check these in order:')
-  lines.push('1. Is the target page open right now? The extension reports open tabs only, so nothing appears here until the page is open in a browser that has dsh-page-capture loaded — a public page can be opened by a browser this agent starts itself, with the extension loaded from ' + capturePath + '; a page that needs a login has to be opened by the user in their own browser, since no cookie is ever copied.')
+  lines.push('1. Is the target page open right now? The extension reports open tabs only, so nothing appears here until the page is open in a browser that has dsh-page-capture loaded — for a public page call open_page({ url }): it starts that browser from ' + capturePath + ' and returns { instance, tabId }; a page that needs a login has to be opened by the user in their own browser, since no cookie is ever copied.')
   lines.push('2. Is the capture extension installed in that browser? chrome://extensions must list dsh-page-capture (Developer mode -> Load unpacked). Its directory on this machine: ' + capturePath)
   lines.push('3. Does its options page point baseURL at ' + instancePortText() + '? That one line is the whole setting: installed once, the extension reports to whichever instance baseURL names, so pointing it at the other instance makes this list empty while the other one fills up.')
   lines.push('4. Is the extension\'s own reporting switch on? With it off the extension sends nothing at all — not even a poll — so nothing here can see it.')
@@ -2203,6 +2264,375 @@ function noResultText(task, timeoutMs) {
   }
   return head + 'The extension took the task and never answered: the page may be stuck loading, or the extension hit an error and dropped the result. Its own console is the place to look (chrome://extensions -> the extension -> service worker). The task is still remembered here, so a late answer still lands in ui-captures.'
 }
+
+// ---------------------------------------------------------------------------
+// open_page: make the capture path REACHABLE.
+//
+// capture_page needs { instance, tabId } of a tab that already exists in a
+// browser with the extension loaded. A model has no way to produce that pair by
+// hand, so this tool starts the browser itself: Chrome headless, a throwaway
+// profile, the packaged extension loaded through CDP Extensions.loadUnpacked
+// (Chrome 156 dropped --load-extension), its options page pointed at THIS
+// instance, then the URL opened and the tab waited for.
+//
+// Lifecycle is the point: the browser is KEPT after a successful call, because
+// the extension lives in it and capture_page still has to reach the page. It is
+// closed by open_page({ close: true, name }), when the plugin fiber is disposed,
+// or by the process-exit hook — never right after the call.
+// ---------------------------------------------------------------------------
+
+/** Live browsers, keyed by the instance name they report under. */
+const openPages = new Map()
+let openPageExitHook = false
+
+/** One WebSocket CDP session: same shape as the one screenshotBlock builds inline. */
+async function cdpConnect(wsUrl) {
+  const socket = new WebSocket(wsUrl)
+  await new Promise((done, fail) => { socket.addEventListener('open', done); socket.addEventListener('error', fail) })
+  let nextId = 0
+  const pending = new Map()
+  socket.addEventListener('message', (event) => {
+    let message
+    try { message = JSON.parse(String(event.data)) } catch { return }
+    const settle = pending.get(message.id)
+    if (settle === undefined) return
+    pending.delete(message.id)
+    settle(message)
+  })
+  const send = (method, params) => new Promise((resolve, reject) => {
+    const id = ++nextId
+    pending.set(id, (message) => {
+      if (message.error !== undefined) reject(new Error(method + ': ' + String(message.error.message === undefined ? message.error : message.error.message)))
+      else resolve(message.result === undefined ? {} : message.result)
+    })
+    socket.send(JSON.stringify({ id, method, params: params === undefined ? {} : params }))
+  })
+  return { send, close: () => { try { socket.close() } catch { /* already closed */ } } }
+}
+
+/** Evaluate in one page target and return the by-value result, exceptions included. */
+async function evaluateInPage(session, expression) {
+  const result = await session.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })
+  if (result.exceptionDetails !== undefined) {
+    throw new Error('page threw: ' + String(result.exceptionDetails.text === undefined ? '' : result.exceptionDetails.text)
+      + ' ' + String(result.exceptionDetails.exception === undefined || result.exceptionDetails.exception.description === undefined ? '' : result.exceptionDetails.exception.description))
+  }
+  return result.result === undefined ? undefined : result.result.value
+}
+
+/** A loopback port nothing is listening on right now. */
+function freeTcpPort() {
+  return new Promise((resolve, reject) => {
+    const server = createTcpServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port
+      server.close(() => resolve(port))
+    })
+  })
+}
+
+/** The browser open_page drives, or a list of the paths it looked at. */
+function browserPath() {
+  for (const candidate of BROWSER_CANDIDATES) if (existsSync(candidate)) return candidate
+  throw new Error(OPEN_PAGE_TOOL + ': no Chrome or Edge found. Looked at: ' + BROWSER_CANDIDATES.join(', ') + ' — set CHROME_PATH to the executable.')
+}
+
+/** One new tab at URL; /json/new only accepts PUT on a modern Chrome. */
+async function openBrowserTab(port, url) {
+  let last = ''
+  for (const method of ['PUT', 'GET']) {
+    try {
+      const res = await fetch('http://127.0.0.1:' + String(port) + '/json/new?' + url, { method, cache: 'no-store' })
+      if (!res.ok) { last = 'HTTP ' + String(res.status); continue }
+      return await res.json()
+    } catch (error) {
+      last = String(error && error.message === undefined ? error : error.message)
+    }
+  }
+  throw new Error('could not open a tab at ' + url + ' (' + last + ')')
+}
+
+/**
+ * Wait for a tab whose URL contains needle, and hand back the target as
+ * /json/list sees it NOW. /json/new answers before the navigation commits, and
+ * its webSocketDebuggerUrl dies with the old document — connecting to that one
+ * evaluates against about:blank, where the extension's chrome.* does not exist.
+ */
+async function waitForBrowserTarget(port, needle, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  let last = 'no answer from /json/list'
+  while (Date.now() < deadline) {
+    try {
+      const list = await (await fetch('http://127.0.0.1:' + String(port) + '/json/list', { cache: 'no-store' })).json()
+      const hit = (Array.isArray(list) ? list : []).find((target) => target.type === 'page'
+        && typeof target.webSocketDebuggerUrl === 'string' && String(target.url).includes(needle))
+      if (hit !== undefined) return hit
+      last = 'no page target whose URL contains ' + needle
+    } catch (error) {
+      last = String(error && error.message === undefined ? error : error.message)
+    }
+    await sleep(200)
+  }
+  throw new Error(OPEN_PAGE_TOOL + ': the tab ' + needle + ' never appeared in the browser (' + last + ')')
+}
+
+/** Delete a throwaway profile, retrying while Chrome still holds a handle on it. */
+async function removeProfileDir(profile) {
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    try { await rm(profile, { recursive: true, force: true }); return } catch { await sleep(100) }
+  }
+}
+
+function ensureOpenPageExitHook() {
+  if (openPageExitHook) return
+  openPageExitHook = true
+  // ponytail: only the exit hook — a SIGKILL of DSH leaves Chrome behind, and
+  // the next open_page with the same name closes that one. A job object would
+  // need a native dependency this plugin does not carry.
+  process.once('exit', () => {
+    for (const record of openPages.values()) {
+      try { record.child.kill() } catch { /* already gone */ }
+    }
+  })
+}
+
+/**
+ * Close one browser open_page started, or every one when no name is given.
+ * @returns the instance names actually closed.
+ */
+async function closeOpenPage(name) {
+  const wanted = name === undefined || name === null || String(name).trim() === ''
+    ? [...openPages.keys()]
+    : [String(name).trim()]
+  const closed = []
+  for (const key of wanted) {
+    const record = openPages.get(key)
+    if (record === undefined) continue
+    openPages.delete(key)
+    closed.push(key)
+    const exited = new Promise((done) => {
+      if (record.child.exitCode !== null) { done(); return }
+      const limit = setTimeout(done, 3000)
+      record.child.once('exit', () => { clearTimeout(limit); done() })
+      try { record.child.kill() } catch { clearTimeout(limit); done() }
+    })
+    await exited
+    await removeProfileDir(record.profile)
+  }
+  return closed
+}
+
+/** http(s) only: a chrome:// or file:// URL is not something capture_page can extract. */
+function openPageUrl(value) {
+  const text = String(value === undefined || value === null ? '' : value).trim()
+  if (text === '') throw new Error(OPEN_PAGE_TOOL + ': url is required, e.g. https://example.com')
+  let parsed
+  try { parsed = new URL(text) } catch { throw new Error(OPEN_PAGE_TOOL + ': url is not a URL: ' + JSON.stringify(value)) }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(OPEN_PAGE_TOOL + ': url must be http or https, got ' + parsed.protocol + ' — a browser-internal or file page has no DOM the capture extension can extract')
+  }
+  return parsed.toString()
+}
+
+/** One instance name: safe to key a map by and to store in the extension. */
+function openPageName(value) {
+  const text = value === undefined || value === null ? '' : String(value).trim()
+  if (text === '') return 'open-' + randomBytes(3).toString('hex')
+  if (!NAME_RE.test(text) || text.includes('..')) {
+    throw new Error(OPEN_PAGE_TOOL + ': name must be 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit, got ' + JSON.stringify(value))
+  }
+  return text
+}
+
+/** How long to wait for the extension's report. */
+function openPageWait(value) {
+  if (value === undefined || value === null) return OPEN_PAGE_DEFAULT_WAIT_MS
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms <= 0) throw new Error(OPEN_PAGE_TOOL + ': waitMs must be a positive number of milliseconds, got ' + JSON.stringify(value))
+  return Math.min(Math.max(Math.round(ms), OPEN_PAGE_MIN_WAIT_MS), OPEN_PAGE_MAX_WAIT_MS)
+}
+
+/** URL normalization for tab matching: the extension reports the final URL. */
+function normalizedHref(raw) {
+  try {
+    const url = new URL(String(raw === undefined || raw === null ? '' : raw))
+    url.hash = ''
+    return url.href
+  } catch {
+    return String(raw === undefined || raw === null ? '' : raw)
+  }
+}
+
+/**
+ * The tab that is the page open_page just opened: exact URL first, then the
+ * same host on a deeper path (a redirect), then the only http(s) tab — a fresh
+ * throwaway browser has nothing else in it once the options page is closed.
+ */
+function matchOpenedTab(tabs, wanted) {
+  const want = normalizedHref(wanted)
+  const exact = tabs.find((tab) => normalizedHref(tab.url) === want)
+  if (exact !== undefined) return exact
+  let parsed
+  try { parsed = new URL(want) } catch { parsed = null }
+  if (parsed !== null) {
+    const cut = parsed.pathname === '/' ? '/' : (parsed.pathname.endsWith('/') ? parsed.pathname : parsed.pathname + '/')
+    const prefix = tabs.find((tab) => {
+      try {
+        const seen = new URL(String(tab.url))
+        return seen.host === parsed.host && (seen.pathname === parsed.pathname || seen.pathname.startsWith(cut))
+      } catch { return false }
+    })
+    if (prefix !== undefined) return prefix
+  }
+  const http = tabs.filter((tab) => /^https?:/i.test(String(tab.url)))
+  return http.length === 1 ? http[0] : undefined
+}
+
+/** Every instance that reported AFTER this launch, newest first. */
+function freshInstances(knownBefore) {
+  return [...agentHub.instances].filter(([instance]) => !knownBefore.has(instance))
+    .sort((left, right) => right[1].at - left[1].at)
+}
+
+/** The failure text: enough to tell "page never loaded" from "extension is not polling this instance". */
+function openPageFailureText(name, url, waitMs, knownBefore, record, agentPortNow) {
+  const lines = [OPEN_PAGE_TOOL + ': no tab was reported for ' + url + ' within ' + String(Math.round(waitMs / 1000)) + 's.']
+  lines.push('- extension directory: ' + extensionDir(EXTENSION_CAPTURE_DIR_NAME))
+  lines.push('- this instance: ' + (agentPortNow > 0 ? 'http://127.0.0.1:' + String(agentPortNow) : 'this instance\'s own port (not learned yet)'))
+  lines.push('- browser: ' + record.chrome + ' (pid ' + String(record.child.pid) + ', debug port ' + String(record.port) + ')')
+  const mine = agentHub.instances.get(name)
+  lines.push('- last report from instance "' + name + '": ' + (mine === undefined ? 'never' : new Date(mine.at).toISOString() + ' (' + String(mine.tabs.length) + ' tab(s))'))
+  const fresh = freshInstances(knownBefore)
+  if (fresh.length > 0) {
+    lines.push('- instances that appeared since the launch: ' + fresh.slice(0, 5).map(([instance, seen]) => '"' + instance + '" at ' + new Date(seen.at).toISOString() + ' (' + String(seen.tabs.length) + ' tab(s))').join('; '))
+  } else {
+    lines.push('- instances that appeared since the launch: none')
+  }
+  lines.push('The page may still be loading, the extension may not have been loaded, or its options page may point elsewhere. Run list_pages: it names every instance reporting right now, and its checklist starts with baseURL. Fix the cause and call open_page again — the browser above is closed now.')
+  return lines.join('\n')
+}
+
+/**
+ * Start a browser with the capture extension, point it at this instance, open
+ * one page and wait until the extension reports that tab.
+ * @returns { instance, tabId, url, title } — exactly what capture_page takes.
+ */
+async function launchOpenPage(options) {
+  const url = openPageUrl(options.url)
+  const name = openPageName(options.name)
+  const waitMs = openPageWait(options.waitMs)
+  if (agentPort <= 0) throw new Error(OPEN_PAGE_TOOL + ': this instance\'s HTTP port is not known yet, so the extension cannot be pointed at it. Start the plugin through the normal DSH web server and retry.')
+  const captureDir = extensionDir(EXTENSION_CAPTURE_DIR_NAME)
+  if (!existsSync(join(captureDir, 'manifest.json'))) {
+    throw new Error(OPEN_PAGE_TOOL + ': the capture extension is missing: ' + captureDir + ' has no manifest.json. Reinstall the plugin package.')
+  }
+  const chrome = browserPath()
+  // One browser per name: a second one would report the same instance and they
+  // would overwrite each other's tab list.
+  if (openPages.has(name)) await closeOpenPage(name)
+  const knownBefore = new Set(agentHub.instances.keys())
+  const port = await freeTcpPort()
+  const profile = join(tmpdir(), 'dsh-open-page-' + randomBytes(6).toString('hex'))
+  const child = spawn(chrome, [
+    '--headless=new',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--user-data-dir=' + profile,
+    '--remote-debugging-port=' + String(port),
+    // Chrome 156: --load-extension is gone; these two are what let CDP load it.
+    '--enable-unsafe-extension-debugging',
+    '--remote-allow-origins=*',
+    'about:blank'
+  ], { stdio: 'ignore', windowsHide: true })
+  const record = { child, chrome, port, profile, extensionId: '', name, url, tabId: undefined, startedAt: Date.now() }
+  openPages.set(name, record)
+  ensureOpenPageExitHook()
+  child.once('exit', () => {
+    if (openPages.get(name) === record) openPages.delete(name)
+    removeProfileDir(profile).catch(() => {})
+  })
+  try {
+    await until(async () => (await fetch('http://127.0.0.1:' + String(port) + '/json/version')).ok, 20000, 'the headless browser to answer /json/version')
+    const version = await (await fetch('http://127.0.0.1:' + String(port) + '/json/version')).json()
+    if (typeof version.webSocketDebuggerUrl !== 'string') throw new Error('the browser gave no webSocketDebuggerUrl')
+    const browser = await cdpConnect(version.webSocketDebuggerUrl)
+    let loaded
+    try { loaded = await browser.send('Extensions.loadUnpacked', { path: captureDir }) } finally { browser.close() }
+    const extensionId = String(loaded.id === undefined ? '' : loaded.id)
+    if (extensionId === '') throw new Error('Extensions.loadUnpacked returned no extension id')
+    record.extensionId = extensionId
+    // The options page is the extension's own surface: writing storage from it
+    // is the same thing the page does for ?baseURL=, only with the instance too.
+    await openBrowserTab(port, 'chrome-extension://' + extensionId + '/options.html')
+    const optionsTab = await waitForBrowserTarget(port, 'options.html', 8000)
+    const session = await cdpConnect(optionsTab.webSocketDebuggerUrl)
+    try {
+      const wanted = {
+        baseUrl: 'http://127.0.0.1:' + String(agentPort),
+        instance: name,
+        enabled: true,
+        ...agentHub.options.token === '' ? {} : { token: agentHub.options.token }
+      }
+      // The target's URL updates a beat before its document is live, so the
+      // extension APIs can still be missing on the first evaluate. Retry rather
+      // than reading about:blank's empty chrome object as a load failure.
+      try {
+        await until(async () => {
+          try { return (await evaluateInPage(session, 'typeof chrome !== "undefined" && !!(chrome.storage && chrome.storage.local)')) === true } catch { return false }
+        }, 8000, 'the extension APIs in the options page')
+        await until(async () => {
+          try { await evaluateInPage(session, 'chrome.storage.local.set(' + JSON.stringify(wanted) + ').then(function () { return 1 })'); return true } catch { return false }
+        }, 8000, 'the options page to accept the baseUrl + instance')
+      } catch (error) {
+        throw new Error(OPEN_PAGE_TOOL + ': the extension never became usable in the browser it opened (' + String(error && error.message === undefined ? error : error.message)
+          + '). Extension directory: ' + captureDir + '. Browser pid: ' + String(child.pid) + '.')
+      }
+      await until(async () => {
+        const back = await evaluateInPage(session, 'chrome.storage.local.get({ baseUrl: "", instance: "", enabled: true }).then(function (v) { return JSON.stringify(v) })')
+        let stored
+        try { stored = JSON.parse(String(back)) } catch { stored = {} }
+        return stored.baseUrl === wanted.baseUrl && stored.instance === name && stored.enabled === true
+      }, 8000, 'the extension options page to store baseUrl + instance')
+    } finally {
+      session.close()
+    }
+    if (optionsTab.id !== undefined) {
+      try { await fetch('http://127.0.0.1:' + String(port) + '/json/close/' + String(optionsTab.id), { cache: 'no-store' }) } catch { /* the page is only noise */ }
+      await sleep(300)
+    }
+    await openBrowserTab(port, url)
+    // The launch argument leaves one about:blank tab behind. Close it BEFORE
+    // waiting, so list_pages has exactly one row for this browser.
+    try {
+      const list = await (await fetch('http://127.0.0.1:' + String(port) + '/json/list', { cache: 'no-store' })).json()
+      for (const target of Array.isArray(list) ? list : []) {
+        if (target.type === 'page' && String(target.url) === 'about:blank') {
+          await fetch('http://127.0.0.1:' + String(port) + '/json/close/' + String(target.id), { cache: 'no-store' })
+        }
+      }
+    } catch { /* the extra row is noise, not a failure */ }
+    const deadline = Date.now() + waitMs
+    while (Date.now() < deadline) {
+      const mine = agentHub.instances.get(name)
+      if (mine !== undefined && Date.now() - mine.at <= AGENT_OFFLINE_MS) {
+        const tab = matchOpenedTab(mine.tabs, url)
+        if (tab !== undefined) {
+          record.tabId = tab.tabId
+          record.url = String(tab.url === undefined ? url : tab.url)
+          return { instance: name, tabId: tab.tabId, url: record.url, title: String(tab.title === undefined ? '' : tab.title) }
+        }
+      }
+      await sleep(200)
+    }
+    throw new Error(openPageFailureText(name, url, waitMs, knownBefore, record, agentPort))
+  } catch (error) {
+    await closeOpenPage(name)
+    throw error
+  }
+}
+
 /**
  * Mount the tools and the read route, plus the extension hub.
  * @param ctx - plugin context carrying `tools` (and `webServer`/`attachments`/`connection` when composed).
@@ -2287,9 +2717,15 @@ export function apply(ctx, config) {
                 path: { type: 'string', required: true },
                 bytes: { type: 'number', required: true },
                 reason: { type: 'string', required: true },
-                detail: { type: 'string' }
+                detail: { type: 'string' },
+                via: { type: 'string', description: 'Present when the only references to this skipped file are srcset candidates ("srcset").' }
               }
             }
+          },
+          srcsetReferenced: {
+            type: 'array',
+            description: 'fromDir only: files the entry loads ONLY through a srcset/imagesrcset candidate. They are LOADED when type and size allow it — never "unreferenced". A path here that also appears in skipped[] was left out for another reason.',
+            items: { type: 'string' }
           },
           referencedSkipped: {
             type: 'array',
@@ -2305,10 +2741,13 @@ export function apply(ctx, config) {
           + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
           + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
           + (Array.isArray(value.skipped) && value.skipped.length > 0
-            ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + ')').join('\n')
+            ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + (item.via === 'srcset' ? '; referenced via srcset' : '') + ')').join('\n')
             : '')
           + (Array.isArray(value.referencedSkipped) && value.referencedSkipped.length > 0
             ? '\nReferenced but skipped — those 404 inside the block, the page still renders:\n' + value.referencedSkipped.map((line) => '  - ' + line).join('\n')
+            : '')
+          + (Array.isArray(value.srcsetReferenced) && value.srcsetReferenced.length > 0
+            ? '\nReferenced via srcset only (' + String(value.srcsetReferenced.length) + ') — these are LOADS, not leftovers:\n  - ' + value.srcsetReferenced.join('\n  - ')
             : '')
           + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
           + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
@@ -2326,12 +2765,14 @@ export function apply(ctx, config) {
       let assembled
       let from
       let skipped
+      let srcsetReferenced
       let referencedSkipped
       if (hasDir) {
         const collected = await collectFromDir(args.fromDir, args.entry)
         from = collected.root
         assembled = await assembleBlock(collected.files, collected.entryPath, { toleratedMissing: collected.tolerated })
         skipped = collected.skipped
+        srcsetReferenced = collected.srcsetReferenced
         referencedSkipped = assembled.toleratedRefs.map((row) => row.where + ':' + String(row.line) + ' ' + row.ref + ' -> ' + row.path)
       } else {
         assembled = await assembleBlock(args.files, args.entry)
@@ -2347,6 +2788,7 @@ export function apply(ctx, config) {
         totalBytes: assembled.files.reduce((sum, file) => sum + file.bytes, 0),
         files: assembled.files,
         ...skipped === undefined ? {} : { skipped },
+        ...srcsetReferenced === undefined || srcsetReferenced.length === 0 ? {} : { srcsetReferenced },
         ...referencedSkipped === undefined || referencedSkipped.length === 0 ? {} : { referencedSkipped },
         ...assembled.warning === undefined ? {} : { warning: assembled.warning }
       }
@@ -2667,6 +3109,79 @@ export function apply(ctx, config) {
       }
     }
   }))
+
+  ctx.tools.register(defineTool({
+    name: OPEN_PAGE_TOOL,
+    description: OPEN_PAGE_DESCRIPTION,
+    // Chrome startup + the extension's own poll + the wait the caller allows.
+    timeoutMs: OPEN_PAGE_MAX_WAIT_MS + 30000,
+    parameters: {
+      url: {
+        type: 'string',
+        description: 'The http(s) page to open. Required unless close is true — a page that needs a login cannot be opened here without the user\'s cookies; open it in the user\'s own browser instead.'
+      },
+      name: {
+        type: 'string',
+        description: 'Instance name this browser reports under, so it can be found again and closed. 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit. Omitted, a random open-xxxxxx is used and returned.'
+      },
+      waitMs: {
+        type: 'number',
+        description: 'How long to wait for the extension to report the tab, in milliseconds. Default 15000, clamped to 1000-120000. The extension polls every couple of seconds; a longer wait only covers a slow page.'
+      },
+      close: {
+        type: 'boolean',
+        description: 'Close the browser open_page started instead of opening a page. Closes the one named by name, or every one this session started when name is omitted. The page is then gone, so call capture_page first.'
+      }
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          instance: { type: 'string', required: true, description: 'The instance name the extension reports under — pass it to capture_page and list_pages.' },
+          tabId: { type: 'number', description: 'The tab the page was opened in. Pass it to capture_page together with instance.' },
+          url: { type: 'string', description: 'The URL the extension actually reported (after redirects).' },
+          title: { type: 'string', description: 'The document title the extension reported.' },
+          closed: { type: 'array', description: 'close only: the instance names whose browsers were closed. Empty means none was open under that name.', items: { type: 'string' } }
+        }
+      },
+      render: (args, value) => {
+        if (Array.isArray(value.closed)) {
+          return [{
+            type: 'text',
+            text: value.closed.length === 0
+              ? OPEN_PAGE_TOOL + ': nothing was open under that name — a browser is only kept after a successful open_page call (' + String(openPages.size) + ' open now).'
+              : OPEN_PAGE_TOOL + ': closed ' + String(value.closed.length) + ' browser(s): ' + value.closed.join(', ') + '. Their pages are gone, so a capture has to be taken before this.'
+          }]
+        }
+        return [{
+          type: 'text',
+          text: OPEN_PAGE_TOOL + ': opened ' + String(value.url) + ' — "' + String(value.title === '' ? '(no title)' : value.title) + '".'
+            + '\nNEXT: capture_page({ instance: "' + String(value.instance) + '", tabId: ' + String(value.tabId) + ' })'
+            + '\nThe browser stays open for that capture — close it when the block is built with open_page({ close: true, name: "' + String(value.instance) + '" }).'
+        }]
+      }
+    },
+    execute: async (args) => {
+      if (args.close === true) {
+        const wanted = args.name === undefined || args.name === null ? undefined : openPageName(args.name)
+        const closed = await closeOpenPage(wanted)
+        return { instance: wanted === undefined ? 'all' : wanted, closed }
+      }
+      return await launchOpenPage(args)
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'Open page: ' + String(args.url ?? ''),
+      kind: 'other',
+      content: [{ type: 'text', text: String(args.url ?? '') }]
+    })
+  }))
+
+  // A browser outlives this tool call, so it must not outlive the plugin fiber.
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => { closeOpenPage().catch(() => {}) })
+  }
 
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.webServer.register({
@@ -3086,6 +3601,20 @@ export const extensionHub = {
   capturesDir,
   captureRelativePath,
   applyAgentConfig
+}
+/**
+ * Test seam for self-check-agent-tools.mjs: the browser open_page starts, so the
+ * argument guards, the tab matching and the kept-until-closed lifecycle can be
+ * asserted without the model-facing schema in the way.
+ */
+export const openPage = {
+  launch: launchOpenPage,
+  close: closeOpenPage,
+  matchOpenedTab,
+  normalizeUrl: openPageUrl,
+  normalizeName: openPageName,
+  normalizeWait: openPageWait,
+  open: () => [...openPages.keys()]
 }
 /**
  * Test seam for self-check-agent-tools.mjs: the instance registry and the

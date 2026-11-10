@@ -17,7 +17,7 @@
  *   8. an extension-reported failure repeats the extension's own words
  */
 import assert from 'node:assert/strict'
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -26,7 +26,7 @@ import { basename, join } from 'node:path'
 const tempHome = await mkdtemp(join(tmpdir(), 'dsh-agent-tools-home-'))
 process.env.DSH_HOME = tempHome
 
-const { apply, extensionHub, instanceRegistry } = await import('./index.js')
+const { apply, extensionHub, instanceRegistry, openPage } = await import('./index.js')
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 
 const checks = []
@@ -34,9 +34,30 @@ const checkAsync = async (name, fn) => { await fn(); checks.push(name); console.
 
 const tools = new Map()
 const routes = []
+// A REAL loopback server, because open_page's browser must poll it: the tools
+// still call handlers directly below, but section 13 runs the whole path.
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+  if (url.pathname === '/page') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end('<!doctype html><html><head><title>Open Page Probe</title></head><body><h1>hello</h1><img src="./a.png"></body></html>')
+    return
+  }
+  if (url.pathname === '/a.png') {
+    res.writeHead(200, { 'content-type': 'image/png' })
+    res.end(Buffer.from([1, 2, 3]))
+    return
+  }
+  const hit = [...routes].sort((left, right) => right.path.length - left.path.length)
+    .find((route) => url.pathname === route.path || url.pathname.startsWith(route.path + '/'))
+  if (hit === undefined) { res.writeHead(404); res.end('not found'); return }
+  Promise.resolve(hit.handler(req, res)).catch(() => { try { res.writeHead(500); res.end('failed') } catch { /* gone */ } })
+})
+await new Promise((done) => server.listen(0, '127.0.0.1', done))
+const instancePort = server.address().port
 const stubCtx = {
   tools: { register: (definition) => { tools.set(definition.name, definition); return () => {} } },
-  inject: (services, fn) => { fn({ webServer: { port: 4000, register: (route) => { routes.push(route); return () => {} } } }) },
+  inject: (services, fn) => { fn({ webServer: { port: instancePort, register: (route) => { routes.push(route); return () => {} } } }) },
   logger: { warn: () => {}, info: () => {} }
 }
 // registry.enabled:false — a test run must never fight a real instance over
@@ -96,14 +117,14 @@ await checkAsync('the rendered text names all five things to check', async () =>
   const value = await tool('list_pages').execute({})
   const text = render('list_pages', {}, value)
   assert.match(text, /no extension has reported/i)
-  for (const needle of ['chrome:\/\/extensions must list dsh-page-capture', 'baseURL', 'http://127.0.0.1:4000', 'reporting switch', 'agent.enabled', 'capturable=false']) {
+  for (const needle of ['chrome:\/\/extensions must list dsh-page-capture', 'baseURL', 'http://127.0.0.1:' + String(instancePort), 'reporting switch', 'agent.enabled', 'capturable=false']) {
     assert.match(text, new RegExp(needle), 'missing: ' + needle)
   }
   assert.doesNotMatch(text, /^\s*$/)
 })
 await checkAsync('the port is this instance\'s, learned from the web server', async () => {
   const text = render('list_pages', {}, [])
-  assert.match(text, /http:\/\/127\.0\.0\.1:4000/)
+  assert.match(text, new RegExp('http://127\\.0\\.0\\.1:' + String(instancePort)))
 })
 
 console.log('--- 2. a reported tab list comes back row for row ---')
@@ -432,5 +453,61 @@ await checkAsync('a non-registry listener on the port is reported once, never re
 })
 reg.stop('test done')
 
+console.log('--- 13. open_page guards: bad URLs and names never start a browser ---')
+await checkAsync('only http(s) is accepted, and url is required unless close is true', async () => {
+  await assert.rejects(() => tool('open_page').execute({}), /url is required/)
+  await assert.rejects(() => tool('open_page').execute({ url: 'file:///C:/x.html' }), /must be http or https/)
+  await assert.rejects(() => tool('open_page').execute({ url: 'chrome://settings' }), /must be http or https/)
+  await assert.rejects(() => tool('open_page').execute({ url: 'not a url' }), /not a URL/)
+})
+await checkAsync('a name create_ui_block would reject never reaches the extension', async () => {
+  await assert.rejects(() => tool('open_page').execute({ url: 'https://example.com', name: 'bad/name' }), /name must be 1-64 chars/)
+  assert.deepEqual(openPage.open(), [], 'no browser was started')
+})
+await checkAsync('closing an unknown name reports nothing closed', async () => {
+  const value = await tool('open_page').execute({ close: true, name: 'never-opened' })
+  assert.deepEqual(value.closed, [])
+  assert.match(render('open_page', {}, value), /nothing was open under that name/)
+})
+await checkAsync('the capture description points at open_page, and open_page says what it returns', async () => {
+  assert.match(tool('capture_page').description, /call open_page\(\{ url \}\) first/)
+  assert.match(tool('open_page').description, /\{ instance, tabId \}/)
+  assert.match(tool('open_page').description, /stays open/i)
+  assert.match(render('open_page', {}, { instance: 'x', tabId: 7, url: 'https://x/', title: '' }), /capture_page\(\{ instance: "x", tabId: 7 \}\)/)
+})
+
+console.log('--- 14. open_page -> list_pages -> capture_page -> create_ui_block, live ---')
+let live
+try {
+  await checkAsync('a real headless browser opens the page and returns the pair list_pages shows', async () => {
+    live = await tool('open_page').execute({ url: 'http://127.0.0.1:' + String(instancePort) + '/page', name: 'open-live', waitMs: 30000 })
+    assert.equal(live.instance, 'open-live')
+    assert.equal(Number.isFinite(live.tabId), true)
+    assert.match(live.url, /\/page$/)
+    assert.equal(live.title, 'Open Page Probe')
+    const rows = await tool('list_pages').execute({ instance: 'open-live' })
+    assert.ok(rows.some((row) => row.tabId === live.tabId), 'the same tabId is in list_pages')
+    assert.ok(openPage.open().includes('open-live'), 'the browser is kept, not closed after the call')
+  })
+  await checkAsync('that pair drives capture_page, create_ui_block and a 200 block URL', async () => {
+    const captured = await tool('capture_page').execute({ instance: live.instance, tabId: live.tabId, name: 'open-live-block', timeout_ms: 30000 })
+    assert.ok(captured.files.length >= 1)
+    const block = await tool('create_ui_block').execute({ name: 'open-live-block', fromDir: captured.fromDir })
+    assert.ok(existsSync(join(tempHome, 'ui-blocks', 'open-live-block.uiblock')), 'the block file is on disk')
+    const res = await fetch('http://127.0.0.1:' + String(instancePort) + '/ui-blocks/open-live-block/')
+    assert.equal(res.status, 200)
+    assert.match(await res.text(), /hello/)
+  })
+  await checkAsync('close:true shuts that browser down and forgets it', async () => {
+    const value = await tool('open_page').execute({ close: true, name: 'open-live' })
+    assert.deepEqual(value.closed, ['open-live'])
+    assert.deepEqual(openPage.open(), [])
+    await sleep(300)
+  })
+} finally {
+  await tool('open_page').execute({ close: true }).catch(() => {})
+}
+
+await new Promise((done) => server.close(done))
 await rm(tempHome, { recursive: true, force: true })
 console.log('self-check-agent-tools: ' + checks.length + ' checks OK')

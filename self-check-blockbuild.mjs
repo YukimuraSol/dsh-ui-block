@@ -109,6 +109,16 @@ t('a navigation href is not a resource reference; ng-src is not src', () => {
   const body = '<a href="/public-course#/all">x</a>\n<img ng-src="/static/x.png">'
   assert.deepEqual(blockBuild.collectRefs(body, 'index.html'), [])
 })
+t('srcset / imagesrcset candidates are LOADS, descriptors dropped, one ref each', () => {
+  const body = '<img srcset="./a.png 1x, ./a@2x.png 2x">\n<picture><source imagesrcset="./b.webp 480w, ./b@2x.webp 800w"></picture>'
+  const refs = blockBuild.collectRefs(body, 'index.html')
+  assert.deepEqual(refs.map((ref) => ref.path), ['a.png', 'a@2x.png', 'b.webp', 'b@2x.webp'])
+  assert.deepEqual(refs.map((ref) => ref.line), [1, 1, 2, 2])
+  assert.ok(refs.every((ref) => ref.via === 'srcset'), 'each candidate carries its provenance')
+})
+t('data-srcset is not a load — only the real attribute counts', () => {
+  assert.deepEqual(blockBuild.collectRefs('<img data-srcset="./lazy.png 2x">', 'index.html'), [])
+})
 
 console.log('--- 2. fromDir: one call, whole page, accounted for ---')
 const site = material('site')
@@ -147,6 +157,32 @@ await ta('the skip ledger names each left-out file and why', async () => {
   assert.equal(byPath.get('assets/empty.stream').bytes, 12)
   assert.equal(value.referencedSkipped, undefined, 'nothing referenced is skipped here')
   assert.ok(!value.files.some((file) => file.path === 'report.json'), 'the report never becomes a section')
+})
+
+console.log('--- 2b. srcset-only material is loaded, never reported as unreferenced ---')
+const retina = material('retina')
+put(retina, 'entry.html', '<!doctype html>\n<html><body><img src="./assets/hero.png" srcset="./assets/hero@2x.png 2x, ./assets/hero@3x.png 3x"><picture><source imagesrcset="./assets/icon.avif 1x"></picture></body></html>\n')
+putBytes(retina, 'assets/hero.png', Buffer.from([1]))
+putBytes(retina, 'assets/hero@2x.png', Buffer.from([2, 2]))
+putBytes(retina, 'assets/hero@3x.png', Buffer.from([3, 3, 3]))
+putBytes(retina, 'assets/icon.avif', Buffer.from([4, 4, 4, 4]))
+await ta('the 2x/3x candidates land in the block; no srcset file is called unreferenced', async () => {
+  const value = await create.execute({ name: 'srcset-probe', fromDir: retina })
+  assert.deepEqual(value.files.map((file) => file.path), ['entry.html', 'assets/hero.png', 'assets/hero@2x.png', 'assets/hero@3x.png'])
+  assert.equal(value.skipped.length, 1, 'only the .avif is left out')
+  assert.equal(value.skipped[0].path, 'assets/icon.avif')
+  assert.equal(value.skipped[0].reason, 'unknown type')
+  assert.equal(value.skipped[0].via, 'srcset', 'the ledger says WHY it was referenced')
+  assert.ok(!value.skipped.some((item) => item.reason === 'unreferenced'), 'a srcset candidate is referenced')
+  assert.deepEqual(value.srcsetReferenced, ['assets/hero@2x.png', 'assets/hero@3x.png', 'assets/icon.avif'])
+  assert.ok(value.referencedSkipped.some((line) => /icon\.avif/.test(line)), 'the skipped-but-referenced report names it')
+})
+await ta('the rendered report separates "srcset only" from "unreferenced"', async () => {
+  const value = await create.execute({ name: 'srcset-probe-2', fromDir: retina })
+  const text = create.output.render({}, value).map((part) => part.text).join('\n')
+  assert.match(text, /Referenced via srcset only \(3\)/)
+  assert.match(text, /assets\/icon\.avif \(4 bytes, unknown type: no section type for "\.avif"; referenced via srcset\)/)
+  assert.doesNotMatch(text, /assets\/hero@[23]x\.png[^\n]*unreferenced/)
 })
 
 console.log('--- 3. fromDir: a referenced file past the per-file ceiling is skipped, not fatal ---')
