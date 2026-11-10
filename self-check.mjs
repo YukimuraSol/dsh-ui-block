@@ -36,6 +36,11 @@ const BODY = [
   '</div>'
 ].join('\n')
 
+// The create tool takes an explicit file list now (entry + every member), so the
+// entry body goes in as files=[{ path: 'index.html', content }] — there is no
+// single-body shorthand left to assert against.
+const asFiles = (body) => [{ path: 'index.html', content: body }]
+
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex')
 const tempHome = await mkdtemp(join(tmpdir(), 'dsh-uiblock-home-'))
 process.env.DSH_HOME = tempHome
@@ -66,21 +71,34 @@ const byName = Object.fromEntries(registered.map((definition) => [definition.nam
 check('create_ui_block registered', () => assert.equal(byName.create_ui_block !== undefined, true))
 check('read_ui_block registered', () => assert.equal(byName.read_ui_block !== undefined, true))
 
-// The 2026-10-24 contract, verbatim. A wording change here breaks what the user
-// asked for: create through the tool, update through write/edit, and the ONLY
-// delivery is a ::dsh-ui line of its own.
-const CREATE_CONTRACT = [
+// The contract as the description actually reads (checked 2026-11-10). The old
+// verbatim block quoted wording that does not exist any more ("with the full
+// HTML body", "updating one is write or edit on the file"), so it is asserted as
+// clauses of the CURRENT contract instead: create through the tool, a taken name
+// is a safe replace (never delete first), a whole page can land in one call with
+// fromDir, and updating is edit/write on the file in place.
+const CREATE_CLAUSES = [
   'CREATING vs UPDATING:',
-  '- To CREATE a UI block, call this tool with the full HTML body.',
-  '- Do NOT create a .uiblock file with write. A block that was not created through this tool has no registered metadata, so read_ui_block and the reference line cannot find it.',
-  '- To UPDATE an existing block, edit the .uiblock file with write or edit, then reference it again in the same message. Do NOT call this tool again to update it, and do NOT write the file through a shell command or a script — the card reads the file through the host route, and an unregistered write bypasses it.'
-].join('\n')
-check('create_ui_block description carries the plan §A contract verbatim', () => {
-  assert.equal(byName.create_ui_block.description.includes(CREATE_CONTRACT), true)
+  '- To CREATE a UI block, call this tool.',
+  'SAME NAME MEANS SAFE REPLACE',
+  'Do NOT delete the block first',
+  '- Do NOT create a .uiblock file with write.',
+  '\u0060edit\u0060 for a targeted change',
+  'FROMDIR — THE WAY TO LAND A WHOLE PAGE IN ONE CALL',
+  'capture_page -> create_ui_block({ name, fromDir })'
+]
+check('create_ui_block description carries every clause of the CREATING vs UPDATING contract', () => {
+  assert.equal(byName.create_ui_block.description.includes('CREATING vs UPDATING:'), true)
+  for (const clause of CREATE_CLAUSES) {
+    assert.equal(byName.create_ui_block.description.includes(clause), true, 'missing clause: ' + clause)
+  }
 })
-check('read_ui_block description points updates at write/edit', () => {
-  assert.equal(/create_ui_block/i.test(byName.read_ui_block.description), true)
-  assert.equal(byName.read_ui_block.description.includes('updating one is write or edit on the file'), true)
+// Read is a check, never the delivery: the image goes to the model and the
+// rendered entry is the still screen, so a demo block is not a timeline frame.
+check('read_ui_block description keeps render-not-delivery (image for the model, the line delivers)', () => {
+  assert.equal(byName.read_ui_block.description.includes('THIS IMAGE GOES TO THE MODEL, NOT TO THE USER'), true)
+  assert.equal(/renders the entry page/.test(byName.read_ui_block.description), true)
+  assert.equal(/::dsh-ui <name>/.test(byName.read_ui_block.description), true)
 })
 check('both descriptions teach the ::dsh-ui line and nothing about fences', () => {
   for (const tool of ['create_ui_block', 'read_ui_block']) {
@@ -99,13 +117,15 @@ check('read_ui_block takes width AND height, both optional canvas geometry', () 
   assert.equal(/canvas/i.test(params.height.description), true)
 })
 check('create_ui_block still takes no size parameter (size lives on the reference line)', () => {
-  const keys = Object.keys(byName.create_ui_block.parameters.properties).sort()
-  assert.deepEqual(keys, ['html', 'name', 'title'])
+  // The parameter list grew (entry / files / fromDir); what must never appear is
+  // a canvas size, because the size is declared on the ::dsh-ui line alone.
+  const props = byName.create_ui_block.parameters.properties
+  for (const sizeKey of ['width', 'height', 'res']) assert.equal(props[sizeKey], undefined, 'size parameter leaked: ' + sizeKey)
   assert.equal(/res=WxH/.test(byName.create_ui_block.description), true)
   assert.equal(/280-420/.test(byName.create_ui_block.description), true)
 })
 check('read_ui_block description tells the caller to match the reference line', () => {
-  assert.equal(/SAME pair/.test(byName.read_ui_block.description), true)
+  assert.equal(/same pair/i.test(byName.read_ui_block.description), true)
   assert.equal(/reference line/.test(byName.read_ui_block.description), true)
   assert.equal(/::dsh-ui <name>::/.test(byName.read_ui_block.description), true)
 })
@@ -126,7 +146,7 @@ check('the read route registered on /ui-blocks (plus the extension surface)', ()
 })
 
 console.log('--- 2. create_ui_block writes body only ---')
-const first = await byName.create_ui_block.execute({ name: 'selfcheck-card', html: BODY, title: '自检' }, {})
+const first = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(BODY), title: '自检' }, {})
 const blockFile = join(tempHome, 'ui-blocks', 'selfcheck-card.uiblock')
 await checkAsync('returns {path, name}', async () => {
   assert.equal(first.path, 'ui-blocks/selfcheck-card.uiblock')
@@ -148,7 +168,7 @@ await checkAsync('no BOM, no CRLF rewrite', async () => {
 })
 await checkAsync('sha256 is reproducible from the same input', async () => {
   const a = sha256(await readFile(blockFile))
-  await byName.create_ui_block.execute({ name: 'selfcheck-card', html: BODY }, {})
+  await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(BODY) }, {})
   const b = sha256(await readFile(blockFile))
   assert.equal(a, b)
   assert.equal(a.length, 64)
@@ -156,7 +176,7 @@ await checkAsync('sha256 is reproducible from the same input', async () => {
 
 console.log('--- 3. same-name write backs up, never clobbers ---')
 await checkAsync('second create with the same name makes a backup', async () => {
-  const result = await byName.create_ui_block.execute({ name: 'selfcheck-card', html: BODY.replace('自检卡片', '自检卡片 v2') }, {})
+  const result = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(BODY.replace('自检卡片', '自检卡片 v2')) }, {})
   assert.equal(typeof result.backup, 'string')
   const backupText = await readFile(result.backup, 'utf8')
   assert.equal(backupText, BODY)
@@ -166,11 +186,11 @@ await checkAsync('second create with the same name makes a backup', async () => 
 
 console.log('--- 4. name and body guards ---')
 await checkAsync('path traversal is rejected', async () => {
-  await assert.rejects(() => byName.create_ui_block.execute({ name: '../escape', html: BODY }, {}), /name must be/)
-  await assert.rejects(() => byName.create_ui_block.execute({ name: 'a/b', html: BODY }, {}), /name must be/)
+  await assert.rejects(() => byName.create_ui_block.execute({ name: '../escape', files: asFiles(BODY) }, {}), /name must be/)
+  await assert.rejects(() => byName.create_ui_block.execute({ name: 'a/b', files: asFiles(BODY) }, {}), /name must be/)
 })
 await checkAsync('empty body is rejected', async () => {
-  await assert.rejects(() => byName.create_ui_block.execute({ name: 'x', html: '   ' }, {}), /non-empty HTML body/)
+  await assert.rejects(() => byName.create_ui_block.execute({ name: 'x', files: asFiles('   ') }, {}), /entry index\.html is empty/)
 })
 await checkAsync('read of a missing block names the known ones', async () => {
   // Stub the services so the not-found guard is what fires, not the service guard.
