@@ -180,7 +180,7 @@ t('directiveRes is the canvas default the host screenshots at', () => {
 // ---------------------------------------------------------------------------
 const home = mkdtempSync(join(tmpdir(), 'dsh-uiblock-selfcheck-'))
 process.env.DSH_HOME = home
-const { timeline } = await import(pathToFileURL(join(here, 'index.js')).href)
+const { timeline, apply } = await import(pathToFileURL(join(here, 'index.js')).href)
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 const sha = (text) => createHash('sha256').update(String(text), 'utf8').digest('hex')
 const ta = async (name, fn) => { await fn(); n += 1; console.log('  ok - ' + name) }
@@ -324,8 +324,306 @@ t('the reference syntax itself is untouched', () => {
   assert.match(source, /var DIRECTIVE_RE = \/\^\[ \\t\]\*::dsh-ui\[ \\t\]\+/)
 })
 t('the tool description and the README both say it', () => {
-  assert.match(hostSource, /RENDERED AT MESSAGE TIME/)
+  assert.match(hostSource, /renders the version the block had when that message was first seen/)
   assert.match(readmeSource, /按消息时刻还原/)
+})
+
+// ---------------------------------------------------------------------------
+// 14-16. SECTIONS (2026-11-04): one file, virtual files. A marker line
+// '<!-- @@file <path> [base64] -->' starts a virtual file; the entry before it
+// is served at /ui-blocks/<name>, every section at /ui-blocks/<name>/<path>.
+// ---------------------------------------------------------------------------
+const MARK = '<!-- @@file '
+const fontBytes = Buffer.from([0x77, 0x4f, 0x46, 0x32, 0x00, 0x01, 0x02, 0x03, 0xff])
+
+console.log('--- 14. section parsing ---')
+t('a marker line splits the entry from one virtual file', () => {
+  const split = timeline.splitSections('<div>entry</div>\n' + MARK + 'panel.css -->\n.a{color:red}\n')
+  assert.equal(split.entry, '<div>entry</div>')
+  assert.deepEqual(split.files.map((file) => [file.path, file.base64, file.body]), [['panel.css', false, '.a{color:red}\n']])
+})
+t('no marker: no sections, and the entry is the whole file', () => {
+  const text = '<div class="pb">plain</div>\n'
+  const split = timeline.splitSections(text)
+  assert.equal(split.files.length, 0)
+  assert.equal(split.entry, text)
+})
+t('sections keep file order and each runs to the next marker', () => {
+  const split = timeline.splitSections(
+    MARK + 'a.css -->\nA\n' +
+    MARK + 'img/b.svg -->\n<svg/>\n' +
+    MARK + 'f.woff2 base64 -->\nAAAA\n')
+  assert.deepEqual(split.files.map((file) => file.path), ['a.css', 'img/b.svg', 'f.woff2'])
+  assert.equal(split.files[0].body, 'A')
+  assert.equal(split.files[1].body, '<svg/>')
+  assert.equal(split.files[2].base64, true)
+  assert.equal(split.files[2].body, 'AAAA\n')
+})
+t('CRLF and trailing spaces around a marker still split', () => {
+  const split = timeline.splitSections('x\r\n' + MARK + 'a.css -->  \r\nbody{}')
+  assert.equal(split.files.length, 1)
+  assert.equal(split.files[0].path, 'a.css')
+  assert.equal(split.files[0].body, 'body{}')
+})
+t('base64 decodes to exactly the bytes the file holds', () => {
+  const split = timeline.splitSections(MARK + 'f.woff2 base64 -->\n' + fontBytes.toString('base64') + '\n')
+  const decoded = Buffer.from(split.files[0].body.trim(), 'base64')
+  assert.equal(decoded.length, fontBytes.length)
+  assert.deepEqual([...decoded], [...fontBytes])
+})
+t('a marker inside a longer line is NOT a section', () => {
+  assert.equal(timeline.splitSections('<p>see ' + MARK + 'x.css --></p>').files.length, 0)
+})
+
+console.log('--- 15. the section guard ---')
+t('traversal, absolute and empty paths are refused (404)', () => {
+  for (const bad of ['../package.json', 'a/../../package.json', '/etc/passwd', '', 'a\\b.css']) {
+    assert.throws(() => timeline.sectionType(bad), (error) => error.status === 404, 'accepted ' + JSON.stringify(bad))
+  }
+})
+t('an unknown extension is 415, never a guess', () => {
+  // html/htm ARE section types (a block can carry whole pages); the rest are not.
+  for (const bad of ['notes.txt', 'noext', 'x.js', 'stream']) {
+    assert.throws(() => timeline.sectionType(bad), (error) => error.status === 415, 'accepted ' + bad)
+  }
+})
+t('every whitelisted extension maps to a real content type', () => {
+  assert.equal(timeline.sectionType('panel.css'), 'text/css; charset=utf-8')
+  assert.equal(timeline.sectionType('logo.svg'), 'image/svg+xml')
+  assert.equal(timeline.sectionType('img/deep/LOGO.PNG'), 'image/png')
+  assert.equal(timeline.sectionType('f.woff2'), 'font/woff2')
+  assert.equal(timeline.sectionType('f.ttf'), 'font/ttf')
+  assert.equal(timeline.sectionType('page.html'), 'text/html; charset=utf-8')
+  assert.equal(timeline.sectionType('page.htm'), 'text/html; charset=utf-8')
+})
+t('the host carries one CSP for the entry and every section, still no script', () => {
+  assert.match(hostSource, /'content-security-policy': BLOCK_CSP/)
+  assert.match(hostSource, /style-src 'self' 'unsafe-inline'/)
+  assert.match(hostSource, /script-src 'none'/)
+  // The ceilings are config now: 2 MB per file, 64 MB per block, 16 MB soft warn.
+  assert.match(hostSource, /sectionBytes: 2 \* 1024 \* 1024/)
+  assert.match(hostSource, /blockBytes: 64 \* 1024 \* 1024/)
+  assert.match(hostSource, /softWarnBytes: 16 \* 1024 \* 1024/)
+})
+t('the client swaps srcdoc for a URL only when sections are present', () => {
+  assert.match(source, /function hasSections\(text\)/)
+  assert.match(source, /state\.frame\.setAttribute\('src', entryUrl\(state\)\)/)
+  assert.match(source, /state\.frame\.setAttribute\('srcdoc', buildSrcdoc\(state, tokenCache\)\)/)
+})
+t('a served document gets the token sheet first in head, hidden until it is in', () => {
+  assert.match(source, /doc\.head\.insertBefore\(style, doc\.head\.firstChild\)/)
+  assert.match(source, /state\.frame\.style\.visibility = 'hidden'/)
+  assert.match(source, /state\.frame\.style\.visibility = ''/)
+})
+
+console.log('--- 16. the /ui-blocks route, driven directly ---')
+const routes = []
+apply({
+  tools: { register: () => undefined },
+  get: () => undefined,
+  inject: (names, fn) => fn({ webServer: { register: (entry) => routes.push(entry) } })
+})
+const route = routes.find((entry) => entry.path === '/ui-blocks')
+const call = async (raw) => {
+  const answer = { status: 0, headers: {}, body: null }
+  await route.handler(
+    { method: 'GET', url: raw, headers: {} },
+    { writeHead: (status, headers) => { answer.status = status; answer.headers = headers || {} }, end: (payload) => { answer.body = payload } }
+  )
+  return answer
+}
+const html = (value) => (Buffer.isBuffer(value) ? value.toString('utf8') : String(value))
+
+const entryHtml = '<!doctype html><html><head><link rel="stylesheet" href="./panel.css"></head><body><div class="Ww4dvW_card">hi</div></body></html>'
+const cssV1 = '.Ww4dvW_card{color:var(--dsw-alias-label-primary)}\n'
+const cssV2 = '.Ww4dvW_card{color:rgb(1, 2, 3)}\n'
+const svgText = '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>\n'
+const sectioned = (css) => entryHtml + '\n' + MARK + 'panel.css -->\n' + css + MARK + 'logo.svg -->\n' + svgText + MARK + 'f.woff2 base64 -->\n' + fontBytes.toString('base64') + '\n'
+const probe = join(home, 'ui-blocks', 'section-probe.uiblock')
+const plainProbe = join(home, 'ui-blocks', 'plain-probe.uiblock')
+const plainBody = '<div class="pb">plain</div>\n'
+writeFileSync(probe, sectioned(cssV1), 'utf8')
+writeFileSync(plainProbe, plainBody, 'utf8')
+
+await ta('a block with no marker still answers its .uiblock byte for byte', async () => {
+  const answer = await call('/ui-blocks/plain-probe.uiblock')
+  assert.equal(answer.status, 200)
+  assert.equal(answer.headers['content-type'], 'text/plain; charset=utf-8')
+  assert.equal(html(answer.body), plainBody)
+  assert.equal(answer.headers['x-uiblock-at'], 'live')
+  assert.equal(answer.headers['content-security-policy'], undefined)
+})
+await ta('the entry is a document, with the CSP header', async () => {
+  const answer = await call('/ui-blocks/section-probe')
+  assert.equal(answer.status, 200)
+  assert.equal(answer.headers['content-type'], 'text/html; charset=utf-8')
+  assert.equal(html(answer.body), entryHtml)
+  assert.match(answer.headers['content-security-policy'], /^default-src 'none'; style-src 'self' 'unsafe-inline';/)
+  assert.match(answer.headers['content-security-policy'], /script-src 'none'/)
+})
+await ta('the trailing-slash spelling serves the same entry (relative paths need it)', async () => {
+  const answer = await call('/ui-blocks/section-probe/')
+  assert.equal(answer.status, 200)
+  assert.equal(answer.headers['content-type'], 'text/html; charset=utf-8')
+  assert.equal(html(answer.body), entryHtml)
+})
+await ta('each section is served with its own content type and the same CSP', async () => {
+  const css = await call('/ui-blocks/section-probe/panel.css')
+  assert.equal(css.status, 200)
+  assert.equal(css.headers['content-type'], 'text/css; charset=utf-8')
+  assert.equal(html(css.body), cssV1.trim())
+  assert.match(css.headers['content-security-policy'], /font-src 'self' data:/)
+  const svg = await call('/ui-blocks/section-probe/logo.svg')
+  assert.equal(svg.status, 200)
+  assert.equal(svg.headers['content-type'], 'image/svg+xml')
+  assert.equal(html(svg.body), svgText.trim())
+  const font = await call('/ui-blocks/section-probe/f.woff2')
+  assert.equal(font.status, 200)
+  assert.equal(font.headers['content-type'], 'font/woff2')
+  assert.equal(font.body.length, fontBytes.length)
+  assert.deepEqual([...font.body], [...fontBytes])
+})
+await ta('a missing section is a 404, not an empty 200', async () => {
+  assert.equal((await call('/ui-blocks/section-probe/nope.css')).status, 404)
+  assert.equal((await call('/ui-blocks/plain-probe/panel.css')).status, 404)
+})
+await ta('an unknown extension is a 415', async () => {
+  writeFileSync(join(home, 'ui-blocks', 'txt-probe.uiblock'), '<b>x</b>\n' + MARK + 'notes.txt -->\nhello\n', 'utf8')
+  assert.equal((await call('/ui-blocks/txt-probe/notes.txt')).status, 415)
+})
+await ta('a path that walks out of the prefix is a 404, and no file content leaks', async () => {
+  const answer = await call('/ui-blocks/x/../../package.json')
+  assert.equal(answer.status, 404)
+  assert.equal(answer.body, 'not found')
+  const encoded = await call('/ui-blocks/x/%2e%2e%2f%2e%2e%2fpackage.json')
+  assert.equal(encoded.status, 404)
+  const direct = await call('/ui-blocks/../../package.json')
+  assert.equal(direct.status, 404)
+})
+await ta('a section over the 2 MB per-file ceiling is refused with 413', async () => {
+  const big = 'a{color:red}'.repeat(200000)
+  writeFileSync(join(home, 'ui-blocks', 'big-probe.uiblock'), '<b>x</b>\n' + MARK + 'big.css -->\n' + big + '\n', 'utf8')
+  const answer = await call('/ui-blocks/big-probe/big.css')
+  assert.equal(answer.status, 413)
+  assert.match(html(answer.body), /the limit is 2097152/)
+})
+await ta('?at= replays the entry AND its stylesheet from one moment', async () => {
+  await call('/ui-blocks/section-probe')
+  await sleep(12)
+  writeFileSync(probe, sectioned(cssV2), 'utf8')
+  await sleep(12)
+  const live = await call('/ui-blocks/section-probe/panel.css')
+  assert.equal(html(live.body), cssV2.trim())
+  const history = await timeline.readHistory('section-probe')
+  const patchedAt = history.entries[history.entries.length - 1].at
+  const at = '?at=' + String(patchedAt - 1)
+  const oldEntry = await call('/ui-blocks/section-probe' + at)
+  const oldCss = await call('/ui-blocks/section-probe/panel.css' + at)
+  assert.equal(html(oldEntry.body), entryHtml)
+  assert.equal(html(oldCss.body), cssV1.trim())
+  assert.equal(oldEntry.headers['x-uiblock-at'], String(patchedAt - 1))
+  assert.equal(oldCss.headers['x-uiblock-at'], String(patchedAt - 1))
+})
+
+// ---------------------------------------------------------------------------
+// 17. assembleBlock (2026-11-05): the tool takes a virtual FOLDER; the host
+// assembles the one body the route already serves. Every rejection here is
+// before the disk is touched.
+// ---------------------------------------------------------------------------
+const cssSource = '.card{color:rgb(9, 8, 7)}\n'
+const cssSourcePath = join(home, 'source.css')
+writeFileSync(cssSourcePath, cssSource, 'utf8')
+const fontPath = join(home, 'KaTeX_Main.woff2')
+writeFileSync(fontPath, fontBytes)
+const cardHtml = '<!doctype html><html><head><link rel="stylesheet" href="./styles/card.css"></head><body><div class="card">hi</div></body></html>'
+
+console.log('--- 17. the tool assembles a virtual folder ---')
+await ta('the entry is index.html, and the sections keep the argument order', async () => {
+  const made = await timeline.assembleBlock([
+    { path: 'styles/card.css', from: cssSourcePath },
+    { path: 'index.html', content: cardHtml },
+    { path: 'icons/ok.svg', content: svgText }
+  ])
+  assert.equal(made.entry, 'index.html')
+  assert.deepEqual(made.files.map((file) => file.path), ['styles/card.css', 'index.html', 'icons/ok.svg'])
+  const split = timeline.splitSections(made.text)
+  assert.equal(split.entry, cardHtml)
+  assert.deepEqual(split.files.map((file) => file.path), ['styles/card.css', 'icons/ok.svg'])
+  assert.equal(split.files[0].body, cssSource)
+  assert.equal(split.files[1].body, svgText)
+  assert.equal(made.files[0].bytes, Buffer.byteLength(cssSource))
+})
+await ta('without index.html the first file is the entry', async () => {
+  // cardHtml links ./styles/card.css, so that member has to be here: a block
+  // whose entry loads a file it does not carry is refused now (see 18).
+  const made = await timeline.assembleBlock([
+    { path: 'card.html', content: cardHtml },
+    { path: 'styles/card.css', content: '.a{}' }
+  ])
+  assert.equal(made.entry, 'card.html')
+  const split = timeline.splitSections(made.text)
+  assert.equal(split.entry, cardHtml)
+  assert.deepEqual(split.files.map((file) => file.path), ['styles/card.css'])
+})
+await ta('entry names another root file; a nested or unknown entry is refused', async () => {
+  const made = await timeline.assembleBlock([
+    { path: 'styles/card.css', content: 'body{margin:0}' },
+    { path: 'card.html', content: cardHtml }
+  ], 'card.html')
+  assert.equal(made.entry, 'card.html')
+  assert.equal(timeline.splitSections(made.text).entry, cardHtml)
+  await assert.rejects(timeline.assembleBlock([{ path: 'sub/card.html', content: cardHtml }], 'sub/card.html'), /block root/)
+  await assert.rejects(timeline.assembleBlock([{ path: 'index.html', content: cardHtml }], 'card.html'), /is not one of files/)
+})
+await ta('a binary file is base64 from disk or from content, byte for byte', async () => {
+  const fromDisk = await timeline.assembleBlock([{ path: 'index.html', content: cardHtml }, { path: 'styles/card.css', content: cssSource }, { path: 'KaTeX_Main.woff2', from: fontPath }])
+  const fromText = await timeline.assembleBlock([{ path: 'index.html', content: cardHtml }, { path: 'styles/card.css', content: cssSource }, { path: 'KaTeX_Main.woff2', content: fontBytes.toString('base64') }])
+  for (const made of [fromDisk, fromText]) {
+    assert.match(made.text, /<!-- @@file KaTeX_Main\.woff2 base64 -->/)
+    const section = timeline.splitSections(made.text).files.find((file) => file.path === 'KaTeX_Main.woff2')
+    assert.deepEqual([...Buffer.from(section.body.trim(), 'base64')], [...fontBytes])
+    assert.equal(made.files.find((file) => file.path === 'KaTeX_Main.woff2').bytes, fontBytes.length)
+  }
+})
+await ta('a text from file lands with the same sha, and reports bytes + source', async () => {
+  const made = await timeline.assembleBlock([{ path: 'index.html', content: cardHtml }, { path: 'styles/card.css', from: cssSourcePath }])
+  const section = timeline.splitSections(made.text).files[0]
+  assert.equal(sha(section.body), sha(cssSource))
+  assert.deepEqual(made.files[1], { path: 'styles/card.css', bytes: Buffer.byteLength(cssSource), from: cssSourcePath })
+})
+await ta('a missing source file and a bad path are refused by name', async () => {
+  await assert.rejects(timeline.assembleBlock([{ path: 'index.html', content: cardHtml }, { path: 'x.css', from: join(home, 'nope.css') }]), /from file does not exist/)
+  for (const bad of ['../x.css', '/etc/passwd', 'a\\b.css', 'notes.txt']) {
+    await assert.rejects(timeline.assembleBlock([{ path: 'index.html', content: cardHtml }, { path: bad, content: 'x' }]), /bad file path/)
+  }
+})
+await ta('content and from are exactly one: not both, not neither, not empty files', async () => {
+  await assert.rejects(timeline.assembleBlock([{ path: 'index.html', content: cardHtml, from: fontPath }]), /exactly one of content \/ from/)
+  await assert.rejects(timeline.assembleBlock([{ path: 'index.html' }]), /exactly one of content \/ from/)
+  await assert.rejects(timeline.assembleBlock([]), /non-empty array/)
+})
+await ta('a body that forges a section marker, an empty entry, a duplicate path are refused', async () => {
+  await assert.rejects(timeline.assembleBlock([
+    { path: 'index.html', content: cardHtml },
+    { path: 'a.css', content: 'x\n<!-- @@file evil.css -->\ny\n' }
+  ]), /section marker/)
+  await assert.rejects(timeline.assembleBlock([{ path: 'index.html', content: '   ' }]), /entry index\.html is empty/)
+  await assert.rejects(timeline.assembleBlock([
+    { path: 'index.html', content: cardHtml },
+    { path: 'a.css', content: '.a{}' },
+    { path: 'a.css', content: '.b{}' }
+  ]), /duplicate file path/)
+})
+await ta('the per-file 2 MB and the 64 MB block ceilings are enforced here too', async () => {
+  await assert.rejects(timeline.assembleBlock([
+    { path: 'index.html', content: cardHtml },
+    { path: 'big.css', content: 'a'.repeat(2 * 1024 * 1024 + 1) }
+  ]), /the limit is 2097152 bytes/)
+  // Under the 2 MB per-file ceiling each, but 40 of them is past 64 MB.
+  const chunk = 'b'.repeat(1900000)
+  const many = [{ path: 'index.html', content: '<p>wide</p>' }]
+  for (let i = 0; i < 40; i += 1) many.push({ path: 'p' + i + '.css', content: chunk })
+  await assert.rejects(timeline.assembleBlock(many), /the limit is 67108864 bytes/)
 })
 
 rmSync(home, { recursive: true, force: true })
