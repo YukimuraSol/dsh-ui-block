@@ -49,7 +49,7 @@ const checks = []
 const check = (name, fn) => { fn(); checks.push(name); console.log('  ok - ' + name) }
 const checkAsync = async (name, fn) => { await fn(); checks.push(name); console.log('  ok - ' + name) }
 
-const { apply } = await import('./index.js')
+const { apply, rendering } = await import('./index.js')
 
 /** The slice of the tools service the plugin uses. */
 const registered = []
@@ -80,7 +80,7 @@ check('read_ui_block registered', () => assert.equal(byName.read_ui_block !== un
 const CREATE_CLAUSES = [
   'CREATING vs UPDATING:',
   '- To CREATE a UI block, call this tool.',
-  'SAME NAME MEANS SAFE REPLACE',
+  'A TAKEN NAME IS NEITHER AN ERROR NOR AN OVERWRITE',
   'Do NOT delete the block first',
   '- Do NOT create a .uiblock file with write.',
   '`edit` for a targeted change',
@@ -174,17 +174,86 @@ await checkAsync('sha256 is reproducible from the same input', async () => {
   assert.equal(a.length, 64)
 })
 
-console.log('--- 3. same-name write backs up, never clobbers ---')
-await checkAsync('second create with the same name makes a backup', async () => {
-  const result = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(BODY.replace('自检卡片', '自检卡片 v2')) }, {})
+console.log('--- 3. a taken name lands on the next free number, and says which ---')
+const v2Body = BODY.replace('自检卡片', '自检卡片 v2')
+await checkAsync('a different page under a taken name is written as <name>-2', async () => {
+  const before = sha256(await readFile(blockFile))
+  const result = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(v2Body) }, {})
+  assert.equal(result.name, 'selfcheck-card-2', 'the result carries the name that EXISTS')
+  assert.equal(result.requested, 'selfcheck-card')
+  assert.equal(result.path, 'ui-blocks/selfcheck-card-2.uiblock')
+  assert.equal(result.backup, undefined, 'no timestamp backup on the rename path')
+  assert.equal(existsSync(join(tempHome, 'ui-blocks', 'selfcheck-card-2.uiblock')), true)
+  assert.equal(sha256(await readFile(blockFile)), before, 'the first block is byte-identical')
+})
+await checkAsync('the result text spells the rename out in one sentence, with the new name', async () => {
+  const parts = byName.create_ui_block.output.render({ name: 'selfcheck-card' }, {
+    path: 'ui-blocks/selfcheck-card-2.uiblock', name: 'selfcheck-card-2', requested: 'selfcheck-card',
+    entry: 'index.html', blockBytes: 1, totalBytes: 1, files: []
+  })
+  const text = parts.map((part) => (part.text === undefined ? '' : part.text)).join('')
+  assert.match(text, /RENAMED — "selfcheck-card" is already taken, so this one was written as "selfcheck-card-2"/)
+  assert.match(text, /read_ui_block\(\{ name: "selfcheck-card-2" \}\)/)
+  assert.match(text, /::dsh-ui selfcheck-card-2::/)
+})
+await checkAsync('a third one is -3, and byte-identical content keeps its name', async () => {
+  const third = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(v2Body.replace('自检卡片 v2', '自检卡片 v3')) }, {})
+  assert.equal(third.name, 'selfcheck-card-3')
+  assert.equal(third.requested, 'selfcheck-card')
+  const same = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(BODY) }, {})
+  assert.equal(same.name, 'selfcheck-card')
+  assert.equal(same.requested, undefined, 'an idempotent rebuild keeps the requested name')
+})
+await checkAsync('overwrite: true is the in-place path and still keeps .bak', async () => {
+  const result = await byName.create_ui_block.execute({ name: 'selfcheck-card', files: asFiles(v2Body), overwrite: true }, {})
+  assert.equal(result.name, 'selfcheck-card')
   assert.equal(typeof result.backup, 'string')
-  const backupText = await readFile(result.backup, 'utf8')
-  assert.equal(backupText, BODY)
-  const current = await readFile(blockFile, 'utf8')
-  assert.equal(current.includes('自检卡片 v2'), true)
+  assert.equal(await readFile(result.backup, 'utf8'), BODY)
+  assert.equal((await readFile(blockFile, 'utf8')).includes('自检卡片 v2'), true)
+})
+await checkAsync('the overwrite result text says OVERWROTE, not a footnote', async () => {
+  const parts = byName.create_ui_block.output.render({ name: 'selfcheck-card' }, {
+    path: 'ui-blocks/selfcheck-card.uiblock', name: 'selfcheck-card', entry: 'index.html',
+    blockBytes: 1, totalBytes: 1, files: [], backup: 'ui-blocks/selfcheck-card.uiblock.bak-x'
+  })
+  const text = parts.map((part) => (part.text === undefined ? '' : part.text)).join('')
+  assert.match(text, /OVERWROTE THE PREVIOUS VERSION/)
 })
 
-console.log('--- 4. name and body guards ---')
+console.log('--- 4. read_ui_block defaults to the FIRST SCREEN ---')
+check('no height asked for: the historical 1440x900, and no note', () => {
+  const { res, note } = rendering.readCanvas({})
+  assert.deepEqual(res, { w: 1440, h: 900 })
+  assert.equal(note, undefined)
+})
+check('a height past 1000 is clamped to the first screen and says both numbers', () => {
+  const { res, note } = rendering.readCanvas({ width: 1440, height: 1400 })
+  assert.deepEqual(res, { w: 1440, h: rendering.FIRST_SCREEN_H })
+  assert.match(note, /FIRST SCREEN \(1440x1000\)/)
+  assert.match(note, /1400 px height you asked for/)
+  assert.match(note, /fullPage: true/)
+})
+check('fullPage: true renders exactly the height asked for', () => {
+  const { res, note } = rendering.readCanvas({ width: 1440, height: 1400, fullPage: true })
+  assert.deepEqual(res, { w: 1440, h: 1400 })
+  assert.equal(note, undefined)
+})
+check('a bad size is still refused, not clamped', () => {
+  assert.throws(() => rendering.readCanvas({ height: 0 }), /must be positive pixel counts/)
+})
+check('probe measures the rendered screen unless fullPage', () => {
+  assert.match(rendering.probeScript(['#a'], 1000), /limit=1000/)
+  assert.match(rendering.probeScript(['#a'], undefined), /limit=null/)
+  assert.match(rendering.formatProbe([['.card', 3, 0, 10, 20, 30, 0]]), /none in the first screen — pass fullPage: true/)
+  assert.match(rendering.formatProbe([['.card', 3, 0, 10, 20, 30, 1]]), /3 matches \(1 in the first screen\)/)
+})
+check('the read tool declares fullPage, and a note in its result', () => {
+  assert.equal(byName.read_ui_block.parameters.properties.fullPage.type, 'boolean')
+  assert.equal(byName.read_ui_block.output.schema.properties.note.type, 'string')
+  assert.equal(/first screen/i.test(byName.read_ui_block.parameters.properties.probe.description), true)
+})
+
+console.log('--- 5. name and body guards ---')
 await checkAsync('path traversal is rejected', async () => {
   await assert.rejects(() => byName.create_ui_block.execute({ name: '../escape', files: asFiles(BODY) }, {}), /name must be/)
   await assert.rejects(() => byName.create_ui_block.execute({ name: 'a/b', files: asFiles(BODY) }, {}), /name must be/)
@@ -201,7 +270,7 @@ await checkAsync('read of a missing block names the known ones', async () => {
   assert.equal(byName.read_ui_block !== undefined, true)
 })
 
-console.log('--- 5. client contract parity ---')
+console.log('--- 6. client contract parity ---')
 const clientSource = await readFile(new URL('./client.js', import.meta.url), 'utf8')
 check('client DEFAULT_RES is the host DEFAULT_RES (1440x900)', () => {
   assert.equal(/var DEFAULT_RES = \{ w: 1440, h: 900 \};/.test(clientSource), true)
@@ -233,7 +302,7 @@ check('the canvas shell is the chat code block component (2026-10-24 user call)'
 })
 
 if (SHOT) {
-  console.log('--- 6. read_ui_block returns a real image ---')
+  console.log('--- 7. read_ui_block returns a real image ---')
   const probe = await fetch(BASE_URL + '/json/version').catch(() => undefined)
   const up = probe !== undefined
   if (!up) {

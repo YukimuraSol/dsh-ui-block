@@ -257,6 +257,86 @@ await ta('no change, no log line', async () => {
   assert.equal((await timeline.readHistory(blockName)).entries.length, versions.length - 1)
 })
 
+console.log('--- 10b. the log is bounded: rotation at the cap and at 100 versions ---')
+await ta('the caps are 8 MB per log, 64 MB per block, 100 versions kept', () => {
+  assert.equal(timeline.HISTORY_LOG_MAX_BYTES, 8 * 1024 * 1024)
+  assert.equal(timeline.HISTORY_BLOCK_MAX_BYTES, 64 * 1024 * 1024)
+  assert.equal(timeline.HISTORY_KEEP_ENTRIES, 100)
+})
+await ta('past 100 changes the log rotates: newest still exact, stored bytes stay small', async () => {
+  const name = 'cap-probe'
+  const file = join(home, 'ui-blocks', name + '.uiblock')
+  mkdirSync(join(home, 'ui-blocks'), { recursive: true })
+  let body = v1
+  writeFileSync(file, body, 'utf8')
+  await timeline.recordChange(name, body)
+  for (let round = 0; round < 105; round += 1) {
+    body = v1.replace('row 0 v1', 'row 0 round' + String(round))
+    writeFileSync(file, body, 'utf8')
+    await timeline.recordChange(name, body)
+  }
+  const history = await timeline.readHistory(name)
+  assert.ok(history.entries.length <= timeline.HISTORY_KEEP_ENTRIES, 'entries=' + String(history.entries.length))
+  assert.equal(timeline.replayHistory(history, null), body, 'the newest version replays exactly')
+  const dir = timeline.historyDir(name)
+  const stored = statSync(join(dir, 'base.uiblock')).size + statSync(join(dir, 'log.json')).size
+  assert.ok(stored < 1024 * 1024, 'history stayed small: ' + String(stored) + ' bytes')
+})
+await ta('a log past the cap is rebuilt from the body instead of replayed', async () => {
+  const name = 'big-log-probe'
+  const dir = timeline.historyDir(name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'base.uiblock'), 'an old baseline\n', 'utf8')
+  writeFileSync(join(dir, 'log.json'), 'x'.repeat(timeline.HISTORY_LOG_MAX_BYTES + 4096), 'utf8')
+  const body = '<div class="pb">fresh</div>\n'
+  writeFileSync(join(home, 'ui-blocks', name + '.uiblock'), body, 'utf8')
+  const result = await timeline.recordChange(name, body)
+  assert.equal(result.kind, 'rebase')
+  assert.equal(readFileSync(join(dir, 'log.json'), 'utf8'), '')
+  assert.equal(readFileSync(join(dir, 'base.uiblock'), 'utf8'), body)
+})
+await ta('trimHistory cuts an over-grown history and touches no block file', async () => {
+  const name = 'trim-probe'
+  const dir = timeline.historyDir(name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'base.uiblock'), 'stale baseline\n', 'utf8')
+  writeFileSync(join(dir, 'log.json'), 'y'.repeat(24 * 1024 * 1024), 'utf8')
+  const body = '<div class="pb">the live page</div>\n'
+  const live = join(home, 'ui-blocks', name + '.uiblock')
+  writeFileSync(live, body, 'utf8')
+  const liveSha = sha(body)
+  const result = await timeline.trimHistory()
+  assert.ok(result.before - result.after > 20 * 1024 * 1024, 'before=' + String(result.before) + ' after=' + String(result.after))
+  assert.equal(sha(readFileSync(live, 'utf8')), liveSha, 'the block file is byte-identical')
+  assert.equal(statSync(join(dir, 'log.json')).size, 0)
+  assert.equal(readFileSync(join(dir, 'base.uiblock'), 'utf8'), body)
+  assert.ok(result.blocks.some((entry) => entry.name === name))
+})
+await ta('a whole-body rewrite of a big block is rebased, never handed to Myers', async () => {
+  const name = 'wide-probe'
+  const file = join(home, 'ui-blocks', name + '.uiblock')
+  const wide = (tag) => Array.from({ length: 6000 }, (_, i) => '  <div class="pb-row">' + tag + ' ' + String(i) + '</div>').join('\n')
+  writeFileSync(file, wide('a'), 'utf8')
+  await timeline.recordChange(name, wide('a'))
+  const started = Date.now()
+  const result = await timeline.recordChange(name, wide('b'))
+  assert.equal(result.kind, 'rebase')
+  assert.ok(Date.now() - started < 5000, 'it did not try to diff ' + String(6000) + ' lines')
+  assert.equal(readFileSync(join(timeline.historyDir(name), 'log.json'), 'utf8'), '')
+  assert.equal(readFileSync(join(timeline.historyDir(name), 'base.uiblock'), 'utf8'), wide('b'))
+  rmSync(file, { force: true })
+})
+
+// Those three blocks were only there to exercise the caps; the disk is shared with
+// the listBlocks assertion further down, which expects one block.
+for (const name of ['cap-probe', 'big-log-probe', 'trim-probe']) rmSync(join(home, 'ui-blocks', name + '.uiblock'), { force: true })
+
+await ta('trimHistory leaves a history that is inside the caps alone', async () => {
+  const before = statSync(join(timeline.historyDir('timeline-probe'), 'log.json')).size
+  await timeline.trimHistory()
+  assert.equal(statSync(join(timeline.historyDir('timeline-probe'), 'log.json')).size, before)
+})
+
 console.log('--- 11. ?at= replays the version that existed at that moment (sha equal) ---')
 await ta('every version is reproducible at its own moment', async () => {
   const history = await timeline.readHistory(blockName)
@@ -536,6 +616,25 @@ writeFileSync(cssSourcePath, cssSource, 'utf8')
 const fontPath = join(home, 'KaTeX_Main.woff2')
 writeFileSync(fontPath, fontBytes)
 const cardHtml = '<!doctype html><html><head><link rel="stylesheet" href="./styles/card.css"></head><body><div class="card">hi</div></body></html>'
+
+console.log('--- 16b. a taken block name lands on -2, and that name answers 200 ---')
+await ta('create twice with one name: <name>-2 exists, both serve 200', async () => {
+  const localTools = []
+  apply({ tools: { register: (definition) => { localTools.push(definition); return () => undefined } }, get: () => undefined, inject: () => undefined })
+  const create = localTools.find((definition) => definition.name === 'create_ui_block')
+  const first = await create.execute({ name: 'dup-probe', files: [{ path: 'index.html', content: '<div class="pb">one</div>' }] }, {})
+  assert.equal(first.name, 'dup-probe')
+  const second = await create.execute({ name: 'dup-probe', files: [{ path: 'index.html', content: '<div class="pb">two</div>' }] }, {})
+  assert.equal(second.name, 'dup-probe-2')
+  assert.equal(second.requested, 'dup-probe')
+  assert.equal(second.path, 'ui-blocks/dup-probe-2.uiblock')
+  const a = await call('/ui-blocks/dup-probe/')
+  const b = await call('/ui-blocks/dup-probe-2/')
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.match(html(b.body), /two/)
+  assert.match(html(a.body), /one/)
+})
 
 console.log('--- 17. the tool assembles a virtual folder ---')
 await ta('the entry is index.html, and the sections keep the argument order', async () => {

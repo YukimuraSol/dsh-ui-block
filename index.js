@@ -46,7 +46,7 @@ import { createServer } from 'node:http'
 import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -161,6 +161,14 @@ const BINARY_EXTENSIONS = new Set(['woff2', 'woff', 'ttf', 'png', 'jpg', 'jpeg',
 const BLOCK_CSP = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'none'; form-action 'none'; base-uri 'none'"
 /** Canvas geometry shared with client.js (asserted equal by self-check.mjs). */
 const DEFAULT_RES = { w: 1440, h: 900 }
+/**
+ * The first screen. A shot taller than this is taken only when the caller asks
+ * for the whole page: measured on a 6 MB sectioned block, a 1440x1400 full-page
+ * read cost 18 s (43.6 s with a probe) against 10-14 s at first-screen height,
+ * and nothing below the fold is any more readable in the picture. The default
+ * height (900) is already under it, so only an explicit tall height changes.
+ */
+const FIRST_SCREEN_H = 1000
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const EDGE_CANDIDATES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -283,6 +291,9 @@ async function writeBlock(blockName, html) {
   const target = join(dir, blockName + EXT)
   let backup
   if (existsSync(target)) {
+    // Byte-identical: no rename, no write, no history line. A rebuild of the same
+    // page is idempotent, so it leaves no .bak-* behind.
+    if ((await readFile(target, 'utf8')) === html) return { target, backup: undefined, unchanged: true }
     backup = target + '.bak-' + new Date().toISOString().replace(/[:.]/g, '-')
     await rename(target, backup)
   }
@@ -773,8 +784,34 @@ const HISTORY_DIR = '.history'
 const BASE_FILE = 'base.uiblock'
 const LOG_FILE = 'log.json'
 const PINS_FILE = '.pins.json'
-/** Longest patch log we replay for one request; a runaway log is truncated, not fatal. */
-const LOG_MAX_BYTES = 4 * 1024 * 1024
+/**
+ * The most patch text one block's log may hold. Past it the log is folded into a
+ * fresh baseline (rotation), so no log is ever unbounded — the defect this
+ * replaces left ONE block's log at 513 MB / 543 MB for the whole .history.
+ * 8 MB is ~130x an ordinary 60 KB page, so hundreds of edits fit, and it still
+ * holds one full body of the biggest block the 64 MB limit allows, so no single
+ * write can force a rotation loop.
+ */
+const HISTORY_LOG_MAX_BYTES = 8 * 1024 * 1024
+/**
+ * The most history one block may cost in total — baseline + log. The baseline IS
+ * a copy of the block, so this mirrors limits.blockBytes: history may cost one
+ * more copy of the largest legal block, never a library of them. A block whose
+ * baseline leaves no room keeps no history at all, which is correct: the block
+ * file, not the history, is the truth.
+ */
+const HISTORY_BLOCK_MAX_BYTES = 64 * 1024 * 1024
+/** How many changes one log keeps before the oldest are folded into the baseline. */
+const HISTORY_KEEP_ENTRIES = 100
+/**
+ * The most line comparisons one Myers diff may cost before the change is folded
+ * into the baseline instead. Memory is O(distance x lines) — one snapshot per
+ * edit distance — so a whole-body rewrite of a 6 MB block (20k lines, 20k lines
+ * of distance) asked for gigabytes and OOM'd the host. 5e7 keeps a normal page's
+ * hundreds of edits free and refuses only the degenerate case, which keeps the
+ * newest version as a baseline (the block file is the truth either way).
+ */
+const HISTORY_DIFF_WORK_MAX = 5e7
 
 function historyDir(blockName) {
   return join(blocksDir(), HISTORY_DIR, blockName)
@@ -888,11 +925,12 @@ async function readHistory(blockName) {
   const entries = []
   if (existsSync(logPath)) {
     const info = await stat(logPath)
-    // ponytail: a log past 4 MB is replayed as far as it goes; the upgrade path
-    // is checkpointing a newer baseline, which the plan defers on purpose.
-    const raw = info.size > LOG_MAX_BYTES
-      ? await readFile(logPath, 'utf8').then((text) => text.slice(0, LOG_MAX_BYTES))
-      : await readFile(logPath, 'utf8')
+    // A log past the cap is either a leftover from before the cap existed or a
+    // torn write: its newer entries were diffed against a baseline that has been
+    // rotated away, so replaying them onto today's baseline would rewrite the
+    // block into garbage. Treat it as empty (recordNow folds it into a fresh
+    // baseline on the next write) instead of reading 500 MB to find that out.
+    const raw = info.size <= HISTORY_LOG_MAX_BYTES ? await readFile(logPath, 'utf8') : ''
     for (const line of raw.split('\n')) {
       const trimmed = line.trim()
       if (trimmed === '') continue
@@ -935,16 +973,42 @@ function headOf(blockName, history) {
 
 let recordTail = Promise.resolve()
 
+/** Position-wise line differences — a cheap lower bound on the diff distance. */
+function positionalChanges(left, right) {
+  let count = Math.abs(left.length - right.length)
+  const shared = Math.min(left.length, right.length)
+  for (let index = 0; index < shared; index += 1) if (left[index] !== right[index]) count += 1
+  return count
+}
+
+/**
+ * Body identity (size|mtime) of the body already in history, per block. The read
+ * route already has it from its stat, and one page load asks for the entry AND
+ * every section — dozens of requests for the same bytes. Without this each one
+ * replayed the whole log. Absent (the tool path) means "record unconditionally".
+ */
+const recordedStamps = new Map()
+
 /**
  * Record one observed body. The baseline is stored ONCE; every later change
- * appends one patch line. Called from writeBlock and from the read route, so
- * both the tool path and a plain write/edit are covered.
+ * appends one patch line, and both files are capped (see HISTORY_* above).
+ * Called from writeBlock and from the read route, so both the tool path and a
+ * plain write/edit are covered.
  * @param blockName - validated single-segment name.
  * @param html - body as it is on disk right now.
+ * @param stamp - optional '<size>|<mtimeMs>' of that body; a repeat is skipped.
  */
-function recordChange(blockName, html) {
+function recordChange(blockName, html, stamp) {
   const text = String(html == null ? '' : html)
-  const run = () => recordNow(blockName, text)
+  if (stamp !== undefined && recordedStamps.get(blockName) === stamp) {
+    return Promise.resolve({ recorded: false, kind: 'unchanged' })
+  }
+  const run = () => recordNow(blockName, text).then((result) => {
+    // Remember only a body history now describes: a skip for "no baseline" or
+    // "too big for history" must stay retryable.
+    if (stamp !== undefined && (result.recorded === true || result.kind === 'same')) recordedStamps.set(blockName, stamp)
+    return result
+  })
   const next = recordTail.then(run, run)
   recordTail = next.then(() => undefined, () => undefined)
   return next
@@ -953,19 +1017,108 @@ function recordChange(blockName, html) {
 async function recordNow(blockName, text) {
   const dir = historyDir(blockName)
   const basePath = join(dir, BASE_FILE)
+  const logPath = join(dir, LOG_FILE)
+  const bytes = Buffer.byteLength(text, 'utf8')
   if (!existsSync(basePath)) {
+    if (bytes > HISTORY_BLOCK_MAX_BYTES) return { recorded: false, kind: 'too-big' }
     await mkdir(dir, { recursive: true })
     await writeFile(basePath, text, 'utf8')
-    await writeFile(join(dir, LOG_FILE), '', 'utf8')
+    await writeFile(logPath, '', 'utf8')
     return { recorded: true, kind: 'base' }
+  }
+  const baseBytes = (await stat(basePath)).size
+  // What the log may still grow by: the per-log cap, minus what THIS block's
+  // baseline costs, so one directory can never pass the per-block cap.
+  const logCap = Math.min(HISTORY_LOG_MAX_BYTES, HISTORY_BLOCK_MAX_BYTES - baseBytes)
+  const logBytes = existsSync(logPath) ? (await stat(logPath)).size : 0
+  if (logBytes > HISTORY_LOG_MAX_BYTES || logBytes > logCap) {
+    // Unreplayable log (leftover or torn): the body in hand is the truth, so it
+    // becomes the new baseline. Only history is lost.
+    await writeFile(basePath, text, 'utf8')
+    await writeFile(logPath, '', 'utf8')
+    headCache.delete(blockName)
+    return { recorded: true, kind: 'rebase' }
   }
   const history = await readHistory(blockName)
   if (history === null) return { recorded: false, kind: 'none' }
   const head = headOf(blockName, history)
-  if (head === text) return { recorded: false, kind: 'none' }
-  const entry = { at: Date.now(), patch: diffLines(splitLines(head), splitLines(text)) }
-  await appendFile(join(dir, LOG_FILE), JSON.stringify(entry) + '\n', 'utf8')
-  return { recorded: true, kind: 'patch', bytes: JSON.stringify(entry).length }
+  if (head === text) return { recorded: false, kind: 'same' }
+  if (logCap <= 0) return { recorded: false, kind: 'too-big' }
+  const headLines = splitLines(head)
+  const textLines = splitLines(text)
+  // Refuse the diff nobody can afford, BEFORE allocating it (see the constant).
+  if (positionalChanges(headLines, textLines) * (headLines.length + textLines.length) > HISTORY_DIFF_WORK_MAX) {
+    await writeFile(basePath, text, 'utf8')
+    await writeFile(logPath, '', 'utf8')
+    headCache.delete(blockName)
+    return { recorded: true, kind: 'rebase' }
+  }
+  const entry = { at: Date.now(), patch: diffLines(headLines, textLines) }
+  const line = JSON.stringify(entry) + '\n'
+  const entryBytes = Buffer.byteLength(line, 'utf8')
+  // Every bounded path lands here: a rotation makes the head the new baseline and
+  // restarts the log at this one entry, so the append below is always in budget.
+  if (entryBytes > logCap || logBytes + entryBytes > logCap || history.entries.length >= HISTORY_KEEP_ENTRIES) {
+    await writeFile(basePath, head, 'utf8')
+    await writeFile(logPath, entryBytes > logCap ? '' : line, 'utf8')
+    headCache.delete(blockName)
+    return { recorded: true, kind: entryBytes > logCap ? 'rebase' : 'rotate', bytes: entryBytes }
+  }
+  await appendFile(logPath, line, 'utf8')
+  return { recorded: true, kind: 'patch', bytes: entryBytes }
+}
+
+/**
+ * One-shot repair for a history written before the caps existed: every log past
+ * HISTORY_LOG_MAX_BYTES (or a directory past HISTORY_BLOCK_MAX_BYTES) is dropped
+ * and its block's on-disk body becomes the new baseline.
+ *
+ * It touches .history/ ONLY: no .uiblock is written, moved or removed, and
+ * ui-captures/ is not looked at. The newest version is never lost — the block
+ * file on disk IS the newest version, and it is what the new baseline copies.
+ * What goes is history older than the cap, which is unreadable anyway: those
+ * entries were diffed against a baseline the old cap had already abandoned.
+ * @returns total bytes under .history before and after, plus what each block got.
+ */
+async function trimHistory() {
+  const root = join(blocksDir(), HISTORY_DIR)
+  const sizeOf = async (path) => (existsSync(path) ? (await stat(path)).size : 0)
+  const dirsUnder = async () => {
+    if (!existsSync(root)) return []
+    return (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+  }
+  const total = async () => {
+    let sum = 0
+    for (const name of await dirsUnder()) {
+      sum += await sizeOf(join(root, name, BASE_FILE))
+      sum += await sizeOf(join(root, name, LOG_FILE))
+    }
+    return sum
+  }
+  const before = await total()
+  const blocks = []
+  for (const name of await dirsUnder()) {
+    const basePath = join(root, name, BASE_FILE)
+    const logPath = join(root, name, LOG_FILE)
+    const baseBytes = await sizeOf(basePath)
+    const logBytes = await sizeOf(logPath)
+    if (logBytes <= HISTORY_LOG_MAX_BYTES && baseBytes + logBytes <= HISTORY_BLOCK_MAX_BYTES) continue
+    // The file next to the history is the truth; with none, the baseline stays
+    // and only the unreplayable log goes.
+    const live = join(blocksDir(), name + EXT)
+    const body = existsSync(live) ? await readFile(live, 'utf8') : null
+    if (body !== null && Buffer.byteLength(body, 'utf8') <= HISTORY_BLOCK_MAX_BYTES) await writeFile(basePath, body, 'utf8')
+    await writeFile(logPath, '', 'utf8')
+    headCache.delete(name)
+    recordedStamps.delete(name)
+    blocks.push({
+      name,
+      baseBytes,
+      logBytes,
+      action: body === null ? 'log dropped, baseline kept' : 'rebased on the block on disk'
+    })
+  }
+  return { before, after: await total(), blocks }
 }
 
 /** The block as it was at `at` (epoch ms); `fallback` when no history exists. */
@@ -1039,13 +1192,21 @@ async function until(probe, timeoutMs, what) {
  * relative to the document; matchCount -1 means querySelectorAll rejected the
  * selector itself.
  */
-function probeScript(selectors) {
-  return '(function(){var out=[],sels=' + JSON.stringify(selectors.map((one) => String(one))) + ';'
+function probeScript(selectors, firstScreen) {
+  // firstScreen === undefined measures the whole document; a number restricts
+  // both the reported box and the match count to that many pixels from the top,
+  // because past it nothing was rendered into the image being checked.
+  const limit = firstScreen === undefined ? 'null' : String(Math.round(firstScreen))
+  return '(function(){var out=[],limit=' + limit + ',sels=' + JSON.stringify(selectors.map((one) => String(one))) + ';'
     + 'for(var i=0;i<sels.length;i++){var s=sels[i],list;'
-    + 'try{list=document.querySelectorAll(s)}catch(error){out.push([s,-1,0,0,0,0]);continue}'
-    + 'if(list.length===0){out.push([s,0,0,0,0,0]);continue}'
-    + 'var r=list[0].getBoundingClientRect();'
-    + 'out.push([s,list.length,Math.round(r.left+window.scrollX),Math.round(r.top+window.scrollY),Math.round(r.width),Math.round(r.height)])}'
+    + 'try{list=document.querySelectorAll(s)}catch(error){out.push([s,-1,0,0,0,0,0]);continue}'
+    + 'if(list.length===0){out.push([s,0,0,0,0,0,0]);continue}'
+    + 'var pick=null,inView=0;'
+    + 'for(var j=0;j<list.length;j++){var box=list[j].getBoundingClientRect(),top=box.top+window.scrollY;'
+    + 'if(limit===null||(top+box.height>0&&top<limit)){inView+=1;if(pick===null)pick=list[j]}}'
+    + 'if(pick===null){out.push([s,list.length,0,0,0,0,0]);continue}'
+    + 'var r=pick.getBoundingClientRect();'
+    + 'out.push([s,list.length,Math.round(r.left+window.scrollX),Math.round(r.top+window.scrollY),Math.round(r.width),Math.round(r.height),inView])}'
     + 'return JSON.stringify(out)})()'
 }
 
@@ -1056,7 +1217,10 @@ function formatProbe(rows) {
     const count = Number(row[1])
     if (count < 0) return selector + ': invalid selector'
     if (count === 0) return selector + ': no match'
-    return selector + ': ' + (count === 1 ? '1 match' : String(count) + ' matches')
+    const inView = Number(row[6])
+    const head = selector + ': ' + (count === 1 ? '1 match' : String(count) + ' matches')
+    if (inView === 0) return head + ', none in the first screen — pass fullPage: true to measure the whole page'
+    return head + (inView === count ? '' : ' (' + String(inView) + ' in the first screen)')
       + ', first x=' + row[2] + ' y=' + row[3] + ' w=' + row[4] + ' h=' + row[5]
   }).join('\n')
 }
@@ -1071,6 +1235,8 @@ function formatProbe(rows) {
  * @param options.timeoutMs - overall budget for the page to come up.
  * @param options.probe - CSS selectors to measure; measured AFTER the shot, in
  *   the document the shot came from.
+ * @param options.firstScreen - pixel height of the screen that was rendered; when
+ *   given, probe measures inside it only. Undefined measures the whole document.
  * @returns PNG bytes plus the token count and scheme the render used, and the
  *   probe lines when selectors were given.
  */
@@ -1162,7 +1328,7 @@ async function screenshotBlock(options) {
       // After the capture, before the page goes away: the same document the shot
       // came from. Nothing here runs when no selectors were asked for.
       const measurements = Array.isArray(options.probe) && options.probe.length > 0
-        ? formatProbe(JSON.parse(await evaluate(probeScript(options.probe))))
+        ? formatProbe(JSON.parse(await evaluate(probeScript(options.probe, options.firstScreen))))
         : undefined
       return {
         png: Buffer.from(data, 'base64'),
@@ -1181,6 +1347,23 @@ async function screenshotBlock(options) {
     for (let attempt = 0; attempt < 25; attempt += 1) {
       try { await rm(profile, { recursive: true, force: true }); break } catch { await sleep(100) }
     }
+  }
+}
+
+/**
+ * Canvas geometry for one read: the first screen unless the whole page was asked
+ * for. A function of its own so the clamp is asserted without a browser.
+ * @param args - the tool arguments (width / height / fullPage).
+ * @returns { res, note } — the geometry used, and why it is not what was asked.
+ */
+function readCanvas(args) {
+  const w = args.width === undefined ? DEFAULT_RES.w : Math.round(Number(args.width))
+  const h = args.height === undefined ? DEFAULT_RES.h : Math.round(Number(args.height))
+  if (!(w > 0) || !(h > 0)) throw new Error(READ_TOOL + ': width and height must be positive pixel counts, got ' + JSON.stringify({ width: args.width, height: args.height }))
+  if (args.fullPage === true || h <= FIRST_SCREEN_H) return { res: { w, h }, note: undefined }
+  return {
+    res: { w, h: FIRST_SCREEN_H },
+    note: 'rendered the FIRST SCREEN (' + String(w) + 'x' + String(FIRST_SCREEN_H) + ') instead of the ' + String(h) + ' px height you asked for; pass fullPage: true to render and probe the whole page'
   }
 }
 
@@ -1219,7 +1402,7 @@ const CREATE_DESCRIPTION = [
   '',
   'CREATING vs UPDATING:',
   '- To CREATE a UI block, call this tool.',
-  '- SAME NAME MEANS SAFE REPLACE, NOT "already exists": calling this tool with a name that is taken renames the old file to <name>.uiblock.bak-<ISO timestamp> first, writes the new one, and appends one patch to that block\'s history (.history/<name>) — so the previous version is still there, replayable. Do NOT delete the block first, and do not try to "clear" it: deleting is the only operation here that loses the old version, and it is never needed.',
+  '- A TAKEN NAME IS NEITHER AN ERROR NOR AN OVERWRITE: if <name>.uiblock already exists and holds different bytes, this block is written as <name>-2 (then -3, -4 ...) — the same numbering the capture\'s material directory uses — and the result carries the name actually used, plus one line saying so. READ THAT NAME: read_ui_block and the ::dsh-ui line must both use it, otherwise you are looking at the other page. Byte-identical content keeps the requested name (an idempotent rebuild writes nothing). overwrite: true is the only way to replace a block in place, and it keeps the old file as <name>.uiblock.bak-<ISO timestamp>. Do NOT delete the block first, and do not try to "clear" it: deleting is the only operation here that loses the old version, and it is never needed.',
   '- Do NOT create a .uiblock file with write. A block that was not created through this tool has no registered metadata, so read_ui_block and the reference line cannot find it.',
   '- To UPDATE an existing block, change the .uiblock file in place: `edit` for a targeted change, or `write` when the block is almost entirely new. Then reference it again in the same message. Do NOT call this tool again to update it, and do NOT write it through a shell command or a script.',
   '- Editing by hand means writing the file format: every extra member is a section that starts on a whole line `<!-- @@file <path> [base64] -->` and runs to the next such line or to the end. Add `base64` to a binary one (png webp jpg jpeg woff woff2 ttf) — unmarked, its bytes are decoded as text and the member arrives corrupted. No member\'s own content may contain such a line; it would split the file.'
@@ -1847,14 +2030,29 @@ function captureRelativePath(value) {
 }
 
 /**
+ * The first free spelling of `wanted` inside `root`: wanted itself, else wanted-2,
+ * wanted-3, ... One implementation serves both kingdoms — a capture's material
+ * directory and a block file — so a page and its material always carry the SAME
+ * number instead of two counters that drift (material -3, block -2).
+ * @param root - the directory to look in.
+ * @param wanted - the name as asked for.
+ * @param extension - '.uiblock' for a block file, '' for a directory.
+ * @returns an absolute path that does not exist yet.
+ */
+function freeNamePath(root, wanted, extension) {
+  let candidate = join(root, wanted + extension)
+  for (let n = 2; existsSync(candidate) && n < 100; n += 1) candidate = join(root, wanted + '-' + String(n) + extension)
+  return candidate
+}
+
+/**
  * The directory one capture writes into: the task's block name when it has a
  * usable one, else capture-<stamp>; a name already taken gets -2, -3, and so on.
  * @returns the absolute directory, created.
  */
 async function captureDirFor(task) {
   const wanted = task !== undefined && typeof task.name === 'string' && NAME_RE.test(task.name) ? task.name : captureStamp(new Date())
-  let dir = join(capturesDir(), wanted)
-  for (let n = 2; existsSync(dir) && n < 100; n += 1) dir = join(capturesDir(), wanted + '-' + String(n))
+  const dir = freeNamePath(capturesDir(), wanted, '')
   await mkdir(dir, { recursive: true })
   return dir
 }
@@ -2271,6 +2469,10 @@ export function apply(ctx, config) {
         type: 'string',
         description: 'Optional human label for the preview card. Not stored in the file.'
       },
+      overwrite: {
+        type: 'boolean',
+        description: 'Replace an existing block IN PLACE instead of landing on the next free number. Without it a taken name becomes <name>-2 / -3 and the result says which name was used; with it the old file is renamed to <name>.uiblock.bak-<ISO timestamp> first. Use it only when you mean to replace that exact block — never to "claim" a name.'
+      },
       fromDir: {
         type: 'string',
         description: 'Absolute path of a material directory (a capture from capture_page, or any folder of a page and its assets). The host walks it and builds the whole block itself: entry.html (else index.html, else name one with entry), every other file at its own relative path, binary extensions base64 automatically. Files nobody loads, files past the per-file limit and extensions no section type serves are LEFT OUT and listed in the result with their bytes and reason — nothing to pick by hand. Use this OR files, not both. A reference the entry or a stylesheet makes to a file that does not exist at all is refused before anything is written.'
@@ -2297,6 +2499,7 @@ export function apply(ctx, config) {
           path: { type: 'string', required: true },
           name: { type: 'string', required: true },
           backup: { type: 'string' },
+          requested: { type: 'string', description: 'Present only when the requested name was taken and the block was written under the next free number: the name that was asked for. `name` is the one that exists.' },
           entry: { type: 'string', required: true },
           fromDir: { type: 'string', description: 'The material directory this block was built from, when fromDir was used.' },
           blockBytes: { type: 'number', required: true, description: 'The stored block text, which is what the limits measure.' },
@@ -2345,6 +2548,7 @@ export function apply(ctx, config) {
       render: (args, value) => [{
         type: 'text',
         text: 'UI block: ' + value.path + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
+          + (value.requested === undefined ? '' : '\nRENAMED — "' + value.requested + '" is already taken, so this one was written as "' + value.name + '". Use the NEW name everywhere: read_ui_block({ name: "' + value.name + '" }) and the ::dsh-ui ' + value.name + ':: line.')
           + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
           + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
           + (Array.isArray(value.skipped) && value.skipped.length > 0
@@ -2359,7 +2563,7 @@ export function apply(ctx, config) {
           + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
           + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
           + '\nNEXT: read_ui_block({ name: "' + value.name + '" })'
-          + (value.backup === undefined ? '' : '\nPrevious version backed up to: ' + value.backup)
+          + (value.backup === undefined ? '' : '\nOVERWROTE THE PREVIOUS VERSION (overwrite: true). The old one is kept byte for byte at: ' + value.backup)
       }]
     },
     execute: async (args) => {
@@ -2385,10 +2589,22 @@ export function apply(ctx, config) {
       } else {
         assembled = await assembleBlock(args.files, args.entry)
       }
-      const written = await writeBlock(blockName, assembled.text)
+      // A name that is taken is neither an error nor an overwrite: this block
+      // lands on the next free number (-2, -3 ...), through the SAME allocator the
+      // capture directory uses, so page and material never get different numbers.
+      let finalName = blockName
+      if (args.overwrite !== true) {
+        const exact = join(blocksDir(), blockName + EXT)
+        // Byte-identical under the requested name: an idempotent rebuild. Keep the
+        // name (writeBlock writes nothing) instead of littering -2 copies of it.
+        const sameBytes = existsSync(exact) && (await readFile(exact, 'utf8')) === assembled.text
+        if (!sameBytes) finalName = basename(freeNamePath(blocksDir(), blockName, EXT)).slice(0, -EXT.length)
+      }
+      const written = await writeBlock(finalName, assembled.text)
       return {
-        path: blockPath(blockName),
-        name: blockName,
+        path: blockPath(finalName),
+        name: finalName,
+        ...finalName === blockName ? {} : { requested: blockName },
         ...written.backup === undefined ? {} : { backup: written.backup },
         entry: assembled.entry,
         ...from === undefined ? {} : { fromDir: from },
@@ -2436,9 +2652,13 @@ export function apply(ctx, config) {
         type: 'number',
         description: 'Optional canvas HEIGHT in pixels. Default 900. For a dialog / card / toolbar pass the height the content actually needs (roughly 280-420) instead of leaving 900 of mostly empty canvas; the `::dsh-ui <name> res=WxH::` line declares the same pair.'
       },
+      fullPage: {
+        type: 'boolean',
+        description: 'Render the WHOLE page instead of the first screen. Without it a height above ' + String(FIRST_SCREEN_H) + ' px is clamped to the first screen (a 1440x1400 full-page shot of a heavy block measured 18 s, 43.6 s with probe), which is also the range probe looks at. Pass true only when something below the first screen is the thing you must see.'
+      },
       probe: {
         type: 'array',
-        description: 'Optional CSS selectors to measure in the rendered document, for when the image cannot show a size. Each returns how many elements matched and the FIRST match\'s x / y / width / height in document pixels, rounded to integers; nothing matched reads `no match`. A comma list is one selector list: the count and the box are over the union, and "first" means document order.',
+        description: 'Optional CSS selectors to measure in the rendered document, for when the image cannot show a size. Each returns how many elements matched and the FIRST match inside the rendered screen\'s x / y / width / height in document pixels, rounded to integers; nothing matched reads `no match`. A comma list is one selector list: the count and the box are over the union, and "first" means document order. Defaults to the first screen — pass fullPage: true to measure the whole page.',
         items: { type: 'string' }
       }
     },
@@ -2454,6 +2674,7 @@ export function apply(ctx, config) {
           tokens: { type: 'number', required: true },
           // Not the page's own colours: `scheme` is the skin the CLIENT renders blocks in (render.tokens().scheme), so a light page painted in the dark canvas still reports "dark".
           scheme: { type: 'string', required: true, description: 'The skin the client rendered this block in (window.__dshPageBlock.render.tokens().scheme: "dark" or "light"). It describes the CANVAS the block was wrapped in, NOT the captured page\'s own colours — a light page rendered in the dark skin still reads "dark" here.' },
+          note: { type: 'string', description: 'Present when the requested height was clamped to the first screen: says both numbers and the way to get the whole page.' },
           measurements: {
             type: 'string',
             description: 'One line per probed selector: match count, then the first match box. Present only when probe was passed.'
@@ -2477,6 +2698,7 @@ export function apply(ctx, config) {
         type: 'text',
         text: '<path>' + value.path + '</path>\n<type>image</type>\n<content>PNG image, ' + value.width + 'x' + value.height + ' px, ' + value.bytes + ' bytes; rendered with ' + value.tokens + ' theme tokens, skin: ' + value.scheme + '</content>'
           + (value.measurements === undefined ? '' : '\n<measurements>\n' + value.measurements + '\n</measurements>')
+          + (value.note === undefined ? '' : '\nNOTE: ' + value.note)
       }, { type: 'image', attachment: value.image }]
     },
     execute: async (args, exec) => {
@@ -2495,17 +2717,16 @@ export function apply(ctx, config) {
       // width/height are CANVAS geometry (the draft is laid out at that size, so
       // media queries re-evaluate) — not a PNG downscale. Omitting both keeps the
       // historical 1440x900 shot.
-      const canvas = {
-        w: args.width === undefined ? DEFAULT_RES.w : Math.round(Number(args.width)),
-        h: args.height === undefined ? DEFAULT_RES.h : Math.round(Number(args.height))
-      }
-      if (!(canvas.w > 0) || !(canvas.h > 0)) throw new Error(READ_TOOL + ': width and height must be positive pixel counts, got ' + JSON.stringify({ width: args.width, height: args.height }))
+      // The first screen only, unless the whole page was asked for: those extra
+      // pixels are paid for in layout, raster and PNG, and are not looked at.
+      const { res: canvas, note } = readCanvas(args)
       const shot = await screenshotBlock({
         baseUrl,
         body,
         blockName,
         res: canvas,
         probe: Array.isArray(args.probe) ? args.probe : undefined,
+        firstScreen: args.fullPage === true ? undefined : canvas.h,
         timeoutMs: 45000
       })
       if (exec !== undefined && exec.signal !== undefined && exec.signal.aborted) throw new Error(READ_TOOL + ': aborted')
@@ -2518,6 +2739,7 @@ export function apply(ctx, config) {
         tokens: shot.tokenCount,
         scheme: String(shot.scheme ?? ''),
         ...shot.measurements === undefined ? {} : { measurements: shot.measurements },
+        ...note === undefined ? {} : { note },
         image: {
           attachmentId: String(image.attachmentId),
           mediaType: String(image.mediaType),
@@ -2751,7 +2973,7 @@ export function apply(ctx, config) {
           // Reading is a write path too: a block edited through write/edit (or a
           // shell command) never passes writeBlock, so its change is logged here.
           try {
-            await recordChange(blockName, body)
+            await recordChange(blockName, body, String(info.size) + '|' + String(info.mtimeMs))
           } catch (error) {
             if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: change log failed for ' + blockName + ': ' + String(error))
           }
@@ -3144,6 +3366,17 @@ export const extensionHub = {
  * per-instance client, so hosting, reuse, expiry and the idle shutdown can be
  * asserted on an ephemeral port — and driven in milliseconds instead of seconds.
  */
+/**
+ * Test seam for self-check.mjs: the canvas clamp and the probe geometry, so the
+ * first-screen default is asserted on its own terms instead of through a browser.
+ */
+export const rendering = {
+  readCanvas,
+  probeScript,
+  formatProbe,
+  DEFAULT_RES,
+  FIRST_SCREEN_H
+}
 export const instanceRegistry = {
   createRegistry,
   createRegistryClient,
@@ -3175,6 +3408,12 @@ export const timeline = {
   pinMoment,
   historyDir,
   pinsFile,
-  resetPinsCache: () => { pinsCache = null }
+  resetPinsCache: () => { pinsCache = null },
+  trimHistory,
+  freeNamePath,
+  captureDirFor,
+  HISTORY_LOG_MAX_BYTES,
+  HISTORY_BLOCK_MAX_BYTES,
+  HISTORY_KEEP_ENTRIES
 }
 

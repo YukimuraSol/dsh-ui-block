@@ -234,21 +234,35 @@ await ta('the call fails, names the missing file and its line, and writes nothin
   assert.ok(!existsSync(blockFile('broken-probe')), 'no block file appeared')
 })
 
-console.log('--- 6. same name is a safe replace: .bak + one more patch ---')
-await ta('the old file becomes .bak-<ISO>, its bytes are kept, history grows once', async () => {
-  const before = await timeline.readHistory('from-probe')
-  const firstText = readFileSync(blockFile('from-probe'), 'utf8')
-  // Change the material, then rebuild over the same name: that is the exact
-  // move that used to lose the old version (delete first, then create).
+console.log('--- 6. a taken name: the next free number, and only overwrite: true keeps .bak ---')
+await ta('a second build lands as <name>-2 and leaves the first byte for byte', async () => {
+  const firstRun = await create.execute({ name: 'name-probe', fromDir: site })
+  assert.equal(firstRun.name, 'name-probe')
+  const firstText = readFileSync(blockFile('name-probe'), 'utf8')
+  // Change the material, then rebuild over the same name: the exact move that used
+  // to silently destroy the other session's page now lands under a new name.
   put(site, 'entry.html', entryHtml.replace('<p>hi</p>', '<p>v2</p>'))
-  const again = await create.execute({ name: 'from-probe', fromDir: site })
+  const again = await create.execute({ name: 'name-probe', fromDir: site })
+  assert.equal(again.name, 'name-probe-2')
+  assert.equal(again.requested, 'name-probe')
+  assert.equal(again.backup, undefined, 'the rename path writes no timestamp backup')
+  assert.ok(existsSync(blockFile('name-probe-2')))
+  assert.equal(readFileSync(blockFile('name-probe'), 'utf8'), firstText, 'the first block is untouched')
+  assert.ok(readFileSync(blockFile('name-probe-2'), 'utf8').includes('<p>v2</p>'))
+})
+await ta('overwrite: true is the in-place path: .bak-<ISO>, bytes kept, one more patch', async () => {
+  const before = await timeline.readHistory('name-probe')
+  const firstText = readFileSync(blockFile('name-probe'), 'utf8')
+  put(site, 'entry.html', entryHtml.replace('<p>hi</p>', '<p>v3</p>'))
+  const again = await create.execute({ name: 'name-probe', fromDir: site, overwrite: true })
+  assert.equal(again.name, 'name-probe')
   assert.match(again.backup, /\.uiblock\.bak-\d{4}-\d{2}-\d{2}T/)
   assert.ok(existsSync(again.backup))
   assert.equal(readFileSync(again.backup, 'utf8'), firstText, 'the backup is the previous version, byte for byte')
-  const after = await timeline.readHistory('from-probe')
+  const after = await timeline.readHistory('name-probe')
   assert.equal(after.entries.length, before.entries.length + 1)
-  const live = readFileSync(blockFile('from-probe'), 'utf8')
-  assert.ok(live.includes('<p>v2</p>'))
+  const live = readFileSync(blockFile('name-probe'), 'utf8')
+  assert.ok(live.includes('<p>v3</p>'))
   assert.notEqual(live, firstText)
 })
 
