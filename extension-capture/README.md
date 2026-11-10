@@ -12,6 +12,29 @@
 
 装完不用再点任何东西：后台每 2 秒轮询一次，DSH 的 `list_pages` 就能看见你开着的标签。
 
+## 两个实测踩过的坑（本机品牌版 Chrome 156.0.8078.80 / Chromium 156.0.8078.4）
+
+1. **`--load-extension` 在品牌版 Chrome 137+ 被直接忽略**：参数照传、扩展没装，只在 stderr 留一句
+   `--disable-extensions-except is not allowed in Google Chrome, ignoring.`（今晚踩了第二遍，第一次是「命令行为空」）。
+   要在命令行里带扩展跑无头/自动化，只能用**未品牌化的 Chromium**（本机 `D:\OpenCode\playwright-browsers\chromium-*\\chrome-win64\\chrome.exe`）：
+   `--headless=new` 照旧可用，`chrome.tabs.captureVisibleTab` 在无头下也能拍到真画面（实测一张 1418×689 / 107 KB 的 PNG）。
+   品牌版 Chrome 只能走 `chrome://extensions` →「加载已解压的扩展程序」手动装。
+2. **重载扩展不要用 `chrome.runtime.reload()`**（现场结论）：Chrome 156 会把命令行/手动加载的 unpacked 扩展直接禁用——
+   之后 API 全失败、日志里是 `did not activate`。正确做法是切一次启用状态：
+   `chrome.management.setEnabled(id, false)` → `chrome.management.setEnabled(id, true)`（需要 `management` 权限）。
+
+## 参考截图（reference/viewport.png）
+
+抓完 DOM、切回原标签之前，扩展用 `chrome.tabs.captureVisibleTab` 存一张 PNG 到材料目录的 `reference/viewport.png`。
+它**不进块**（`create_ui_block({fromDir})` 会把它列进 `skipped`，理由 `unreferenced`），只用来「块渲染 vs 真页面」对照。
+
+- 只拍**可见区域**：这是 `captureVisibleTab` 的硬限制，没有整页拼接（拼接要 attach `chrome.debugger`，会在页顶挂调试横幅并改动 DOM，明确不做）。所以 `report.screenshot.mode` 恒为 `viewport`。
+- `width` / `height` / `dpr` / `scrollY` / `scrollHeight` / `captureViewport` 是**抓取那一刻的视口**，只作参考，**不是目标尺寸**。
+  块里固化的 `px` 绑在这个宽度上：实测抽屉 `inset:0 1006.67px 0 0` 在 1340 宽下是 333px、1440 宽下变 433px——
+  换宽度就不再等于真站。**想跨宽度都像，只能用相对单位重写布局，那不在抓取这一层。**
+- 拍不到时（权限、窗口被遮挡、截图配额）**不重试、不阻塞**：`report.screenshot.error` 照实写一行，抓取照常完成；
+  返回文本里是 `REFERENCE VIEWPORT unavailable: <reason>`，不静默。
+
 ## 配
 
 | 项 | 默认 | 说明 |

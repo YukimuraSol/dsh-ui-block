@@ -425,6 +425,31 @@ async function restoreActiveTab(prevTabId, selfTabId) {
   try { await chrome.tabs.update(prevTabId, { active: true }) } catch (e) {}
 }
 
+// ---- 参考截图：只拍可见区域，附加物，失败不影响抓取 ----------------------
+// captureVisibleTab 的硬边界就是「可见区域」，没有整页拼接（拼接要 attach
+// chrome.debugger，会在页顶挂调试横幅并改动页面 DOM/布局，明确不做）。
+// 失败（权限、窗口被遮挡、截图配额）不重试、不阻塞，也不许为了它去激活窗口 ——
+// 用户的窗口可能正停在别的程序上，抓取本身只需要标签在它自己的窗口里 active。
+function base64Bytes(b64) {
+  const s = String(b64 || '')
+  const pad = (/=*$/.exec(s) || [''])[0].length
+  return Math.floor(s.length * 3 / 4) - pad
+}
+
+function captureViewportPng(windowId) {
+  return new Promise(function (resolve) {
+    try {
+      chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, function (dataUrl) {
+        const err = chrome.runtime.lastError   // 必须在回调里读，否则 MV3 报未检查错误
+        if (err) { resolve({ ok: false, error: String((err && err.message) || err) }); return }
+        const m = /^data:([^;]+);base64,(.*)$/i.exec(String(dataUrl || ''))
+        if (!m) { resolve({ ok: false, error: 'captureVisibleTab 没返回 base64 data URL' }); return }
+        resolve({ ok: true, mime: m[1], base64: m[2], bytes: base64Bytes(m[2]) })
+      })
+    } catch (e) { resolve({ ok: false, error: String((e && e.message) || e) }) }
+  })
+}
+
 async function runTask(task, row) {
   keepAlive(true)
   try { return await runTaskBody(task, row) } finally { keepAlive(false) }
@@ -478,6 +503,22 @@ async function runTaskBody(task, row) {
       if (!out || !out.files) throw new Error('抽取函数没有返回 files（页面可能禁止注入）')
     } catch (e) {
       return sendResult(task.id, { ok: false, error: '抓取失败：' + String(e && e.message || e) }, row)
+    }
+
+    // 参考截图：DOM 拍完之后、切回原标签之前（此时目标标签已在窗口里 active）。
+    // 附加物：异常一律吞进 report.screenshot.error，抓取照常完成。
+    const shot = await captureViewportPng(tab.windowId)
+    if (out.report && out.report.screenshot) {
+      if (shot.ok) {
+        const shotPath = out.report.screenshot.path || 'reference/viewport.png'
+        out.files.push({ path: shotPath, content: shot.base64, base64: true, bytes: shot.bytes })
+        out.report.screenshot.bytes = shot.bytes
+        out.report.screenshot.mime = shot.mime
+        if (Array.isArray(out.report.files)) out.report.files.push({ path: shotPath, bytes: shot.bytes })
+        out.report.bytes = Number(out.report.bytes || 0) + shot.bytes
+      } else {
+        out.report.screenshot.error = shot.error
+      }
     }
 
     return sendResult(task.id, { ok: true, files: out.files, report: out.report }, row)

@@ -20,6 +20,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const realSetTimeout = setTimeout
 const silent = { log() {}, info() {}, warn() {}, error() {} }
 
+// 一段「够大」的假 PNG 载荷：只证明通道把截图当二进制文件搬进 files[]，不是真截图。
+// base64 9200 字符 ≈ 6900 字节，跨过「字节 > 5000」那道门槛，与真实 1440x900 PNG 的量级一致。
+const FAKE_PNG_DATA_URL = 'data:image/png;base64,' + 'iVBORw0KGgoAAAANSUhEUg'.repeat(400)
 const TAB_A = { id: 11, url: 'http://example.test/a', title: 'A', windowId: 1, active: false }
 const TAB_B = { id: 12, url: 'https://example.test/b', title: 'B', windowId: 1, active: false }
 
@@ -61,6 +64,9 @@ function makeChrome(store, env) {
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
       onMessage: { addListener(fn) { listeners.message.push(fn) } },
+      // MV3 回调式 API 失败时靠 runtime.lastError 报；假 chrome 也要有这个口，
+      // 否则「captureVisibleTab 抛错」这条路径在离线自检里根本走不到。
+      get lastError() { return env.lastError },
       getPlatformInfo(cb) { if (cb) cb({ os: 'win' }) },
       openOptionsPage() {},
       async sendMessage() { return { enabled: true, baseUrl: store.get('baseUrl') || '', instance: 'chrome', registry: { source: 'none', at: 0, instances: [] } } }
@@ -90,6 +96,16 @@ function makeChrome(store, env) {
         if (!tab) throw new Error('No tab with id: ' + id)
         return tab
       },
+      // 参考截图：成功时回 env.capture.dataUrl（默认一段 > 5000 字节的假 PNG 载荷），
+      // 失败时设 env.lastError 并回 undefined —— 与 MV3 的真实行为一致。
+      captureVisibleTab(windowId, options, cb) {
+        env.captureCalls = (env.captureCalls || 0) + 1
+        env.captureArgs = { windowId: windowId, format: options && options.format }
+        const mode = env.capture || { ok: true }
+        if (mode.ok === false) { env.lastError = { message: mode.error || 'Failed to capture visible tab' }; cb(undefined); return }
+        env.lastError = null
+        cb(mode.dataUrl || FAKE_PNG_DATA_URL)
+      },
       async update(id, props) {
         env.tabUpdates.push({ id: id, props: Object.assign({}, props) })
         log('tabs.update:' + id + (props && props.active ? ' active' : ''))
@@ -101,7 +117,12 @@ function makeChrome(store, env) {
       async executeScript(options) {
         if (options && options.files) return []
         log('extract')
-        return [{ result: { files: [{ path: 'entry.html', content: '<html></html>', bytes: 13, base64: false }], report: { bytes: 13, files: [], dropped: [] } } }]
+        // extractor 会带一份 report.screenshot 的环境事实进来；background 负责把 PNG 落成
+        // files[] 里的一项，或把失败写进 screenshot.error。env.noShotFacts 用来模拟老版本 extractor。
+        const facts = env.noShotFacts === true ? {} : {
+          screenshot: { mode: 'viewport', path: 'reference/viewport.png', width: 1280, height: 800, dpr: 1, scrollY: 0, scrollHeight: 2400, captureViewport: { width: 1280, height: 800, dpr: 1 } }
+        }
+        return [{ result: { files: [{ path: 'entry.html', content: '<html></html>', bytes: 13, base64: false }], report: Object.assign({ bytes: 13, files: [], dropped: [] }, facts) } }]
       }
     }
   }
@@ -375,6 +396,39 @@ export async function runHubChecks(assert) {
     'tabs.update 顺序 ' + JSON.stringify(seqR) + '；windows.update ' + envR.windowUpdates.length + ' 次' +
       '；调用顺序 ' + JSON.stringify(instanceA.order.filter(function (l) { return /^(extract|tabs\.update)/.test(l) })) +
       '；ok=' + String(lastResultR && lastResultR.body.ok))
+
+  // ---- 10. 参考截图（成功路径，假 chrome 桩）-----------------------------
+  // 只证明「cap 得到的 PNG 被当成 files[] 里的一项搬走，且字节进了 report 的账」。
+  const envS = { badge: '', activeTabId: 11, order: [], capture: { ok: true } }
+  const fakeS = makeChrome(new Map([['baseUrl', 'http://127.0.0.1:' + aPort]]), envS)
+  instanceA.queue.push({ id: 't-shot', tabId: 12 })
+  await loadBackground(fakeS.api)()
+  const bodyS = (instanceA.results[instanceA.results.length - 1] || {}).body || {}
+  const shotFile = (bodyS.files || []).find(function (file) { return file.path === 'reference/viewport.png' })
+  const shotRep = bodyS.report && bodyS.report.screenshot ? bodyS.report.screenshot : {}
+  const shotB64 = String(FAKE_PNG_DATA_URL).split(',')[1]
+  const shotWant = Math.floor(shotB64.length * 3 / 4) - ((/=*$/.exec(shotB64) || [''])[0].length)
+  assert('参考截图（假 chrome 桩）：PNG 落成 files[] 的 reference/viewport.png，字节与 total 都记账',
+    bodyS.ok === true && !!shotFile && shotFile.base64 === true && shotFile.bytes === shotWant &&
+      shotRep.bytes === shotWant && Number(bodyS.report.bytes) === 13 + shotWant &&
+      (bodyS.report.files || []).some(function (file) { return file.path === 'reference/viewport.png' && file.bytes === shotWant }) &&
+      envS.captureArgs && envS.captureArgs.format === 'png' && envS.captureCalls === 1,
+    'files: ' + (shotFile ? shotFile.path + ' ' + shotFile.bytes + ' B (base64)' : '（缺）') +
+      '；report.screenshot.bytes=' + String(shotRep.bytes) + '；report.bytes=' + String(bodyS.report && bodyS.report.bytes) +
+      '（entry 13 + 图 ' + shotWant + '）；format=' + String(envS.captureArgs && envS.captureArgs.format) + '；调用 ' + String(envS.captureCalls) + ' 次')
+
+  // ---- 11. 参考截图（失败路径）：不崩、抓取照常完成 -----------------------
+  const envF = { badge: '', activeTabId: 11, order: [], capture: { ok: false, error: 'Failed to capture visible tab' } }
+  const fakeF = makeChrome(new Map([['baseUrl', 'http://127.0.0.1:' + aPort]]), envF)
+  instanceA.queue.push({ id: 't-shot-fail', tabId: 12 })
+  await loadBackground(fakeF.api)()
+  const bodyF = (instanceA.results[instanceA.results.length - 1] || {}).body || {}
+  const shotF = bodyF.report && bodyF.report.screenshot ? bodyF.report.screenshot : {}
+  const noShotFile = !(bodyF.files || []).some(function (file) { return file.path === 'reference/viewport.png' })
+  assert('参考截图失败不阻塞抓取：ok=true、没有 viewport 文件、report.screenshot.error 照实写',
+    bodyF.ok === true && noShotFile && String(shotF.error || '').indexOf('Failed to capture') >= 0 && shotF.mode === 'viewport',
+    'ok=' + String(bodyF.ok) + '；viewport 文件 ' + (noShotFile ? '没有' : '居然有') + '；error=' + JSON.stringify(shotF.error) +
+      '；screenshot.mode=' + String(shotF.mode))
 
   try { a.server.close() } catch (e) {}
   try { b.server.close() } catch (e) {}

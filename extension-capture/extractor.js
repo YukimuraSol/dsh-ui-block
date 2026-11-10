@@ -1072,6 +1072,21 @@
       degrade: degrade,
       // frame 盲区：扩展只注入顶层文档，正文装在 iframe 里时抓到的就是空壳。
       // dominant = 盖住可视区 30% 以上的那个 frame（没有就是 null）。
+      // 参考截图的环境事实：PNG 由 background.js 用 chrome.tabs.captureVisibleTab 拍下，存成
+      // 材料目录里的 reference/viewport.png（不进块、不被 entry 引用）。
+      // mode 恒为 viewport——captureVisibleTab 只能拍可见区域，没有整页拼接，别把它当整页。
+      // width/height 是**抓取那一刻的视口**，只作对照参考，不是目标尺寸：块里固化的 px 绑在
+      // 这个宽度上，明显换宽度渲染时 right/inset/宽度不会跟着变（已知上限）。
+      screenshot: {
+        mode: 'viewport',
+        path: 'reference/viewport.png',
+        width: Math.round(viewW),
+        height: Math.round(viewH),
+        dpr: Number(win.devicePixelRatio) || 1,
+        scrollY: Math.round(Number(win.scrollY !== undefined ? win.scrollY : win.pageYOffset) || 0),
+        scrollHeight: Math.round(Number((doc.documentElement && doc.documentElement.scrollHeight) || 0) || 0),
+        captureViewport: { width: Math.round(viewW), height: Math.round(viewH), dpr: Number(win.devicePixelRatio) || 1 }
+      },
       frames: {
         total: frameEls.length,
         sameOrigin: frameSame,

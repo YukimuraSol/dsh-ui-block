@@ -667,6 +667,34 @@ async function main() {
       'frames=' + JSON.stringify(normalReport.frames) + '；frameShell=' + String(normalReport.frameShell) +
         '；entry ' + normalEntry.length + ' 字符；dropped 里有 FRAME SHELL=' + String(normalDroppedText.indexOf('FRAME SHELL') >= 0));
 
+    // ---- 18. 参考截图：报告里的事实与口径 ---------------------------------
+    // 拍图本身在 background.js（chrome.tabs.captureVisibleTab），这里只钉报告口径：
+    // mode 只能是 viewport；宽高是**抓取那一刻的视口**，不是目标尺寸——所以字段名里
+    // 不许出现 target / expected / size 这类会被读成「应该照做」的词。
+    const shot = (report.screenshot !== null && typeof report.screenshot === 'object') ? report.screenshot : {};
+    const shotForbidden = ['target', 'expected', 'size'].filter((k) => Object.prototype.hasOwnProperty.call(shot, k));
+    const shotViewport = (shot.captureViewport !== null && typeof shot.captureViewport === 'object') ? shot.captureViewport : {};
+    assert('report.screenshot：mode=viewport + path=reference/viewport.png + captureViewport，且不含 target/expected/size 键',
+      shot.mode === 'viewport' && shot.path === 'reference/viewport.png' &&
+        Number(shot.width) > 0 && Number(shot.height) > 0 && Number(shot.dpr) > 0 && Number.isFinite(Number(shot.scrollHeight)) &&
+        Number(shotViewport.width) === Number(shot.width) && Number(shotViewport.height) === Number(shot.height) &&
+        shotForbidden.length === 0,
+      JSON.stringify(shot) + '；禁用键命中 ' + shotForbidden.length + ' 个' + (shotForbidden.length ? '：' + shotForbidden.join(',') : ''));
+
+    // ---- 19. index.js 里那两行参考截图文案（抓完必须出现在返回文本里）----
+    const indexSrc = readFileSync(path.join(HERE, '..', 'index.js'), 'utf8');
+    const refLineOk = indexSrc.indexOf('REFERENCE VIEWPORT ') >= 0 &&
+      indexSrc.indexOf('That viewport is the capture viewport, NOT a target size.') >= 0 &&
+      indexSrc.indexOf('compare against this image only at the same width') >= 0 &&
+      indexSrc.indexOf('frozen at the capture width, so do not rescale or copy those pixel values') >= 0 &&
+      indexSrc.indexOf('REFERENCE VIEWPORT unavailable: ') >= 0 &&
+      indexSrc.indexOf("shot.mode === 'viewport'") >= 0;
+    assert('index.js 的 captureText 打印 REFERENCE VIEWPORT 两行（截图失败时打印 unavailable 行）',
+      refLineOk, 'REFERENCE VIEWPORT ' + (indexSrc.indexOf('REFERENCE VIEWPORT ') >= 0) +
+        ' / NOT a target size ' + (indexSrc.indexOf('NOT a target size') >= 0) +
+        ' / unavailable ' + (indexSrc.indexOf('REFERENCE VIEWPORT unavailable: ') >= 0) +
+        ' / 口径守卫 ' + (indexSrc.indexOf("shot.mode === 'viewport'") >= 0));
+
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });
     mkdirSync(OUT, { recursive: true });

@@ -2697,6 +2697,9 @@ function captureText(value) {
   // Buried in report.dropped it reads like the 40 false "lost resource" lines that
   // sent a model off to re-capture the whole page; this one decides what to do next.
   if (isFrameShell(value.report)) lines.push(FRAME_SHELL_LINE, FRAME_SHELL_NEXT, '')
+  // REFERENCE VIEWPORT: the capture-time viewport to compare a render against — NOT a target size.
+  const shot = value.report !== null && typeof value.report === 'object' ? value.report.screenshot : null
+  if (shot !== null && typeof shot === 'object') lines.push('', shot.mode === 'viewport' && shot.path ? 'REFERENCE VIEWPORT ' + String(shot.width) + 'x' + String(shot.height) + ' dpr=' + String(shot.dpr) + ' page-height=' + String(shot.scrollHeight) + ' saved to ' + String(shot.path) + '\nThat viewport is the capture viewport, NOT a target size. Render the block at whatever width you actually need, and compare against this image only at the same width. Geometry inside the block was frozen at the capture width, so do not rescale or copy those pixel values to another width.' : 'REFERENCE VIEWPORT unavailable: ' + String(shot.error || 'no screenshot'))
   lines.push('Capture landed in ' + value.dir + ' — ' + value.summary, '')
   const index = value.index
   if (index !== undefined && index !== null) {
