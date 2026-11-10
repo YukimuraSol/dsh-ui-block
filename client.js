@@ -3193,19 +3193,31 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       }, []);
 
       var ready = info.phase === 'ready';
-      // Who is reporting in right now. The newest report wins the line; a page
+      // Who is reporting in right now. The newest live report wins the line; a page
       // with several browsers says how many instead of pretending there is one.
+      // A record the host marked stale is OFFLINE, not connected, and gets its own
+      // wording: "已断开" says it was here and stopped, which "尚未检测到" cannot.
       var agents = ready && Array.isArray(info.agents) ? info.agents : [];
-      var newest = null;
+      var newest = null;       // reporting right now
+      var newestStale = null;  // reported before, now offline
+      var liveCount = 0;
       for (var agentIndex = 0; agentIndex < agents.length; agentIndex += 1) {
-        var spot = Date.parse(String((agents[agentIndex] && agents[agentIndex].lastSeenAt) || ''));
+        var agent = agents[agentIndex];
+        var spot = Date.parse(String((agent && agent.lastSeenAt) || ''));
         if (!isFinite(spot)) continue;
-        if (newest === null || spot > newest.at) newest = { at: spot, agent: agents[agentIndex] };
+        if (agent.stale === true) {
+          if (newestStale === null || spot > newestStale.at) newestStale = { at: spot, agent: agent };
+          continue;
+        }
+        liveCount += 1;
+        if (newest === null || spot > newest.at) newest = { at: spot, agent: agent };
       }
-      var statusText = newest === null
-        ? (ready || info.phase === 'error' ? '尚未检测到扩展上报' : '正在读取扩展状态…')
-        : '已连接：' + String(newest.agent.instance || '未知实例') + '（' + relativeTime(newest.agent.lastSeenAt)
-          + (agents.length > 1 ? '，共 ' + agents.length + ' 个实例上报' : '') + '）';
+      var statusText = newest !== null
+        ? '已连接：' + String(newest.agent.instance || '未知实例') + '（' + relativeTime(newest.agent.lastSeenAt)
+          + (liveCount > 1 ? '，共 ' + liveCount + ' 个实例上报' : '') + '）'
+        : newestStale !== null
+          ? '已断开：' + String(newestStale.agent.instance || '未知实例') + '（' + relativeTime(newestStale.agent.lastSeenAt) + '）'
+          : (ready || info.phase === 'error' ? '尚未检测到扩展上报' : '正在读取扩展状态…');
       return h('div', { className: 'dshub-ext' },
         h('div', {
           className: 'dshub-ext-status' + (newest === null ? '' : ' dshub-ext-status-on'),

@@ -143,14 +143,24 @@ await checkAsync('an unknown instance lists nothing and says which ones are repo
   assert.match(text, /Instances reporting right now: probe-ext, other-ext/)
 })
 
-console.log('--- 4. an old report is marked stale ---')
-await checkAsync('a report 11 minutes old marks every row stale:true', async () => {
+console.log('--- 4. a stale report is marked; an offline instance drops off the list ---')
+await checkAsync('a report 50 seconds old is still listed, marked stale:true', async () => {
   const seen = extensionHub.hub.instances.get('probe-ext')
-  seen.at = Date.now() - 11 * 60 * 1000
+  seen.at = Date.now() - 50 * 1000
   const rows = await tool('list_pages').execute({ instance: 'probe-ext' })
   assert.deepEqual(rows.map((row) => row.stale), [true, true])
+  assert.match(render('list_pages', { instance: 'probe-ext' }, rows), /STALE: last reported/)
+  seen.at = Date.now()
+})
+await checkAsync('a report 70 seconds old leaves the list and is named as quiet, not dropped silently', async () => {
+  const seen = extensionHub.hub.instances.get('probe-ext')
+  seen.at = Date.now() - 70 * 1000
+  const rows = await tool('list_pages').execute({ instance: 'probe-ext' })
+  assert.deepEqual(rows, [], 'an offline instance contributes no rows at all')
   const text = render('list_pages', { instance: 'probe-ext' }, rows)
-  assert.match(text, /STALE: last reported/)
+  assert.match(text, /instance probe-ext went quiet \d+ seconds ago and is not listed/)
+  // The other instances are unaffected: filtering is per instance.
+  assert.equal((await tool('list_pages').execute({ instance: 'other-ext' })).length, 1)
   seen.at = Date.now()
 })
 
@@ -314,11 +324,24 @@ await checkAsync('agents carries instance, lastSeenAt and the tab count', async 
   assert.equal(Array.isArray(body.agents), true)
   const probe = body.agents.find((agent) => agent.instance === 'probe-ext')
   assert.ok(probe, 'probe-ext appears in agents')
-  assert.deepEqual(Object.keys(probe).sort(), ['instance', 'lastSeenAt', 'tabs'])
+  assert.deepEqual(Object.keys(probe).sort(), ['instance', 'lastSeenAt', 'stale', 'tabs'])
   assert.equal(probe.tabs, 2)
+  assert.equal(probe.stale, false, 'a report from seconds ago is not stale')
   assert.equal(new Date(probe.lastSeenAt).getTime() > Date.now() - 5000, true)
   const keep = body.agents.find((agent) => agent.instance === 'keep-ext')
   assert.equal(keep.tabs, 0, 'an instance that reported zero tabs says zero, not "missing"')
+})
+await checkAsync('an offline instance STAYS in agents, marked stale with its lastSeenAt', async () => {
+  const seen = extensionHub.hub.instances.get('keep-ext')
+  seen.at = Date.now() - 3 * 60 * 1000
+  const body = (await infoCall()).json()
+  const quiet = body.agents.find((agent) => agent.instance === 'keep-ext')
+  assert.ok(quiet, 'the record is kept, not deleted')
+  assert.equal(quiet.stale, true)
+  assert.equal(Math.abs(new Date(quiet.lastSeenAt).getTime() - seen.at) < 1000, true)
+  // ... and it contributes no rows, so the card's "已断开" and the tool agree.
+  assert.deepEqual(await tool('list_pages').execute({ instance: 'keep-ext' }), [])
+  seen.at = Date.now()
 })
 await checkAsync('the info answer keeps the install fields and carries no token', async () => {
   const body = (await infoCall()).json()

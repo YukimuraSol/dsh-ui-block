@@ -1213,7 +1213,7 @@ const LIST_DESCRIPTION = [
   '',
   'Call this first, then capture_page with one row\'s { instance, tabId }: a tab id is unique only inside one instance, so the pair is the identity. url and title say what the page is, focused says whether it is the active tab, and capturable:false carries the reason that tab can never be captured (a chrome:// page, the extension store, an extension page, an embedded PDF).',
   '',
-  'The list is only what the extension last reported: a tab it cannot see is absent, never guessed. A report more than 10 minutes old is marked stale on its rows, because a tab closed since then is still listed — refresh by calling again once the extension has polled (it polls every couple of seconds). An empty list means nothing is connected, and the result then says what to check, including the extension\'s absolute path and this instance\'s address.'
+  'The list is only what the extension last reported: a tab it cannot see is absent, never guessed. An instance that has not polled for a minute is offline and its rows are LEFT OUT, with one line naming it and how long it has been quiet; a report 45 to 60 seconds old is still listed but marked stale, because a tab closed since then is still in it — refresh by calling again once the extension has polled (it polls every couple of seconds). An empty list means nothing is connected, and the result then says what to check, including the extension\'s absolute path and this instance\'s address.'
 ].join('\n')
 
 const CAPTURE_DESCRIPTION = [
@@ -1884,8 +1884,20 @@ async function writeCapture(result, task) {
 // its absolute path, which is what create_ui_block's `from` takes.
 // ---------------------------------------------------------------------------
 
-/** A tab report older than this cannot be trusted: the tab may be long closed. */
-const STALE_AFTER_MS = 10 * 60 * 1000
+/**
+ * A report older than this is still listed but marked stale: the tab may have
+ * closed since, so refresh before capturing.
+ */
+const STALE_AFTER_MS = 45 * 1000
+/**
+ * A report older than THIS is not listed at all: the instance is offline.
+ * The extension polls every couple of seconds, so a minute of silence means it
+ * is gone — a stopped browser, a closed browser, a dead service worker. A row
+ * from such an instance is worse than no row: it names a tab nobody can capture.
+ */
+const AGENT_OFFLINE_MS = 60 * 1000
+/** How long a quiet instance keeps being NAMED in the result instead of silently dropped. */
+const AGENT_QUIET_REPORT_MS = 60 * 60 * 1000
 /** How long capture_page waits for the extension unless the caller says otherwise. */
 const CAPTURE_DEFAULT_TIMEOUT_MS = 60000
 /** Ceilings for timeout_ms: below this the extension gets no chance to poll even once. */
@@ -1901,6 +1913,50 @@ let agentPort = 0
 /** How to spell the current instance in an instruction a human can follow. */
 function instancePortText() {
   return agentPort > 0 ? 'http://127.0.0.1:' + String(agentPort) : 'this instance\'s own port'
+}
+
+/** True when this instance has not reported for the offline window. */
+function isOffline(seen, now = Date.now()) {
+  return seen === undefined || seen === null || !(now - seen.at <= AGENT_OFFLINE_MS)
+}
+
+/** "3 minutes" / "12 seconds": how long ago, spelled for one line of a tool result. */
+function ageText(ms) {
+  const seconds = Math.max(1, Math.round(Number(ms) / 1000))
+  if (seconds < 90) return String(seconds) + ' seconds'
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 90) return String(minutes) + ' minutes'
+  return String(Math.round(minutes / 60)) + ' hours'
+}
+
+/**
+ * The hub's instances split into the two answers a caller needs: which ones are
+ * reporting right now (their rows are usable) and which ones went quiet so
+ * recently that saying so beats dropping them in silence.
+ */
+function instanceStates(args) {
+  const wanted = String(args === undefined || args === null || args.instance === undefined || args.instance === null ? '' : args.instance).trim()
+  const now = Date.now()
+  const live = []
+  const quiet = []
+  for (const [instance, seen] of agentHub.instances) {
+    if (!isOffline(seen, now)) {
+      // "Instances reporting right now" is about the hub, not about the filter:
+      // asking for an unknown name must still say who IS there.
+      live.push(instance)
+      continue
+    }
+    if (wanted !== '' && instance !== wanted) continue
+    if (now - seen.at <= AGENT_QUIET_REPORT_MS) quiet.push({ instance, at: seen.at })
+  }
+  quiet.sort((left, right) => right.at - left.at)
+  return { live, quiet }
+}
+
+/** One line per recently-quiet instance: named, timed, and not offered as a target. */
+function quietLines(args) {
+  const now = Date.now()
+  return instanceStates(args).quiet.slice(0, 5).map((item) => 'instance ' + item.instance + ' went quiet ' + ageText(now - item.at) + ' ago and is not listed.')
 }
 
 /** One compact time for the recent-request trail: HH:MM:SS, local. */
@@ -1920,9 +1976,11 @@ function pagesText(rows, args) {
       + (row.capturable ? '' : ' | ' + (row.reason === undefined ? 'no reason given' : row.reason))
       + (row.stale ? ' | STALE: last reported ' + row.seenAt + ', call the extension to refresh before capturing' : ''))
     if (rows.some((row) => !row.capturable)) lines.push('', 'Each [cannot capture] row is there so it does not become a target: those pages have no DOM to extract. capture_page takes only the other rows.')
+    const quiet = quietLines(args)
+    if (quiet.length > 0) lines.push('', ...quiet)
     return lines.join('\n')
   }
-  const known = [...agentHub.instances.keys()]
+  const known = instanceStates(args).live
   const lines = []
   if (wanted === '') {
     lines.push(known.length === 0
@@ -1932,6 +1990,11 @@ function pagesText(rows, args) {
     lines.push('No browser tab is on the list for instance "' + wanted + '".'
       + (known.length === 0 ? ' No extension has reported to this instance at all.' : ' Instances reporting right now: ' + known.join(', ') + '.'))
   }
+  // A quiet instance is named rather than silently missing: "it was here a
+  // minute ago" is the difference between "nothing is connected" and "the thing
+  // that was connected stopped reporting".
+  const quiet = quietLines(args)
+  if (quiet.length > 0) lines.push('', ...quiet)
   const recent = agentHub.recent.slice(-6)
   if (recent.length > 0) {
     lines.push('', 'Last requests this endpoint saw (newest last): ' + recent.map((entry) => shortTime(entry.at) + ' ' + entry.kind
@@ -2462,6 +2525,10 @@ export function apply(ctx, config) {
       const rows = []
       for (const [instance, seen] of agentHub.instances) {
         if (wanted !== '' && instance !== wanted) continue
+        // An offline instance's rows are not offered at all: the tabs in them
+        // belong to a browser that stopped reporting, so capture_page on one of
+        // them can only end in "the target is gone".
+        if (isOffline(seen)) continue
         const stale = Date.now() - seen.at > STALE_AFTER_MS
         for (const tab of seen.tabs) {
           rows.push({
@@ -2778,10 +2845,15 @@ export function apply(ctx, config) {
             // Who has reported in, out of the hub's own table — no new storage.
             // lastSeenAt is that instance's last POST /poll, which is exactly what
             // the card needs to say "connected: chrome (12s ago)".
+            // Every record is kept, INCLUDING the ones that went quiet: the card
+            // says "disconnected 3 minutes ago" from this, which is more useful
+            // than the row simply vanishing while the user wonders why.
+            const now = Date.now()
             const agents = [...agentHub.instances.entries()].map(([instance, seen]) => ({
               instance,
               lastSeenAt: new Date(seen.at).toISOString(),
-              tabs: seen.tabs.length
+              tabs: seen.tabs.length,
+              stale: isOffline(seen, now)
             }))
             send(200, {
               ok: true,
