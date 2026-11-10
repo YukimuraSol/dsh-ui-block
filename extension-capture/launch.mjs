@@ -198,8 +198,11 @@ const STORAGE_EXPR = "chrome.storage.local.get('baseUrl').then(function (v) { re
 
 /**
  * 这次打开的那个标签页的身份：capture_page 要的 { instance, tabId } 就是它。
- * 在扩展自己的上下文里问 chrome.tabs（页面被重定向时按"第一个 http(s) 标签"兜底，
- * matched 会说明是哪一种）。
+ *
+ * 匹配分三级，先把 URL 归一化再比（host 小写、空路径补尾斜杠、去掉 fragment 由
+ * URL() 一条搞定）：① 归一化后相等 → exact；② 同 host 且 path 以目标为前缀
+ * （重定向到更深路径）→ prefix；③ 都没有才拿第一个 http(s) 标签 → fallback，
+ * 并把所有备选放进 candidates，多标签时人能看出会不会抓错。
  *
  * instance 必须是插件侧记账用的那个名字：手填的 instance 优先，留空就用后台自动生成的
  * instanceId（chrome-xxxx）。老版本写进 storage 的 "chrome" 当"没填"看，跟 background.js
@@ -212,13 +215,33 @@ function tabInfoExpr(wantUrl) {
     ' if (manual === "chrome") manual = "";' +
     ' var name = manual || String(s.instanceId || "").trim();' +
     ' if (name === "") return { pending: true };' +
+    ' var norm = function (raw) { try { var u = new URL(String(raw)); u.hash = ""; return u.href } catch (e) { return String(raw) } };' +
     ' var tabs = await chrome.tabs.query({});' +
     ' var want = ' + JSON.stringify(String(wantUrl)) + ';' +
-    ' var hit = null, matched = "";' +
-    ' for (var i = 0; i < tabs.length; i += 1) { if (String(tabs[i].url || "") === want) { hit = tabs[i]; matched = "exact"; break } }' +
-    ' if (!hit) { for (var j = 0; j < tabs.length; j += 1) { if (/^https?:/i.test(String(tabs[j].url || ""))) { hit = tabs[j]; matched = "fallback"; break } } }' +
+    ' var wantHref = norm(want);' +
+    ' var hit = null, matched = "", candidates = [];' +
+    ' for (var i = 0; i < tabs.length; i += 1) { if (norm(tabs[i].url) === wantHref) { hit = tabs[i]; matched = "exact"; break } }' +
+    ' if (!hit) {' +
+    '   var wu = null; try { wu = new URL(want) } catch (e) { wu = null }' +
+    '   if (wu) {' +
+    '     var cut = wu.pathname === "/" ? "/" : (wu.pathname.slice(-1) === "/" ? wu.pathname : wu.pathname + "/");' +
+    '     for (var j = 0; j < tabs.length; j += 1) {' +
+    '       var tu = null; try { tu = new URL(String(tabs[j].url || "")) } catch (e) { tu = null }' +
+    '       if (!tu) continue;' +
+    '       if (tu.host === wu.host && (tu.pathname === wu.pathname || tu.pathname.indexOf(cut) === 0)) { hit = tabs[j]; matched = "prefix"; break }' +
+    '     }' +
+    '   }' +
+    ' }' +
+    ' if (!hit) {' +
+    '   var httpTabs = [];' +
+    '   for (var k = 0; k < tabs.length; k += 1) { if (/^https?:/i.test(String(tabs[k].url || ""))) httpTabs.push(tabs[k]) }' +
+    '   if (httpTabs.length) {' +
+    '     hit = httpTabs[0]; matched = "fallback";' +
+    '     candidates = httpTabs.map(function (t) { return { url: String(t.url || ""), title: String(t.title || "") } });' +
+    '   }' +
+    ' }' +
     ' if (!hit) return null;' +
-    ' return { instance: name, manual: manual !== "", tabId: hit.id, url: String(hit.url || ""), title: String(hit.title || ""), matched: matched };' +
+    ' return { instance: name, manual: manual !== "", tabId: hit.id, url: String(hit.url || ""), title: String(hit.title || ""), matched: matched, want: wantHref, candidates: candidates };' +
     '})()'
 }
 
@@ -312,7 +335,13 @@ async function main() {
   }
 }
 
-main().catch(function (e) {
-  console.error('[launch] 失败：' + (e && e.message || e))
-  process.exitCode = 1
-})
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+if (isMain) {
+  main().catch(function (e) {
+    console.error('[launch] 失败：' + (e && e.message || e))
+    process.exitCode = 1
+  })
+}
+
+// 给 hub-check 用：把"要报哪个标签页"的那段表达式单独测（URL 归一化/前缀/兜底三级）
+export { tabInfoExpr }

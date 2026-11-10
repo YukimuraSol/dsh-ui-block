@@ -12,6 +12,9 @@ import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+// launch.mjs 里的标签页匹配表达式单独测：它只吃 chrome.tabs 的结果，不需要真浏览器。
+// launch.mjs 自己用 isMain 守住，被 import 时不会起 Chrome。
+import { tabInfoExpr } from './launch.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const realSetTimeout = setTimeout
@@ -276,6 +279,34 @@ export async function runHubChecks(assert) {
     optionsStore.get('baseUrl') === 'http://127.0.0.1:4000' && back.baseUrl === 'http://127.0.0.1:4000' &&
       elements.baseUrl && elements.baseUrl.value === 'http://127.0.0.1:4000',
     'storage.baseUrl 读回 = ' + JSON.stringify(String(back.baseUrl || '')) + '；输入框 = ' + JSON.stringify(String(elements.baseUrl && elements.baseUrl.value)))
+
+  // ---- 6. launch 的标签页匹配：URL 归一化三级 ------------------------------
+  // 落地 URL 与传入写法常常差一个尾斜杠或一个 fragment，按字符串直比就会退化成
+  // "第一个 http(s) 标签"——多标签浏览器里就是拿错页。这里用假 chrome 跑那段表达式。
+  const fakeTabs = [
+    { id: 1, url: 'https://example.com/', title: 'Example' },
+    { id: 2, url: 'https://other.test/x', title: 'Other' }
+  ]
+  const fakeTabChrome = function (tabs) {
+    return {
+      storage: { local: { async get(defaults) { return Object.assign({}, defaults, { instanceId: 'chrome-abcd' }) } } },
+      tabs: { async query() { return tabs } }
+    }
+  }
+  const runTabInfo = function (want, tabs) {
+    const fn = new Function('chrome', 'URL', 'return ' + tabInfoExpr(want))
+    return fn(fakeTabChrome(tabs || fakeTabs), URL)
+  }
+  const noSlash = await runTabInfo('https://example.com')
+  const withSlash = await runTabInfo('https://example.com/')
+  const withHash = await runTabInfo('https://example.com/#x')
+  const miss = await runTabInfo('https://missing.test/', fakeTabs)
+  assert('launch 标签页匹配：无尾斜杠 / 带尾斜杠 / 带 fragment 三种写法都命中 exact，未命中才 fallback 并带 candidates',
+    noSlash.matched === 'exact' && withSlash.matched === 'exact' && withHash.matched === 'exact' &&
+      noSlash.tabId === 1 && withSlash.tabId === 1 && withHash.tabId === 1 &&
+      miss.matched === 'fallback' && Array.isArray(miss.candidates) && miss.candidates.length === 2,
+    'matched=' + [noSlash.matched, withSlash.matched, withHash.matched, miss.matched].join('/') +
+      '；归一化后 want=' + noSlash.want + '；fallback candidates=' + JSON.stringify(miss.candidates.map(function (c) { return c.url })))
 
   try { a.server.close() } catch (e) {}
   try { b.server.close() } catch (e) {}
