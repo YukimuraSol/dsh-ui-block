@@ -79,13 +79,20 @@ function buildFixture(P) {
     '.thumb{width:240px;height:120px;object-fit:cover;border-radius:8px;}',
     // 根绝对引用（真实事故形态）：CSS 里写 url(/static/…)。它必须被改写成本地段，
     // 不能因为调用方传了 includes 就原样留在产物里。
-    '.probe{background-image:url(/static/probe.svg);width:16px;height:16px;}'
+    '.probe{background-image:url(/static/probe.svg);width:16px;height:16px;}',
+    // 抽屉形态：定位规则只写在样式表里（真实事故里那份表跨域取不到）。这些必须被固化成
+    // 元素规则，否则抓下来抽屉落回文档流、整页往下压。
+    '.drawerlike{position:fixed;top:0;left:0;transform:translateY(-100%);z-index:30;overflow:auto;width:200px;height:40px;}',
+    // 单位矩阵 = 视觉上没动，和 transform:none 一样不许写进块。
+    '.noopmove{position:relative;transform:translateX(0);top:auto;left:auto;}'
   ].join('') + '</style>';
   document.body.innerHTML = '<main class="wrap">' +
     '<section><h1 id="headline">抓取自检</h1><p id="tagline">目标元素在这里</p></section>' +
     '<div class="card" id="target">\u4f60\u597d\uff0cdsh</div>' +
     '<div class="hero"></div>' +
     '<div class="probe" id="probe"></div>' +
+    '<div class="drawerlike" id="drawerprobe">抽屉容器</div>' +
+    '<div class="noopmove" id="noopmove">没移动</div>' +
     '<p><a id="rootlink" href="/abs/link">一个根绝对外链</a></p>' +
     '<div id="bigbox"></div>' +
     '</main>';
@@ -473,6 +480,34 @@ async function main() {
         '；传 css,fonts,images：assets ' + (incRun.report.assets || []).length + ' 条 / 内联 ' + incRun.report.assetsInlined +
         ' / CSS 根绝对 ' + incAbs + ' / 悬空引用 ' + incBadRefs.length + ' / ' + sumBytes(incRun.files) + ' B / includesIgnored=' + String(incRun.report.includesIgnored) +
         (incBadRefs.length ? '；' + incBadRefs.slice(0, 3).join(' | ') : ''));
+
+    // ---- 14. 定位属性固化：抽屉落回文档流的根因 -----------------------------
+    // 真实事故：抽屉样式表 pure-drawer.css 跨域取不到，position/left/transform 全在里面，
+    // 抓下来抽屉落回文档流、把整页往下压 450px。定位必须固化成元素规则；
+    // 默认值（static / auto / none / 单位矩阵）不许写，否则平白胖一圈。
+    const cssText = ['shared/app.css', 'pages/current/page.css']
+      .map((p) => (byPath.get(p) ? String(byPath.get(p).content) : '')).join('\n');
+    const ruleOf = (id) => {
+      const tag = (new RegExp('<[a-z]+[^>]*id="' + id + '"[^>]*>', 'i').exec(entry.content) || [''])[0];
+      const key = (/data-dsh-el="(e\d+)"/.exec(tag) || [])[1] || '';
+      return { key: key, rule: key ? ((new RegExp('\\[data-dsh-el="' + key + '"]\\{[^}]*\\}').exec(cssText) || [''])[0]) : '' };
+    };
+    const drawer = ruleOf('drawerprobe');
+    const noop = ruleOf('noopmove');
+    const computedRules = cssText.match(/\[data-dsh-el="e\d+"\]\{[^}]*\}/g) || [];
+    const defaultHits = computedRules.filter((r) =>
+      /(?:^|[;{])(?:position:static|top:auto|right:auto|bottom:auto|left:auto|transform:none|z-index:auto|overflow:visible|inset:auto)(?:[;}]|$)/.test(r));
+    const drawerOk = drawer.rule !== '' &&
+      /position:fixed/.test(drawer.rule) && /left:0px/.test(drawer.rule) && /top:0px/.test(drawer.rule) &&
+      /transform:matrix\(1,\s*0,\s*0,\s*1,\s*0,\s*-?[\d.]+\)/.test(drawer.rule) &&
+      /z-index:30/.test(drawer.rule) && /overflow:auto/.test(drawer.rule);
+    const noopOk = noop.rule !== '' && /position:relative/.test(noop.rule) &&
+      !/transform:matrix\(1,\s*0,\s*0,\s*1,\s*0,\s*0\)/.test(noop.rule) && !/[;{]left:auto/.test(noop.rule);
+    assert('定位属性被固化，默认值不写（position/left/top/transform/z-index/overflow）',
+      drawerOk && noopOk && defaultHits.length === 0,
+      '抽屉规则=' + (drawer.rule || '（缺）') + '；单位矩阵那条=' + (noop.rule || '（缺）') +
+        '；固化规则里写了默认值的条数=' + defaultHits.length +
+        '；CSS 段共 ' + computedRules.length + ' 条元素规则');
 
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });

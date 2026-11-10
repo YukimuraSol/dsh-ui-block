@@ -169,7 +169,7 @@ node self-check.mjs
 
 ## 已知边界
 
-- 抽取只固化子树前 600 个元素的关键计算属性（`computed` 段到 384KB 预算就停，`report.degrade` 里会说）；
+- 抽取只固化子树前 600 个元素的关键计算属性（`computed` 段到 384KB 预算就停，`report.degrade` 里会说）；属性里含布局位置（`position/inset/top/right/bottom/left/transform/z-index/overflow`），等于默认值时一律不写——定位样式表跨域取不到时（`pure-drawer.css` 那种），抽屉的版式就靠这些规则立住；
 - 跨域 `@import` 的样式表读不到 `cssRules`，记进 dropped；
 - 只处理顶层文档：iframe 内容不抓（元素本身移除并记名）；
 - 自定义属性表取 `:root`+`body`，挂在更深的祖先上的局部变量解析不了 → 丢声明；

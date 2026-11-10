@@ -8,8 +8,22 @@
 
   var NL = String.fromCharCode(10);
   var COMPUTED_PROPS = ['color', 'background-color', 'font-size', 'font-family', 'line-height',
-    'padding', 'margin', 'border-radius', 'box-shadow', 'display', 'grid-template-columns', 'gap'];
+    'padding', 'margin', 'border-radius', 'box-shadow', 'display', 'grid-template-columns', 'gap',
+    // 布局位置也是"版式事实"，必须固化：实测 courses.zju.edu.cn 的抽屉样式表 pure-drawer.css
+    // 跨域取不到（cssRules 抛 SecurityError），抽屉的 position/left/transform 全在里面，
+    // 抓下来抽屉落回文档流、把整页往下压 450px，模型只能自己读 entry.html 反推版式。
+    'position', 'inset', 'top', 'right', 'bottom', 'left', 'transform', 'z-index', 'overflow'];
   var INHERITED = { color: 1, 'font-size': 1, 'font-family': 1, 'line-height': 1 };
+  // 这几个属性"等于默认"就是没设过，写进块只会白胖，默认值一律不输出。
+  var PROP_DEFAULTS = {
+    position: 'static', inset: 'auto', top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
+    transform: 'none', 'z-index': 'auto', overflow: 'visible'
+  };
+  /** 单位矩阵 = 视觉上没动，和 transform:none 一样省掉。 */
+  function identityTransform(v) {
+    var s = String(v || '').replace(/\s+/g, '');
+    return s === 'matrix(1,0,0,1,0,0)' || s === 'matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)';
+  }
 
   // 单文件上限与块格式对齐（2 MB）。data: 内嵌另有更紧的一条：base64 会胀 4/3，
   // 1.4 MB 的字节内嵌后约 1.87 MB，仍在一段 2 MB 之内。
@@ -456,6 +470,8 @@
         if (!val) continue;
         if (prop === 'box-shadow' && val === 'none') continue;
         if (prop === 'border-radius' && val === '0px') continue;
+        if (PROP_DEFAULTS[prop] !== undefined && val === PROP_DEFAULTS[prop]) continue;
+        if (prop === 'transform' && identityTransform(val)) continue;
         if (INHERITED[prop] && pcs) {
           var pv = '';
           try { pv = String(pcs.getPropertyValue(prop) || '').trim(); } catch (e) { pv = ''; }
