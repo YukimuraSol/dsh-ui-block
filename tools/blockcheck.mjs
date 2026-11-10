@@ -1,7 +1,7 @@
 // blockcheck.mjs — 用 .uiblock 的**正式解析规则**检查块文件
 // 规则来自 dsh-ui-block/index.js：SECTION_RE、sectionType()、SECTION_TYPES、
 // bytes=binary?base64解码后:utf8、段标记伪造检查、块总量按落盘文本。
-// 两条上限与 index.js 的 LIMIT_DEFAULTS **同值**（sectionBytes 2 MB / blockBytes 64 MB）：
+// 两条上限与 index.js 的 LIMIT_DEFAULTS **同值**（sectionBytes 8 MB / blockBytes 64 MB）：
 // 那边改了（可用 limits 配置覆盖），这里跟着改，不在本工具另立一套默认值。
 // 再加两条**生成侧**规则（插件侧不动，数据侧自己保证）：
 //   ① 段内资源路径必须段相对：src="/…"、href="/…"、url(/…) 一律报错
@@ -12,13 +12,13 @@ import { readFile } from 'node:fs/promises';
 
 const SECTION_RE = /^<!--\s*@@file\s+(\S+?)(\s+base64)?\s*-->\s*$/;
 // 与 index.js LIMIT_DEFAULTS.sectionBytes / .blockBytes 同值，见文件头注释。
-const SECTION_MAX_BYTES = 2 * 1024 * 1024;
+const SECTION_MAX_BYTES = 8 * 1024 * 1024;
 const BLOCK_MAX_BYTES = 64 * 1024 * 1024;
 // html/htm 是正式段类型（index.js SECTION_TYPES 已收）：一个块可以带整页。
-const SECTION_TYPES = { html: 1, htm: 1, css: 1, svg: 1, json: 1, woff2: 1, woff: 1, ttf: 1, png: 1, jpg: 1, jpeg: 1, webp: 1 };
+const SECTION_TYPES = { html: 1, htm: 1, css: 1, svg: 1, json: 1, woff2: 1, woff: 1, ttf: 1, otf: 1, png: 1, jpg: 1, jpeg: 1, webp: 1, gif: 1 };
 // --allow-html 是旧调用的兼容开关，现在什么也不做（html 恒为合法段类型），也绝不报错。
 void process.argv.includes('--allow-html');
-const BINARY = new Set(['woff2', 'woff', 'ttf', 'png', 'jpg', 'jpeg', 'webp']);
+const BINARY = new Set(['woff2', 'woff', 'ttf', 'otf', 'png', 'jpg', 'jpeg', 'webp', 'gif']);
 const TEXTY = new Set(['html', 'htm', 'css', 'svg']);
 const ext = (p) => p.slice(p.lastIndexOf('.') + 1).toLowerCase();
 

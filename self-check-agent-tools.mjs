@@ -263,7 +263,7 @@ await checkAsync('the whole loop returns dir + files[].from with real bytes', as
     assert.equal(statSync(file.from).size, file.bytes, 'bytes on disk match the returned count: ' + file.path)
   }
   assert.equal(readFileSync(value.files[0].from, 'utf8'), '<p>captured</p>')
-  assert.match(value.summary, /2 file\(s\), 34 bytes total, 2 resource\(s\) dropped/)
+  assert.match(value.summary, /2 file\(s\), 34 bytes total, 2 resource\(s\) really lost/)
   // The structured extras are GONE: the flow and the dangling list live in the
   // rendered text only, and the value is the material itself.
   assert.equal('next' in value, false, 'no next field — the flow is in the rendered text')

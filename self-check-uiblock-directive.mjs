@@ -180,7 +180,7 @@ t('directiveRes is the canvas default the host screenshots at', () => {
 // ---------------------------------------------------------------------------
 const home = mkdtempSync(join(tmpdir(), 'dsh-uiblock-selfcheck-'))
 process.env.DSH_HOME = home
-const { timeline, apply } = await import(pathToFileURL(join(here, 'index.js')).href)
+const { timeline, apply, reporting } = await import(pathToFileURL(join(here, 'index.js')).href)
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 const sha = (text) => createHash('sha256').update(String(text), 'utf8').digest('hex')
 const ta = async (name, fn) => { await fn(); n += 1; console.log('  ok - ' + name) }
@@ -480,8 +480,8 @@ t('the host carries one CSP for the entry and every section, still no script', (
   assert.match(hostSource, /'content-security-policy': BLOCK_CSP/)
   assert.match(hostSource, /style-src 'self' 'unsafe-inline'/)
   assert.match(hostSource, /script-src 'none'/)
-  // The ceilings are config now: 2 MB per file, 64 MB per block, 16 MB soft warn.
-  assert.match(hostSource, /sectionBytes: 2 \* 1024 \* 1024/)
+  // The ceilings are config now: 8 MB per file, 64 MB per block, 16 MB soft warn.
+  assert.match(hostSource, /sectionBytes: 8 \* 1024 \* 1024/)
   assert.match(hostSource, /blockBytes: 64 \* 1024 \* 1024/)
   assert.match(hostSource, /softWarnBytes: 16 \* 1024 \* 1024/)
 })
@@ -580,18 +580,22 @@ await ta('a path that walks out of the prefix is a 404, and no file content leak
   const direct = await call('/ui-blocks/../../package.json')
   assert.equal(direct.status, 404)
 })
-await ta('a section over the 2 MB per-file ceiling is refused with 413', async () => {
-  const big = 'a{color:red}'.repeat(200000)
+await ta('a section over the 8 MB per-file ceiling is refused with 413', async () => {
+  const big = 'a{color:red}'.repeat(700000)
   writeFileSync(join(home, 'ui-blocks', 'big-probe.uiblock'), '<b>x</b>\n' + MARK + 'big.css -->\n' + big + '\n', 'utf8')
   const answer = await call('/ui-blocks/big-probe/big.css')
   assert.equal(answer.status, 413)
-  assert.match(html(answer.body), /the limit is 2097152/)
+  assert.match(html(answer.body), /the limit is 8388608/)
 })
 await ta('?at= replays the entry AND its stylesheet from one moment', async () => {
-  await call('/ui-blocks/section-probe')
+  // A read does NOT record any more (§18), so the baseline is the first save and
+  // the patch is the second: exactly the two records the watcher would make.
+  await timeline.recordChange('section-probe', readFileSync(probe, 'utf8'))
   await sleep(12)
   writeFileSync(probe, sectioned(cssV2), 'utf8')
+  await timeline.recordChange('section-probe', readFileSync(probe, 'utf8'))
   await sleep(12)
+  assert.equal((await timeline.readHistory('section-probe')).entries.length, 1, 'one patch for one edit')
   const live = await call('/ui-blocks/section-probe/panel.css')
   assert.equal(html(live.body), cssV2.trim())
   const history = await timeline.readHistory('section-probe')
@@ -713,18 +717,127 @@ await ta('a body that forges a section marker, an empty entry, a duplicate path 
     { path: 'a.css', content: '.b{}' }
   ]), /duplicate file path/)
 })
-await ta('the per-file 2 MB and the 64 MB block ceilings are enforced here too', async () => {
+await ta('the per-file 8 MB and the 64 MB block ceilings are enforced here too', async () => {
   await assert.rejects(timeline.assembleBlock([
     { path: 'index.html', content: cardHtml },
-    { path: 'big.css', content: 'a'.repeat(2 * 1024 * 1024 + 1) }
-  ]), /the limit is 2097152 bytes/)
-  // Under the 2 MB per-file ceiling each, but 40 of them is past 64 MB.
+    { path: 'big.css', content: 'a'.repeat(8 * 1024 * 1024 + 1) }
+  ]), /the limit is 8388608 bytes/)
+  // Under the 8 MB per-file ceiling each, but 40 of them is past 64 MB.
   const chunk = 'b'.repeat(1900000)
   const many = [{ path: 'index.html', content: '<p>wide</p>' }]
   for (let i = 0; i < 40; i += 1) many.push({ path: 'p' + i + '.css', content: chunk })
   await assert.rejects(timeline.assembleBlock(many), /the limit is 67108864 bytes/)
 })
 
+// ---------------------------------------------------------------------------
+// 18. reading is not a change (2026-11-10): a GET, a preview and read_ui_block's
+// own render must leave history alone; a real edit still lands, through the
+// watcher, with no read involved.
+// ---------------------------------------------------------------------------
+console.log('--- 18. 20 reads leave the log alone; a real edit is still recorded ---')
+const fatCss = '.fat{color:#123}' + 'z'.repeat(6 * 1024 * 1024)
+await ta('twenty entry+section reads change neither the log nor one byte of the block', async () => {
+  const localTools = []
+  apply({ tools: { register: (definition) => { localTools.push(definition); return () => undefined } }, get: () => undefined, inject: () => undefined })
+  const create = localTools.find((definition) => definition.name === 'create_ui_block')
+  await create.execute({
+    name: 'read-probe',
+    files: [
+      { path: 'index.html', content: '<div class="pb">fat</div>' },
+      { path: 'fat.css', content: fatCss }
+    ]
+  }, {})
+  const blockPath = join(home, 'ui-blocks', 'read-probe.uiblock')
+  const logPath = join(home, 'ui-blocks', '.history', 'read-probe', 'log.json')
+  const historyBytes = () => {
+    let sum = 0
+    const walk = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const target = join(dir, entry.name)
+        if (entry.isDirectory()) walk(target)
+        else sum += statSync(target).size
+      }
+    }
+    walk(join(home, 'ui-blocks', '.history'))
+    return sum
+  }
+  assert.ok(statSync(blockPath).size > 6 * 1024 * 1024, 'the probe block is a real 6 MB one')
+  // Let the watcher settle first: a record queued by an EARLIER write in this run
+  // is a real edit (big-probe is 8 MB) and must not land mid-measurement.
+  const settle = async () => {
+    await sleep(400)
+    await timeline.settleHistory()
+    await sleep(250)
+    await timeline.settleHistory()
+  }
+  await settle()
+  const logBefore = statSync(logPath).size
+  const historyBefore = historyBytes()
+  const blockBefore = statSync(blockPath).size
+  const sizes = []
+  for (let round = 0; round < 20; round += 1) {
+    const one = await call('/ui-blocks/read-probe')
+    const two = await call('/ui-blocks/read-probe/fat.css')
+    assert.equal(one.status, 200)
+    assert.equal(two.status, 200)
+    if (round === 0 || round === 19) sizes.push(String(statSync(logPath).size) + '/' + String(statSync(blockPath).size))
+  }
+  await settle()
+  assert.equal(statSync(logPath).size, logBefore, 'the log is byte-identical after 40 reads')
+  assert.equal(historyBytes(), historyBefore, 'no new file under .history')
+  assert.equal(statSync(blockPath).size, blockBefore)
+  assert.equal(sizes.join(' -> '), String(logBefore) + '/' + String(blockBefore) + ' -> ' + String(logBefore) + '/' + String(blockBefore))
+  // A real edit: the watcher records it, no read of the new body involved.
+  writeFileSync(blockPath, '<div class="pb">fat 2</div>' + String.fromCharCode(10) + MARK + 'fat.css -->' + String.fromCharCode(10) + fatCss.replace('#123', '#456') + String.fromCharCode(10), 'utf8')
+  await sleep(1200)
+  const history = await timeline.readHistory('read-probe')
+  assert.equal(history.entries.length, 1, 'exactly one patch for one edit')
+  const live = readFileSync(blockPath, 'utf8')
+  assert.equal(sha(await timeline.contentAt('read-probe', history.entries[0].at, 'x')), sha(live))
+})
+
+// ---------------------------------------------------------------------------
+// 19. the capture ledger tells the truth: lost is lost, moved is kept, and the
+// "references" line stops saying all-clear when a stylesheet never arrived.
+// ---------------------------------------------------------------------------
+console.log('--- 19. dropped counts only what was lost; a missing stylesheet degrades the verdict ---')
+const lostFont = '字体 4293380 超 8388608，丢弃：https://x.test/f.woff'
+const movedFont = '字体 209KB 超 200KB，改存 assets/font-1.woff：https://x.test/g.woff'
+const movedSprite = '图片重编码 358x20870 → 34x2000 webp 16KB：https://x.test/s.png'
+const failedSheet = '读不到样式表（跨域）：https://x.test/a.css'
+const missingByte = '取不到字节，丢弃： （HTTP 404）https://x.test/m.png'
+const splitOf = (items) => reporting.splitDropped({ dropped: items })
+await ta('one array, two counts: really lost versus moved into assets/', () => {
+  const split = splitOf([lostFont, movedFont, movedSprite, failedSheet, missingByte])
+  assert.equal(split.dropped.count, 3, 'over a ceiling, cross-origin, 404')
+  assert.equal(split.movedToAssets.count, 2, 'spilled to assets/ and re-encoded: kept, not lost')
+  assert.deepEqual(split.dropped.items.map((item) => item.url), ['https://x.test/f.woff', 'https://x.test/a.css', 'https://x.test/m.png'])
+  assert.match(split.dropped.items[1].reason, /读不到样式表（跨域）/)
+  assert.equal(split.movedToAssets.sample.length, 1, 'one example, not the whole list')
+  assert.equal(reporting.captureSummary([], { dropped: [lostFont, movedFont] }), '0 file(s), 0 bytes total, 1 resource(s) really lost, 1 moved into assets/ (kept, not lost)')
+})
+await ta('the text lists every lost one, one moved example, and no all-clear when a sheet failed', () => {
+  const report = { dropped: [lostFont, movedFont, movedSprite, failedSheet, missingByte], sheetsFailed: 1 }
+  const split = splitOf(report.dropped)
+  const index = {
+    dir: 'D:/cap', count: 0, totalBytes: 0,
+    groups: { html: [], css: [], images: [], fonts: [], other: [] },
+    dropped: split.dropped, movedToAssets: split.movedToAssets, sheetsFailed: 1,
+    dangling: [], suggestedName: 'cap'
+  }
+  const text = reporting.captureText({ dir: 'D:/cap', summary: 'x', index, files: [], report })
+  assert.match(text, /report\.dropped: 3 resource\(s\) really LOST/)
+  assert.match(text, /https:\/\/x\.test\/f\.woff  \[字体 4293380 超 8388608，丢弃\]/)
+  assert.match(text, /https:\/\/x\.test\/m\.png  \[取不到字节，丢弃： （HTTP 404）\]/, 'a 404 is spelled out, with no ceiling note attached')
+  assert.match(text, /report\.movedToAssets: 2 resource\(s\) KEPT .*NOT lost \(e\.g\. 字体 209KB 超 200KB，改存 assets\/font-1\.woff\)/)
+  assert.match(text, /stylesheet\(s\) could NOT be captured \(cross-origin\)/)
+  assert.match(text, /Do not read this line as nothing is wrong/)
+  assert.doesNotMatch(text, /NOTE ON THE CEILINGS/, 'the ceiling note belongs to the create ledger, not here')
+  const clean = reporting.captureText({ dir: 'D:/cap', summary: 'x', index: { ...index, sheetsFailed: 0, dropped: { count: 0, items: [] }, movedToAssets: { count: 0, sample: [] } }, files: [], report: { dropped: [], sheetsFailed: 0 } })
+  assert.match(clean, /references: every url\(\)\/src\/href in the captured documents resolves to a captured file/)
+  assert.doesNotMatch(clean, /could NOT be captured/)
+  assert.match(clean, /report\.dropped: nothing lost/)
+})
 rmSync(home, { recursive: true, force: true })
 
 console.log('\nself-check-uiblock-directive: ' + n + ' assertions passed')

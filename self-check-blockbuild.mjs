@@ -191,7 +191,7 @@ await ta('the rendered report separates "srcset only" from "unreferenced"', asyn
 
 console.log('--- 3. fromDir: a referenced file past the per-file ceiling is skipped, not fatal ---')
 const heavy = material('heavy')
-const bigCss = 'a'.repeat(2 * 1024 * 1024 + 1)
+const bigCss = 'a'.repeat(8 * 1024 * 1024 + 1)
 put(heavy, 'entry.html', '<!doctype html>\n<html><head><link rel="stylesheet" href="./big.css"></head><body>ok</body></html>\n')
 put(heavy, 'big.css', bigCss)
 await ta('big.css is skipped with its exact overage, and the reference is reported back', async () => {
@@ -200,10 +200,13 @@ await ta('big.css is skipped with its exact overage, and the reference is report
   assert.equal(value.skipped.length, 1)
   assert.equal(value.skipped[0].path, 'big.css')
   assert.equal(value.skipped[0].reason, 'over limit')
-  assert.match(value.skipped[0].detail, /1 bytes over the per-file limit 2097152/)
+  assert.match(value.skipped[0].detail, /1 bytes over the per-file limit 8388608/)
   assert.equal(value.referencedSkipped.length, 1)
   assert.match(value.referencedSkipped[0], /entry\.html:2 +\.\/big\.css -> big\.css/)
   assert.ok(existsSync(blockFile('heavy-probe')), 'the block still lands — the page renders without it')
+  const rendered = create.output.render({}, value).map((part) => part.text).join('\n')
+  assert.equal((rendered.match(/NOTE ON THE CEILINGS/g) || []).length, 1, 'one sentence, said once')
+  assert.match(rendered, /DELIBERATE degradation, not a defect/)
 })
 
 console.log('--- 4. fromDir with no entry names the candidates ---')
@@ -266,15 +269,36 @@ await ta('overwrite: true is the in-place path: .bak-<ISO>, bytes kept, one more
   assert.notEqual(live, firstText)
 })
 
+console.log('--- 6b. a big binary inlined in CSS becomes its own assets/ section ---')
+await ta('two stylesheets inlining the same 4 MB font share ONE assets/ section; the small icon stays inline', async () => {
+  const site = material('inline-site')
+  const font = Buffer.alloc(4 * 1024 * 1024, 3).toString('base64')
+  const icon = Buffer.alloc(2 * 1024, 5).toString('base64')
+  const sheet = (who) => '@font-face{font-family:F' + who + ';src:url("data:font/woff2;base64,' + font + '") format("woff2")}'
+    + String.fromCharCode(10) + '.' + who + '{background:url(data:image/png;base64,' + icon + ')}'
+  put(site, 'entry.html', '<!doctype html><html><head><link rel="stylesheet" href="./a/one.css"><link rel="stylesheet" href="./b/two.css"></head><body><div class="pb">inline</div></body></html>')
+  put(site, 'a/one.css', sheet('one'))
+  put(site, 'b/two.css', sheet('two'))
+  const value = await create.execute({ name: 'inline-probe', fromDir: site })
+  const inline = value.files.filter((file) => /assets\/inline-/.test(file.path))
+  assert.equal(inline.length, 1, 'the same payload lands once, not once per stylesheet')
+  assert.equal(inline[0].bytes, 4 * 1024 * 1024)
+  const text = readFileSync(blockFile('inline-probe'), 'utf8')
+  assert.equal((text.match(/data:font/g) || []).length, 0, 'no font stays base64 inside CSS')
+  assert.match(text, /url\("\.\.\/assets\/inline-[0-9a-f]{10}\.woff2"\)/, 'the reference is rewritten relative to the stylesheet')
+  assert.equal((text.match(/data:image\/png/g) || []).length, 2, 'the 2 KB icon stays inline, in both sheets')
+  assert.ok(value.blockBytes < 4 * 1024 * 1024 * 1.4 + 4096, 'one copy of the font, plus text: ' + String(value.blockBytes))
+})
+
 console.log('--- 7. the per-file refusal carries size, limit, difference and the exits ---')
-await ta('a 2 MB + 1 file: the message says how far over and what to do', async () => {
+await ta('an 8 MB + 1 file: the message says how far over and what to do', async () => {
   const over = join(home, 'over.css')
   writeFileSync(over, bigCss)
   await assert.rejects(create.execute({
     name: 'over-probe',
     files: [{ path: 'index.html', content: '<p>x</p>' }, { path: 'big.css', from: over }]
   }), (error) => {
-    assert.match(error.message, /the limit is 2097152 bytes \(per file, 2\.0 MB\)/)
+    assert.match(error.message, /the limit is 8388608 bytes \(per file, 8\.0 MB\)/)
     assert.match(error.message, /1 bytes over/)
     assert.match(error.message, /Three ways out/)
     assert.match(error.message, /limits\.sectionBytes/)
@@ -299,7 +323,7 @@ await ta('unspecified fields keep the documented defaults', async () => {
   mount({ limits: { sectionBytes: 1024 } })
   assert.deepEqual({ ...blockBuild.limits }, { sectionBytes: 1024, blockBytes: 67108864, softWarnBytes: 16777216 })
   mount({})
-  assert.deepEqual({ ...blockBuild.limits }, { sectionBytes: 2097152, blockBytes: 67108864, softWarnBytes: 16777216 })
+  assert.deepEqual({ ...blockBuild.limits }, { sectionBytes: 8388608, blockBytes: 67108864, softWarnBytes: 16777216 })
   mount({ limits: { sectionBytes: -5, blockBytes: 'nope' } })
   assert.deepEqual({ ...blockBuild.limits }, blockBuild.LIMIT_DEFAULTS)
 })

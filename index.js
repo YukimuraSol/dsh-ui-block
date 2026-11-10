@@ -41,10 +41,10 @@
  * @module dsh-ui-block
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, watch, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -128,8 +128,14 @@ const SECTION_RE = /^<!--\s*@@file\s+(\S+?)(\s+base64)?\s*-->\s*$/
  * because a binary section is stored as base64 text: 4/3 of its bytes.
  */
 const LIMIT_DEFAULTS = {
-  /** One file's own bytes, measured on the decoded bytes. */
-  sectionBytes: 2 * 1024 * 1024,
+  /**
+   * One file's own bytes, measured on the decoded bytes. 8 MB, not 2: the campus
+   * page ships two real web fonts (2.28 MB and 4.19 MB) and a 2 MB ceiling
+   * silently dropped both — the stylesheet kept its @font-face, the block had no
+   * file behind it, and the page fell back to a system face. blockBytes is
+   * unchanged, so the block as a whole is still capped; this ceiling is per file.
+   */
+  sectionBytes: 8 * 1024 * 1024,
   /** The whole stored block text, section markers included. */
   blockBytes: 64 * 1024 * 1024,
   /** Not a ceiling: past this a block still writes, with one advisory line. */
@@ -150,13 +156,15 @@ const SECTION_TYPES = {
   woff2: 'font/woff2',
   woff: 'font/woff',
   ttf: 'font/ttf',
+  otf: 'font/otf',
   png: 'image/png',
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
-  webp: 'image/webp'
+  webp: 'image/webp',
+  gif: 'image/gif'
 }
 /** Extensions whose payload is BYTES, not text: those sections are stored base64. */
-const BINARY_EXTENSIONS = new Set(['woff2', 'woff', 'ttf', 'png', 'jpg', 'jpeg', 'webp'])
+const BINARY_EXTENSIONS = new Set(['woff2', 'woff', 'ttf', 'otf', 'png', 'jpg', 'jpeg', 'webp', 'gif'])
 /** The one policy served with the entry document and with every section. */
 const BLOCK_CSP = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'none'; form-action 'none'; base-uri 'none'"
 /** Canvas geometry shared with client.js (asserted equal by self-check.mjs). */
@@ -169,6 +177,17 @@ const DEFAULT_RES = { w: 1440, h: 900 }
  * height (900) is already under it, so only an explicit tall height changes.
  */
 const FIRST_SCREEN_H = 1000
+/**
+ * The inline ceiling for a binary carried INSIDE a stylesheet or a document as a
+ * data: URI: past this it is de-inlined into its own assets/ section.
+ *
+ * base64 costs 4/3, and for a big payload that buys nothing: a 4 MB font inlined
+ * in CSS is 5.3 MB of block text, and it cannot be cached, range-served or
+ * counted against sectionBytes. As its own section the same font costs the block
+ * 5.3 MB of text and the browser one request it can skip. Small icons stay
+ * inline — one request saved is worth 4/3 of 8 KB, not of 4 MB.
+ */
+const ASSET_INLINE_MAX_BYTES = 512 * 1024
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const EDGE_CANDIDATES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -503,6 +522,80 @@ async function walkMaterial(root, rel, out, depth) {
   return out
 }
 
+/** data: mime -> the section extension that can serve it, for the binaries a block carries. */
+const DATA_URI_EXTENSIONS = {
+  'font/woff2': 'woff2',
+  'application/font-woff2': 'woff2',
+  'font/woff': 'woff',
+  'application/font-woff': 'woff',
+  'font/ttf': 'ttf',
+  'application/x-font-ttf': 'ttf',
+  'font/otf': 'otf',
+  'application/x-font-opentype': 'otf',
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif'
+}
+/** One url(data:...) / src="data:..." / href="data:...", with the head and tail kept in the match. */
+const DATA_URL_RE = /(url\(\s*)(['"]?)(data:[^)'"]*)\2(\s*\))/g
+const DATA_ATTR_RE = /((?:src|href|poster)\s*=\s*)(['"])(data:[^'"]*)\2/g
+/**
+ * The path from one block-internal file to another. A stylesheet one level down
+ * reaches its assets with ../assets/, the entry with ./assets/.
+ */
+function assetPathFrom(filePath, assetPath) {
+  const slash = filePath.lastIndexOf('/')
+  const depth = slash < 0 ? 0 : filePath.slice(0, slash).split('/').length
+  return (depth === 0 ? './' : '../'.repeat(depth)) + assetPath
+}
+
+/**
+ * Pull the big base64 binaries out of one text file into their own assets/
+ * sections, and rewrite each reference to a path.
+ *
+ * Returns the rewritten text and the assets it created; a payload already seen
+ * in this directory is reused, so one font inlined by two stylesheets becomes one
+ * section. Anything at or under ASSET_INLINE_MAX_BYTES is left exactly as it was.
+ * @param text - the file body.
+ * @param filePath - its block-internal path, for the relative rewrite.
+ * @param made - payload -> asset path, shared across the directory.
+ * @param assets - output: [{ path, bytes, content, referencedBy }].
+ */
+function deinlineBinaries(text, filePath, made, assets) {
+  if (!text.includes('data:')) return text
+  const swap = (whole, head, quote, uri, tail) => {
+    const comma = uri.indexOf(',')
+    if (comma < 0 || !/;base64$/i.test(uri.slice(0, comma).replace(/\s+$/, ''))) return whole
+    const ext = DATA_URI_EXTENSIONS[uri.slice(5, comma).split(';')[0].trim().toLowerCase()]
+    if (ext === undefined) return whole
+    const payload = uri.slice(comma + 1).replace(/\s+/g, '')
+    const bytes = Buffer.from(payload, 'base64').length
+    if (bytes <= ASSET_INLINE_MAX_BYTES) return whole
+    let asset = made.get(payload)
+    if (asset === undefined) {
+      asset = 'assets/inline-' + createHash('sha1').update(payload).digest('hex').slice(0, 10) + '.' + ext
+      made.set(payload, asset)
+      assets.push({ path: asset, bytes, content: payload, referencedBy: filePath })
+    }
+    return head + quote + assetPathFrom(filePath, asset) + quote + (tail === undefined ? '' : tail)
+  }
+  return text.replace(DATA_URL_RE, swap).replace(DATA_ATTR_RE, swap)
+}
+/**
+ * The reasons a file was left out ON PURPOSE. Everything else (a reference nobody
+ * could resolve, an unknown type) is a real gap and says so without the note below.
+ */
+const BUDGET_REASONS = new Set(['over limit'])
+/**
+ * One sentence, said once, at the end of the list.
+ *
+ * A model reading "over the per-file limit" treats it as a to-do list: measured
+ * once, it fetched 84 files by hand, rewrote the CSS and rebuilt the directory.
+ * The ceiling is a product decision, so the text says so plainly and does not
+ * repeat it on every line.
+ */
+const DEGRADED_TEXT = 'NOTE ON THE CEILINGS: every file above that was left out for a size / budget reason is a DELIBERATE degradation, not a defect — do not fetch, inline or copy those files by hand to "fix" it. The block renders without them: what is missing shows as a placeholder or falls back to the default.'
 /**
  * Turn one material directory into an assembly argument list, doing the picking
  * a caller should not have to do by hand.
@@ -593,13 +686,37 @@ async function collectFromDir(dir, entryHint) {
     }
     accepted.push({ path, from: info.abs, bytes: info.bytes })
   }
+  // De-inline: a data: URI past ASSET_INLINE_MAX_BYTES becomes an assets/ section
+  // of its own, so the same bytes are not carried twice at 4/3 (see the constant).
+  const deinlined = []
+  const made = new Map()
+  for (const file of accepted) {
+    if (!REFERENCE_TEXT_EXTENSIONS.has(extOf(file.path))) continue
+    if (file.bytes > limits.softWarnBytes) continue
+    let text
+    try {
+      text = await readFile(file.from, 'utf8')
+    } catch {
+      continue
+    }
+    if (!text.includes('data:')) continue
+    const next = deinlineBinaries(text, file.path, made, deinlined)
+    if (next === text) continue
+    file.content = next
+    file.from = undefined
+  }
+  const carried = [...accepted, ...deinlined]
   accepted.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   srcsetReferenced.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   return {
     root,
     entryPath,
-    files: [{ path: entryPath, from: found.get(entryPath).abs }, ...accepted.map((file) => ({ path: file.path, from: file.from }))],
-    loaded: [{ path: entryPath, bytes: found.get(entryPath).bytes, from: found.get(entryPath).abs }, ...accepted],
+    files: [{ path: entryPath, from: found.get(entryPath).abs }].concat(carried.map((file) => (file.content === undefined
+      ? { path: file.path, from: file.from }
+      : { path: file.path, content: file.content }))) ,
+    loaded: [{ path: entryPath, bytes: found.get(entryPath).bytes, from: found.get(entryPath).abs }].concat(carried.map((file) => (file.content === undefined
+      ? { path: file.path, bytes: file.bytes, from: file.from }
+      : { path: file.path, bytes: file.bytes, deinlinedFrom: file.referencedBy }))) ,
     skipped,
     srcsetReferenced,
     tolerated: skipped.map((item) => item.path)
@@ -982,36 +1099,89 @@ function positionalChanges(left, right) {
 }
 
 /**
- * Body identity (size|mtime) of the body already in history, per block. The read
- * route already has it from its stat, and one page load asks for the entry AND
- * every section — dozens of requests for the same bytes. Without this each one
- * replayed the whole log. Absent (the tool path) means "record unconditionally".
- */
-const recordedStamps = new Map()
-
-/**
  * Record one observed body. The baseline is stored ONCE; every later change
  * appends one patch line, and both files are capped (see HISTORY_* above).
- * Called from writeBlock and from the read route, so both the tool path and a
- * plain write/edit are covered.
+ *
+ * Two callers and no third: writeBlock (this tool wrote the block) and the
+ * ui-blocks WATCHER (something else did). A READ is not a change — a GET, a
+ * preview, read_ui_block's own render must leave history exactly as it was.
  * @param blockName - validated single-segment name.
  * @param html - body as it is on disk right now.
- * @param stamp - optional '<size>|<mtimeMs>' of that body; a repeat is skipped.
  */
-function recordChange(blockName, html, stamp) {
+function recordChange(blockName, html) {
   const text = String(html == null ? '' : html)
-  if (stamp !== undefined && recordedStamps.get(blockName) === stamp) {
-    return Promise.resolve({ recorded: false, kind: 'unchanged' })
-  }
-  const run = () => recordNow(blockName, text).then((result) => {
-    // Remember only a body history now describes: a skip for "no baseline" or
-    // "too big for history" must stay retryable.
-    if (stamp !== undefined && (result.recorded === true || result.kind === 'same')) recordedStamps.set(blockName, stamp)
-    return result
-  })
+  const run = () => recordNow(blockName, text)
   const next = recordTail.then(run, run)
   recordTail = next.then(() => undefined, () => undefined)
   return next
+}
+
+/**
+ * The change log follows the FILE, not the reader.
+ *
+ * writeBlock covers this tool's own writes; fs.watch covers every other way a
+ * block's bytes can change (the write/edit tools, a shell command, a copy), so a
+ * block's history stays the story of what actually changed on disk while a read
+ * writes nothing. One save can raise several events, so each block is recorded
+ * once, after the writes settle; recordNow compares bodies and appends nothing
+ * when they match.
+ */
+let watcher = null
+let watcherTail = Promise.resolve()
+function watchBlocksDir(ctx) {
+  if (watcher !== null) return
+  const dir = blocksDir()
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    return
+  }
+  try {
+    watcher = watch(dir, { persistent: false }, (_event, filename) => {
+      // Windows keeps firing events for a directory that is gone (a test that
+      // removes its temp home does exactly that), and each one would start a
+      // record. Stop the watcher instead of spinning on nothing.
+      if (!existsSync(dir)) {
+        closeWatcher()
+        return
+      }
+      if (filename === null || filename === undefined) return
+      const name = String(filename)
+      if (!name.endsWith(EXT)) return
+      const blockName = name.slice(0, -EXT.length)
+      if (!NAME_RE.test(blockName)) return
+      queueRecord(ctx, blockName)
+    })
+    // A lost watcher must not take the host down with it: history is bookkeeping.
+    watcher.on('error', () => {
+      closeWatcher()
+    })
+  } catch {
+    closeWatcher()
+  }
+}
+function closeWatcher() {
+  const handle = watcher
+  watcher = null
+  if (handle !== null) {
+    try {
+      handle.close()
+    } catch {
+      // already closed: nothing to do
+    }
+  }
+}
+function queueRecord(ctx, blockName) {
+  const step = async () => {
+    await new Promise((settle) => setTimeout(settle, 150))
+    const target = join(blocksDir(), blockName + EXT)
+    if (!existsSync(target)) return
+    const body = await readFile(target, 'utf8')
+    await recordChange(blockName, body)
+  }
+  watcherTail = watcherTail.then(step, step).then(() => undefined, (error) => {
+    if (ctx !== undefined && ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: change log failed for ' + blockName + ': ' + String(error))
+  })
 }
 
 async function recordNow(blockName, text) {
@@ -1110,7 +1280,6 @@ async function trimHistory() {
     if (body !== null && Buffer.byteLength(body, 'utf8') <= HISTORY_BLOCK_MAX_BYTES) await writeFile(basePath, body, 'utf8')
     await writeFile(logPath, '', 'utf8')
     headCache.delete(name)
-    recordedStamps.delete(name)
     blocks.push({
       name,
       baseBytes,
@@ -2248,14 +2417,50 @@ function pagesText(rows, args) {
   return lines.join('\n')
 }
 
-/** One line a human can read: how many files, how big, what the extension dropped. */
+/** One line a human can read: how many files, how big, what was lost versus kept. */
 function captureSummary(files, report) {
   const total = files.reduce((sum, file) => sum + file.bytes, 0)
-  const dropped = report !== null && typeof report === 'object' ? report.dropped : undefined
-  const droppedText = Array.isArray(dropped)
-    ? String(dropped.length) + ' resource(s) dropped'
-    : typeof dropped === 'number' ? String(dropped) + ' resource(s) dropped' : 'nothing recorded as dropped'
-  return String(files.length) + ' file(s), ' + String(total) + ' bytes total, ' + droppedText
+  const split = splitDropped(report)
+  const lost = split.dropped.count === 0 ? 'nothing lost' : String(split.dropped.count) + ' resource(s) really lost'
+  const kept = split.movedToAssets.count === 0 ? '' : ', ' + String(split.movedToAssets.count) + ' moved into assets/ (kept, not lost)'
+  return String(files.length) + ' file(s), ' + String(total) + ' bytes total, ' + lost + kept
+}
+
+/**
+ * Split the extension's ONE dropped list into what was really lost and what was
+ * safely moved out of the inline budget.
+ *
+ * The extension writes both into the same array of free-form sentences —
+ * "字体 209KB 超 200KB，改存 assets/font-1.woff" next to "取不到字节（HTTP 404）" — so
+ * the split has to read the words it writes. Counting them together reported 40
+ * dropped for a page that had lost 4, and the model then re-captured the page and
+ * read the whole table by hand. ponytail: the ceiling is a reworded sentence; the
+ * upgrade path is a kind field on the item, in extension-capture.
+ */
+const MOVED_REASON_RE = /改存|落\s*assets\/|原尺寸|重编码|moved to assets|spilled/i
+function droppedItemOf(item) {
+  const line = typeof item === 'string'
+    ? item
+    : (item !== null && typeof item === 'object'
+      ? String(item.url === undefined ? (item.src === undefined ? (item.ref === undefined ? JSON.stringify(item) : item.ref) : item.src) : item.url)
+        + (item.reason === undefined && item.why === undefined ? '' : ' ' + String(item.reason === undefined ? item.why : item.reason))
+      : String(item))
+  const found = line.match(/https?:\/\/[^\s]+/)
+  const url = found === null ? '' : found[0]
+  const reason = (url === '' ? line : line.replace(url, '')).replace(/[：:]\s*$/, '').trim()
+  return { url, reason, line }
+}
+function splitDropped(report) {
+  const raw = report !== null && typeof report === 'object' ? report.dropped : undefined
+  if (typeof raw === 'number') return { dropped: { count: raw, items: [] }, movedToAssets: { count: 0, sample: [] } }
+  const lost = []
+  const moved = []
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const parsed = droppedItemOf(item)
+    if (MOVED_REASON_RE.test(parsed.line)) moved.push({ url: parsed.url, reason: parsed.reason })
+    else lost.push({ url: parsed.url, reason: parsed.reason })
+  }
+  return { dropped: { count: lost.length, items: lost }, movedToAssets: { count: moved.length, sample: moved.slice(0, 1) } }
 }
 
 /** The type bucket one captured file belongs to, for the index. */
@@ -2289,17 +2494,14 @@ async function indexMaterial(dir, files, report) {
     groups[materialGroup(file.path)].push({ path: file.path, bytes: file.bytes })
     totalBytes += file.bytes
   }
-  const droppedRaw = report !== null && typeof report === 'object' ? report.dropped : undefined
-  const droppedItems = Array.isArray(droppedRaw)
-    ? droppedRaw.slice(0, 20).map((item) => {
-      if (item === null || typeof item !== 'object') return { url: String(item), reason: '' }
-      return { url: String(item.url === undefined ? (item.src === undefined ? item.ref : item.src) : item.url), reason: String(item.reason === undefined ? item.why : item.reason) }
-    })
-    : []
-  const dropped = {
-    count: Array.isArray(droppedRaw) ? droppedRaw.length : (typeof droppedRaw === 'number' ? droppedRaw : 0),
-    items: droppedItems
-  }
+  const split = splitDropped(report)
+  const dropped = split.dropped
+  const movedToAssets = split.movedToAssets
+  // A stylesheet the extension could not read (cross-origin) takes its whole
+  // <link> with it, so the dangling scan below looks clean by construction.
+  const sheetsFailed = report !== null && typeof report === 'object' && Number.isFinite(Number(report.sheetsFailed))
+    ? Number(report.sheetsFailed)
+    : 0
   // Dangling: read the text members (capped) and resolve every reference. A
   // capture of a real page is 100+ files, so the read is bounded on purpose.
   const dangling = []
@@ -2325,6 +2527,8 @@ async function indexMaterial(dir, files, report) {
     totalBytes,
     groups,
     dropped,
+    movedToAssets,
+    sheetsFailed,
     dangling,
     /** What create_ui_block needs: the directory itself is the whole material set. */
     fromDir: dir,
@@ -2356,13 +2560,25 @@ function captureText(value) {
       lines.push('  ' + key + ': ' + bucket.map((file) => file.path + ' ' + String(file.bytes)).join(', '))
     }
     if (index.dropped.count > 0) {
-      lines.push('  report.dropped: ' + String(index.dropped.count) + ' resource(s)'
-        + (index.dropped.items.length === 0 ? '' : ' — ' + index.dropped.items.slice(0, 8).map((item) => (item.url === '' ? '(no url)' : item.url) + (item.reason === '' ? '' : ' [' + item.reason + ']')).join('; ')))
+      // Every lost one, in full: a lost resource is a defect to report, and a count
+      // with eight samples is what sent a model off to re-capture the whole page.
+      lines.push('  report.dropped: ' + String(index.dropped.count) + ' resource(s) really LOST (not fetched, over a ceiling, or unreadable) — hand-fetching them is not the fix:')
+      for (const item of index.dropped.items) lines.push('    ' + (item.url === '' ? '(no url)' : item.url) + (item.reason === '' ? '' : '  [' + item.reason + ']'))
     } else {
-      lines.push('  report.dropped: nothing')
+      lines.push('  report.dropped: nothing lost')
+    }
+    if (index.movedToAssets !== undefined && index.movedToAssets.count > 0) {
+      const kept = index.movedToAssets.sample[0]
+      lines.push('  report.movedToAssets: ' + String(index.movedToAssets.count) + ' resource(s) KEPT — stored under assets/ instead of inlined, NOT lost'
+        + (kept === undefined ? '' : ' (e.g. ' + kept.reason + ')'))
     }
     if (index.dangling.length === 0) {
-      lines.push('  references: every url()/src/href in the captured documents resolves to a captured file')
+      // "Everything resolves" is only true of the documents that were captured:
+      // a cross-origin stylesheet never arrived, so its whole <link> is gone and the
+      // scan is clean by construction. Saying "all clear" here is the expensive lie.
+      lines.push(index.sheetsFailed > 0
+        ? '  references: every url()/src/href inside the CAPTURED documents resolves — but ' + String(index.sheetsFailed) + ' stylesheet(s) could NOT be captured (cross-origin), and a missing <link> takes all its rules with it: the layout may be missing chunks. Build it, then RENDER it and look. Do not read this line as nothing is wrong.'
+        : '  references: every url()/src/href in the captured documents resolves to a captured file')
     } else {
       lines.push('  DANGLING — referenced but not captured (' + String(index.dangling.length) + '), these 404 if you build the block as-is:')
       for (const row of index.dangling.slice(0, 20)) lines.push('    ' + row.where + ':' + String(row.line) + '  ' + row.ref + ' -> ' + row.path)
@@ -2447,6 +2663,8 @@ export function apply(ctx, config) {
   applyAgentConfig(config)
   // limits is a SIBLING of agent: the ceilings are not a switch, they are sizes.
   applyLimitsConfig(config)
+  // History follows the file, never the reader: install the watcher once.
+  watchBlocksDir(ctx)
   // registry is a third sibling. enabled:false turns the whole 登记台 off for
   // this instance — the self-check uses it so a test run never fights a running
   // instance over the fixed port.
@@ -2553,6 +2771,9 @@ export function apply(ctx, config) {
           + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
           + (Array.isArray(value.skipped) && value.skipped.length > 0
             ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + (item.via === 'srcset' ? '; referenced via srcset' : '') + ')').join('\n')
+            : '')
+          + (Array.isArray(value.skipped) && value.skipped.some((item) => BUDGET_REASONS.has(item.reason))
+            ? '\n' + DEGRADED_TEXT
             : '')
           + (Array.isArray(value.referencedSkipped) && value.referencedSkipped.length > 0
             ? '\nReferenced but skipped — those 404 inside the block, the page still renders:\n' + value.referencedSkipped.map((line) => '  - ' + line).join('\n')
@@ -2874,12 +3095,12 @@ export function apply(ctx, config) {
             }
           },
           report: { type: 'json', required: true, description: 'report.json exactly as written: the extension report plus a "capture" section of our bookkeeping. Nothing is trimmed.' },
-          summary: { type: 'string', required: true, description: 'One line for humans: file count, total bytes, how many resources the extension dropped.' },
+          summary: { type: 'string', required: true, description: 'One line for humans: file count, total bytes, how many resources were really lost, and how many were kept by moving them into assets/.' },
           fromDir: { type: 'string', required: true, description: 'The directory to hand create_ui_block as fromDir — the whole material set becomes a block in one call.' },
           index: {
             type: 'json',
             required: true,
-            description: 'The material index: files grouped by type (html/css/images/fonts/other) with bytes, the totals, report.dropped summarised, and "dangling" — every reference the captured documents make to something that was NOT captured (where, line, ref, resolved path).'
+            description: 'The material index: files grouped by type (html/css/images/fonts/other) with bytes, the totals, report.dropped split into really-lost versus moved-to-assets (dropped / movedToAssets), sheetsFailed (stylesheets that could not be read), and "dangling" — every reference the captured documents make to something that was NOT captured (where, line, ref, resolved path).'
           }
         }
       },
@@ -2970,13 +3191,8 @@ export function apply(ctx, config) {
           }
           const info = await stat(target)
           const body = await readFile(target, 'utf8')
-          // Reading is a write path too: a block edited through write/edit (or a
-          // shell command) never passes writeBlock, so its change is logged here.
-          try {
-            await recordChange(blockName, body, String(info.size) + '|' + String(info.mtimeMs))
-          } catch (error) {
-            if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: change log failed for ' + blockName + ': ' + String(error))
-          }
+          // A read writes nothing, history included: the watcher records the
+          // changes, so opening a block (or its 89 sections) leaves the log alone.
           // ?pin=<chat node key>&i=<n>  -> the moment that message was first seen
           // ?at=<epoch ms>              -> an explicit moment
           // neither                     -> the newest body (unchanged behaviour)
@@ -3377,6 +3593,29 @@ export const rendering = {
   DEFAULT_RES,
   FIRST_SCREEN_H
 }
+/**
+ * The capture ledger as text, so the two honesty rules are assertable without a
+ * browser: what was really lost versus kept, and whether the "references" line
+ * is allowed to say everything is fine.
+ */
+export const reporting = {
+  splitDropped,
+  droppedItemOf,
+  captureSummary,
+  captureText,
+  indexMaterial,
+  MOVED_REASON_RE,
+  DEGRADED_TEXT,
+  BUDGET_REASONS
+}
+/** The fromDir side: the de-inline rule is pure text handling, worth its own assertions. */
+export const materialRules = {
+  deinlineBinaries,
+  assetPathFrom,
+  ASSET_INLINE_MAX_BYTES,
+  DATA_URI_EXTENSIONS,
+  LIMIT_DEFAULTS
+}
 export const instanceRegistry = {
   createRegistry,
   createRegistryClient,
@@ -3410,6 +3649,8 @@ export const timeline = {
   pinsFile,
   resetPinsCache: () => { pinsCache = null },
   trimHistory,
+  /** Test hook: wait until the ui-blocks watcher has recorded everything it saw. */
+  settleHistory: () => watcherTail.then(() => undefined, () => undefined),
   freeNamePath,
   captureDirFor,
   HISTORY_LOG_MAX_BYTES,
