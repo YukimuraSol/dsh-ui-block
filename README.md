@@ -113,6 +113,29 @@ dsh-ui res=1440x900 h=760 title=首页 · 改版 (非对称 · 分级卡片)
 - ~~`html` 别名~~：**v0.3.0 已删除**（语料实测 0 次使用）。现在 ```html` + `<div>` 的普通 HTML 示例**不渲染**。
 - **旧写法（首行没有 `dsh-ui` 前缀）一律不渲染**，只留一条 `missing-dsh-ui-prefix` warn。
 
+### 分段与虚拟文件（2026-11-04）
+
+一个 `.uiblock` 可以同时是**入口 + 若干虚拟文件**。分隔符是**独占一行**的 `<!-- @@file <路径> -->`（二进制资源写成 `<!-- @@file <路径> base64 -->`，段体是 base64）：
+
+```text
+<!doctype html><html><head><link rel="stylesheet" href="./panel.css"></head><body>…</body></html>
+<!-- @@file panel.css -->
+@font-face{font-family:Demo;src:url(./f.woff2) format('woff2')}
+.card{background:var(--dsw-alias-bg-layer-1)}
+<!-- @@file logo.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">…</svg>
+<!-- @@file f.woff2 base64 -->
+d09GMgABAAAAA…
+```
+
+- **为什么要有它**：srcdoc 文档的 URL 是 `about:srcdoc`，相对路径无处可解，块里引用不了任何别的文件。分段把每一段变成**真有地址**的虚拟文件。
+- **三条路由**（都在 `/ui-blocks` 前缀下）：`/ui-blocks/<name>.uiblock` = 原文（复制按钮、`?at=`、`?pin=` 全走它，行为不变）；`/ui-blocks/<name>` = 入口段，`text/html`；`/ui-blocks/<name>/<路径>` = 该段，按扩展名给 content-type。
+- **段路径守卫**：不得含 `..`、不得以 `/` 开头、不得为空（404）；扩展名白名单 `css svg json woff2 woff ttf png jpg jpeg webp`，其它一律 **415**；允许子目录（`img/logo.svg`），因为相对路径按"段所在的 URL"解析。
+- **上限**：单段 256 KB、整文件 2 MB，超了 **413**。版本历史是整文件行级补丁链，大 base64 段会让每次改动记录变肥 —— 这是硬上限，不是建议。
+- **响应头**（入口与每一段都带）：`default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'none'; base-uri 'none'`。**唯一放宽的是同源样式/图片/字体**，`script-src` 仍是 `'none'`，sandbox 仍只有 `allow-same-origin`。
+- **没有分段标记的块一个字节都不变**：`splitSections()` 返回空 `files` ⇒ 客户端仍走 `srcdoc`，`buildSrcdoc()` 的输出与改动前逐字节相同。
+- **`?at=` 对 CSS 同样生效**：段是从"那一刻的文件内容"里解析出来的，所以入口与它的样式表永远是同一个版本。
+
 ## 画布内选区（v0.4.0）
 
 ### 按钮
@@ -175,6 +198,24 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 - `«` / `»` / 反斜杠按 element-picker 的规则转义，保证第一个裸闭合书名号永远是 token 结尾。
 - **Styles 行已删**（与 element-picker 同步，token 现在是 3 行）。
 
+## 演示块：宿主驱动的时间轴（2026-11-09，路线 1）
+
+**效果：** 块文件里多一份 `<!-- @@file demo.json -->` 段（内容是 `{ snapshots, timeline }`）时，这个块变成**演示块**：块本身仍是纯数据（沙箱不变、帧仍 `pointer-events:none`），由插件在外层把时间轴演给块看——光标、高亮、合成点击、切页（换快照）、逐字输入都由宿主完成。
+1. 判据只有一条：块文件里存在可解析的 `demo.json` 段，且 `snapshots` 非空、`timeline.steps` 非空。不带这段的块走原来的 srcdoc 路径，**不建任何新 DOM、不起 rAF、不加控件**。
+2. `demo.json` 解析失败 → `console.warn` 一条并退回静态显示；`steps` 为空 → 同样退回静态。**不会白屏。**
+3. 时间轴没写 `loop` 时**默认循环**（`loop !== false`）；播到末尾回到第一份快照，不会停在末帧。
+4. 快照写 `url:pages/home/index.html` 这类相对块根的路径，插件按块自身的服务目录解析；空块 → 静态。
+5. 播放层是 `<div class="dshpb-stage">`（绝对定位，几何与画布帧逐帧同步，`pointer-events:none`），里面挂 vendored 播放器；块自己的 frame 在演示块里 `display:none`。
+6. 工具条：`播放 / 暂停 / 重新开始` 三个按钮，复用 `dshpb-ctl` + `dshpb-btn`，放在 banner 的**标题侧**——实测放在右侧动作组里会把 `1440×900 / 选取元素` 左移 162px，所以不放那儿。静态块的 banner 一个字节不变。
+7. 进入可视区自动播放、离开暂停、回来继续（`IntersectionObserver`）；用户点过"暂停"后，滚进滚出不会自己恢复。
+8. 选取元素（pick）与播放互斥：`armPick` 时暂停播放并记住状态，`disarmPick` 后恢复；`frame.pointerEvents` 的置位/复位逻辑未改。
+9. 宿主侧新增一种 section 类型 `html`（`index.js` 的 `SECTION_TYPES`）：多页快照的 `pages/*.html` 需要能当 section 服务（原来只允许 ENTRY 是 `.html`，其余一律 415）。路径校验不变（`..` / 前导 `/` / 反斜杠 / NUL 全部拒），每个 section 仍带 `script-src 'none'` 的 CSP。
+10. 新增测试接缝 `__dshPageBlock.demos.{count,state,play,pause,restart}(index)`，`sweep().live[]` 多一个 `demo` 字段。
+
+**锚点：** `client.js` 的 `readDemo / blockSections / paintDemo / ensureStage / armAutoplay / buildTransport / demoSet / demoInfoOf`；`player.mjs`（从 ui-snapshot 复制、独立维护，`self-check-player-vendor.mjs` 断言它与 client.js 里的 `[vendored-player]` 段逐字一致）；`index.js` 的 `SECTION_TYPES.html`。
+
+**验：** `node self-check-player-vendor.mjs`；CDP 用 `demos.state()` 读 `t/snapshot`，点 `[data-dshpb-demo=pause]` 后两帧哈希应相同。
+
 ## 沙箱（v0.4.0 变更）
 
 - `sandbox="allow-same-origin"`：**只有** `allow-same-origin`，**绝不**加 `allow-scripts`（两者同时 = 沙箱失效，规范明示）。
@@ -183,7 +224,7 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
   - **没有放开的**：`<script>` **仍不执行**（`window.__ran === undefined`，实测）；CSP 仍生效（外链 `<img>` `naturalWidth === 0`，实测）；iframe 读父页面仍失败。三条都在 `tmp\dshui-canvas-picker-20261010` 的验证里逐条断言过。
 - 旧值 `sandbox=""`（v0.3.0 及以前）**已不再使用**。
 - srcdoc 里 CSP `default-src none; style-src unsafe-inline; img-src data: blob:; font-src data:; media-src data:; form-action none; base-uri none`，`referrerpolicy="no-referrer"`。
-- 主题令牌：读宿主 `document.body` / `documentElement` 上的全部 `--dsw-*`（0.1.7 时 384 个，0.2.0-rc.2 实测 413 个）注入 srcdoc 的 `:root`，并写 `color-scheme`。主题切换后 1.5s 内自动重绘（已验证：不刷新页面，深→浅会自己重绘）。
+- 主题令牌：读宿主 `document.body` / `documentElement` 上的全部 `--dsw-*`（0.1.7 时 384 个，0.2.0-rc.2 实测 413 个）。**两条注入路径**：srcdoc 块照旧在 `buildSrcdoc()` 里内联进 `:root`；分段块（URL 文档）由父页面在 `load` 之后写进同源的 `contentDocument`，一个 `<style id="dshpb-tokens">` 插在 `head` **最前面**（块的样式表要能盖住 `BASE_CSS`）。两条都写 `color-scheme`；主题切换后 1.5s 内自动重绘（srcdoc 块重建文档，URL 块只重写那张 `<style>`，不重新导航、不闪白）。
 
 ## 素材抓取脚本怎么跑（tools/）
 
@@ -270,3 +311,7 @@ node tools\capture.mjs --url "http://127.0.0.1:3080/?token=<token>" --out out\sn
 - **选区依赖同源**：`sandbox` 去掉 `allow-same-origin` 会让选区整体失效（`contentDocument` 变 `null`，会提示"画布还没准备好"）。
 - 计划卡片内的块走同一套 primitives，预期同样生效，但**本次未单独验证**（试点范围是聊天消息）。
 - 交互回流（点击经 HTTP 桥 `agent.steer`）是计划的阶段 L，本次未做。**沙箱自 v0.4.0 起是 `allow-same-origin`**（见「沙箱」节）。
+- **分段块仍无脚本**（2026-11-04）：`script-src 'none'` + sandbox 没有 `allow-scripts`，分段只解锁"同源可读样式/字体/图片"这一件事；要交互还得走阶段 L。
+- **分段块不能引外网**：`img-src` / `font-src` 只含 `'self' data: blob:`，`https://…` 的图与字会被 CSP 拦掉并在控制台报错——这是刻意的，不是待修的 bug。
+- **跨源即失去选区**：分段块是**同源文档**（`/ui-blocks/<name>` 与页面同源），所以选区照旧可用；若哪天把 `src=` 指向别的主机或本地 dev server，`contentDocument` 就是 `null`，选区整体失效——这也是计划里"不做 `src=` 指向 dev server"的一半原因。
+- **大 base64 段让历史变肥**：版本历史是行级补丁，一次大段改动就是一条大补丁，单段 256 KB 的上限就是兜住它。本轮未单独给 `recordNow()` 计时；若哪天真超 100 ms，就加"超过 128 KB 的段不进历史、只留最新"的规则。
