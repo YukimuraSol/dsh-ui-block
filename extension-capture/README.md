@@ -127,7 +127,7 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 
 ## 三个坑怎么处理
 
-1. **后台标签偷懒**：先 `chrome.tabs.update(tabId,{active:true})` + 窗口置前，等 300ms 再注入；切不动就回 `该页在后台且拒绝激活，请手动切过去`。
+1. **后台标签偷懒**：先 `chrome.tabs.update(tabId,{active:true})`（只在本窗口内切标签，**不置前窗口**，否则抢用户焦点），等 300ms 再注入；抓前记下本窗口原本 active 的 tab，抓完切回。切不过去也照抓，只有页面确实 `hidden` 时才在 report 里记 `hiddenTab: true`。
 2. **标签被关掉**：`chrome.tabs.get` 失败 → `目标已消失，请重新 list_pages`，不猜替代品。
 3. **永远抓不到的页**：`chrome://` / 扩展页 / 扩展商店 / 内嵌 PDF → 清单里 `capturable:false` + `reason`，任务阶段再挡一次。
 

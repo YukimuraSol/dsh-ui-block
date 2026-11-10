@@ -26,6 +26,11 @@ const TAB_B = { id: 12, url: 'https://example.test/b', title: 'B', windowId: 1, 
 /** 假 chrome：行为对齐 MV3 里用到的那些 API，storage 用外部传入的 Map（跨"重启"复用）。 */
 function makeChrome(store, env) {
   const listeners = { message: [], storageChanged: [] }
+  // 现场账：tabs.update 调用按顺序记下来（env.activeTabId 就是"此刻哪个 tab 是 active"），
+  // windows.update 单独记——抓取流程一次都不许调它（那是抢焦点的唯一来源）。
+  env.tabUpdates = env.tabUpdates || []
+  env.windowUpdates = env.windowUpdates || []
+  const log = function (line) { if (env.order) env.order.push(line) }
   const api = {
     storage: {
       local: {
@@ -65,19 +70,37 @@ function makeChrome(store, env) {
       setBadgeText(o) { env.badge = String(o && o.text || '') },
       setBadgeBackgroundColor() {}
     },
-    windows: { async getLastFocused() { return { id: 1 } }, async update() {} },
+    windows: {
+      async getLastFocused() { return { id: 1 } },
+      async get(id) { return { id: id, focused: !!env.windowFocused } },
+      async update(id, props) { env.windowUpdates.push({ id: id, props: Object.assign({}, props) }); return { id: id } }
+    },
     tabs: {
-      async query() { return [TAB_A, TAB_B] },
+      async query(filter) {
+        const rows = [TAB_A, TAB_B].filter(function (t) {
+          if (!filter || typeof filter !== 'object') return true
+          if (filter.windowId !== undefined && t.windowId !== filter.windowId) return false
+          if (filter.active !== undefined && (t.id === env.activeTabId) !== !!filter.active) return false
+          return true
+        })
+        return rows
+      },
       async get(id) {
         const tab = [TAB_A, TAB_B].find((t) => t.id === id)
         if (!tab) throw new Error('No tab with id: ' + id)
         return tab
       },
-      async update() {}
+      async update(id, props) {
+        env.tabUpdates.push({ id: id, props: Object.assign({}, props) })
+        log('tabs.update:' + id + (props && props.active ? ' active' : ''))
+        if (props && props.active) env.activeTabId = id
+        return Object.assign({}, [TAB_A, TAB_B].find((t) => t.id === id) || { id: id }, props)
+      }
     },
     scripting: {
       async executeScript(options) {
         if (options && options.files) return []
+        log('extract')
         return [{ result: { files: [{ path: 'entry.html', content: '<html></html>', bytes: 13, base64: false }], report: { bytes: 13, files: [], dropped: [] } } }]
       }
     }
@@ -133,7 +156,9 @@ function json(res, status, body) {
 export async function runHubChecks(assert) {
   const store = new Map()
   const registryHits = []
-  const instanceA = { polls: [], results: [], queue: [{ id: 't-A1', tabId: 11 }] }
+  // order 是「谁先谁后」的共享账：假 chrome 的 tabs.update 与下面的 /result 各记一笔，
+  // 用来证明"结果送回之后才切回原 tab"。
+  const instanceA = { polls: [], results: [], queue: [{ id: 't-A1', tabId: 11 }], order: [] }
   const instanceB = { polls: [], results: [], queue: [] }
 
   const registry = await startServer(async function (req, res) {
@@ -161,6 +186,7 @@ export async function runHubChecks(assert) {
     if (url.pathname.endsWith('/result')) {
       const body = await readBody(req)
       instanceA.results.push({ body })
+      instanceA.order.push('result:' + String(body && body.taskId))
       json(res, 200, { ok: true, dir: 'out/fake-a' })
       return
     }
@@ -307,6 +333,48 @@ export async function runHubChecks(assert) {
       miss.matched === 'fallback' && Array.isArray(miss.candidates) && miss.candidates.length === 2,
     'matched=' + [noSlash.matched, withSlash.matched, withHash.matched, miss.matched].join('/') +
       '；归一化后 want=' + noSlash.want + '；fallback candidates=' + JSON.stringify(miss.candidates.map(function (c) { return c.url })))
+
+  // ---- 7. 不抢焦点：源码里没有窗口置前 ------------------------------------
+  // 用户的窗口被提到前台、焦点被抢走，"唯一来源"就是抓之前那次窗口置前。
+  // 这里用正则源码扫描（而不是跑一遍）钉住：这两个东西不许再出现。
+  const bgSrc = readFileSync(path.join(HERE, 'background.js'), 'utf8')
+  const hitsWindowUpdate = /chrome\s*\.\s*windows\s*\.\s*update/.test(bgSrc)
+  const hitsFocusedTrue = /\bfocused\s*:\s*true\b/.test(bgSrc)
+  assert('ext-no-focus：background.js 里不出现 chrome.windows.update，也不出现 focused 置真（不抢用户焦点）',
+    !hitsWindowUpdate && !hitsFocusedTrue,
+    'chrome.windows.update ' + (hitsWindowUpdate ? '命中' : '0 处') + '；focused 置真 ' + (hitsFocusedTrue ? '命中' : '0 处') +
+      '；' + bgSrc.split('\n').length + ' 行源码')
+
+  // ---- 8. 现场三段：记原 active → 激活 → 抓 → finally 恢复 ----------------
+  const hasRestoreFn = /async function restoreActiveTab\s*\(/.test(bgSrc)
+  const iRemember = bgSrc.indexOf('await activeTabOf(')
+  const iActivate = bgSrc.indexOf('chrome.tabs.update(tabId, { active: true })')
+  const iRestore = bgSrc.indexOf('await restoreActiveTab(')
+  const restoreInFinally = /finally\s*\{[^}]*restoreActiveTab\(/s.test(bgSrc)
+  assert('ext-restore-source：有 restoreActiveTab()，且顺序是「记原 active → 切目标 → 抓 → finally 恢复」（失败也恢复）',
+    hasRestoreFn && restoreInFinally && iRemember >= 0 && iActivate > iRemember && iRestore > iActivate,
+    '函数 restoreActiveTab ' + (hasRestoreFn ? '在' : '缺') + '；在 finally 里 ' + (restoreInFinally ? '是' : '否') +
+      '；下标 记=' + iRemember + ' 切=' + iActivate + ' 恢复=' + iRestore)
+
+  // ---- 9. 假 chrome 桩：抓完真的把原 tab 切回，且全程不碰窗口焦点 --------
+  const envR = { badge: '', activeTabId: 11, order: instanceA.order }   // 原本 11(A) 是 active，任务抓 12(B)
+  const storeR = new Map([['baseUrl', 'http://127.0.0.1:' + aPort]])
+  const fakeR = makeChrome(storeR, envR)
+  instanceA.queue.push({ id: 't-restore', tabId: 12 })
+  const tickR = loadBackground(fakeR.api)
+  await tickR()
+  const seqR = envR.tabUpdates.map(function (row) { return row.id + (row.props && row.props.active ? '→active' : '') })
+  const lastResultR = instanceA.results[instanceA.results.length - 1]
+  const iActR = instanceA.order.indexOf('tabs.update:12 active')
+  const iExtractR = instanceA.order.indexOf('extract')
+  const iRestoreR = instanceA.order.indexOf('tabs.update:11 active')
+  assert('ext-restore（假 chrome 桩）：抓完把原 active tab 切回（顺序 激活→抽取→切回），窗口 update 一次都没调',
+    seqR.length === 2 && seqR[0] === '12→active' && seqR[1] === '11→active' &&
+      envR.windowUpdates.length === 0 && !!lastResultR && lastResultR.body.ok === true &&
+      lastResultR.body.taskId === 't-restore' && iActR >= 0 && iActR < iExtractR && iExtractR < iRestoreR,
+    'tabs.update 顺序 ' + JSON.stringify(seqR) + '；windows.update ' + envR.windowUpdates.length + ' 次' +
+      '；调用顺序 ' + JSON.stringify(instanceA.order.filter(function (l) { return /^(extract|tabs\.update)/.test(l) })) +
+      '；ok=' + String(lastResultR && lastResultR.body.ok))
 
   try { a.server.close() } catch (e) {}
   try { b.server.close() } catch (e) {}

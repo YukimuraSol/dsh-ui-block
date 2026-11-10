@@ -407,6 +407,24 @@ async function sendResult(taskId, payload, row) {
   return r.json
 }
 
+// ---- 现场：本窗口里原本 active 的 tab --------------------------------------
+// 只记同一个窗口里的 active tab。恢复时也只切标签、不碰窗口焦点（窗口由用户自己管）。
+async function activeTabOf(windowId) {
+  try {
+    const rows = await chrome.tabs.query({ windowId: windowId, active: true })
+    const hit = rows && rows[0]
+    return hit && typeof hit.id === 'number' ? hit.id : -1
+  } catch (e) {
+    return -1
+  }
+}
+
+// 抓完把现场还回去。原 tab 已经不存在（或本来就是目标）就跳过，不报错。
+async function restoreActiveTab(prevTabId, selfTabId) {
+  if (typeof prevTabId !== 'number' || prevTabId < 0 || prevTabId === selfTabId) return
+  try { await chrome.tabs.update(prevTabId, { active: true }) } catch (e) {}
+}
+
 async function runTask(task, row) {
   keepAlive(true)
   try { return await runTaskBody(task, row) } finally { keepAlive(false) }
@@ -424,35 +442,49 @@ async function runTaskBody(task, row) {
   const c = capturable(tab)
   if (!c.ok) return sendResult(task.id, { ok: false, error: '该页抓不了：' + c.reason }, row)
 
-  // 坑 1：后台标签会偷懒（不在前台时不渲染/延迟加载），先切到前台再等 300ms
+  // 坑 1：后台标签会偷懒（不在前台时不渲染/延迟加载），先在本窗口内切到前台再等 300ms。
+  // 只切标签、不置前窗口：窗口置前是抢用户焦点的唯一来源。抓之前记下本窗口原本 active
+  // 的 tab，抓完（成功失败都算）切回去；原 tab 已经没了就跳过。
+  const prevActive = await activeTabOf(tab.windowId)
   try {
-    await chrome.tabs.update(tabId, { active: true })
-    try { await chrome.windows.update(tab.windowId, { focused: true }) } catch (e) {}
-    await sleep(ACTIVATE_WAIT_MS)
-    badge('..', '#b45309')
-  } catch (e) {
-    return sendResult(task.id, { ok: false, error: '该页在后台且拒绝激活，请手动切过去：' + String(e && e.message || e) }, row)
+    try {
+      await chrome.tabs.update(tabId, { active: true })
+      await sleep(ACTIVATE_WAIT_MS)
+      badge('..', '#b45309')
+    } catch (e) {
+      // 切不过去也照抓：多数页面 DOM 已经在。真因 hidden 抓不全的话，由
+      // report.hiddenTab 记一笔说明情况；不要求用户手动切过去。
+      log('activate failed, capture anyway: ' + String(e && e.message || e))
+    }
+
+    const opts = { origin: String(tab.url || ''), title: String(tab.title || '') }
+    if (task.includes) opts.includes = String(task.includes)
+    if (task.maxBytes) opts.maxBytes = Number(task.maxBytes)
+
+    let out
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['extractor.js'] })
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        func: function (o) {
+          var out = globalThis.dshPageCapture.extract(document, o)
+          // 页面确实处于 hidden（切不过去）→ 抓取可能不全，记一笔；抽取的内容一律不动
+          if (out && out.report && document.visibilityState === 'hidden') out.report.hiddenTab = true
+          return out
+        },
+        args: [opts]
+      })
+      out = res && res[0] ? res[0].result : null
+      if (!out || !out.files) throw new Error('抽取函数没有返回 files（页面可能禁止注入）')
+    } catch (e) {
+      return sendResult(task.id, { ok: false, error: '抓取失败：' + String(e && e.message || e) }, row)
+    }
+
+    return sendResult(task.id, { ok: true, files: out.files, report: out.report }, row)
+  } finally {
+    // 结果送回去之后把现场还回去：切回原来那个 tab，不动窗口焦点。
+    await restoreActiveTab(prevActive, tabId)
   }
-
-  const opts = { origin: String(tab.url || ''), title: String(tab.title || '') }
-  if (task.includes) opts.includes = String(task.includes)
-  if (task.maxBytes) opts.maxBytes = Number(task.maxBytes)
-
-  let out
-  try {
-    await chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['extractor.js'] })
-    const res = await chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      func: function (o) { return globalThis.dshPageCapture.extract(document, o) },
-      args: [opts]
-    })
-    out = res && res[0] ? res[0].result : null
-    if (!out || !out.files) throw new Error('抽取函数没有返回 files（页面可能禁止注入）')
-  } catch (e) {
-    return sendResult(task.id, { ok: false, error: '抓取失败：' + String(e && e.message || e) }, row)
-  }
-
-  return sendResult(task.id, { ok: true, files: out.files, report: out.report }, row)
 }
 
 async function tick() {
