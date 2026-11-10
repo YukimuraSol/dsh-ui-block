@@ -1175,15 +1175,17 @@ const READ_DESCRIPTION = [
 const LIST_DESCRIPTION = [
   'List the web pages a browser extension is reporting to this DSH instance right now, so a capture targets a page that exists instead of a URL someone guessed.',
   '',
+  'THE PAGE HAS TO BE OPEN FIRST. The extension reports open tabs, so the page must already be open in a browser that has dsh-page-capture installed: prefer a headless Chrome this agent starts itself with --load-extension=<captureDir> (captureDir comes from GET /ui-block-extension/info), and fall back to the user\'s own browser when the page will not open there. The list is the same either way.',
+  '',
   'Call this first, then capture_page with one row\'s { instance, tabId }: a tab id is unique only inside one instance, so the pair is the identity. url and title say what the page is, focused says whether it is the active tab, and capturable:false carries the reason that tab can never be captured (a chrome:// page, the extension store, an extension page, an embedded PDF).',
   '',
-  'The list is only what the extension last reported: a tab it cannot see is absent, never guessed. A report more than 10 minutes old is marked stale on its rows, because a tab closed since then is still listed — refresh by calling again once the extension has polled (it polls every couple of seconds). An empty list means nothing is connected, and the result then says what to check.'
+  'The list is only what the extension last reported: a tab it cannot see is absent, never guessed. A report more than 10 minutes old is marked stale on its rows, because a tab closed since then is still listed — refresh by calling again once the extension has polled (it polls every couple of seconds). An empty list means nothing is connected, and the result then says what to check, including the extension\'s absolute path and this instance\'s address.'
 ].join('\n')
 
 const CAPTURE_DESCRIPTION = [
   'Capture one web page — a row from list_pages, given as { instance, tabId } — into a material directory, and hand back a file list that create_ui_block can load straight off disk, so no page content has to pass through this conversation.',
   '',
-  'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer, and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
+  'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer (60 seconds; a tab closed or navigated since list_pages fails here, and a timeout means the extension never answered — either way call list_pages again instead of retrying the same tabId), and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
   '',
   'files[].from is the ABSOLUTE path of each file on disk. Pass those strings as create_ui_block\'s files[].from and the host copies the bytes itself: a few hundred KB of material then costs no context at all. Read a file only when the caller asked to change its content.',
   '',
@@ -1532,12 +1534,17 @@ function pagesText(rows, args) {
     lines.push('', 'Last requests this endpoint saw (newest last): ' + recent.map((entry) => shortTime(entry.at) + ' ' + entry.kind
       + (entry.instance === '' || entry.instance === undefined ? '' : ' instance=' + entry.instance) + ' -> ' + entry.outcome).join('; '))
   }
+  // The extension's directory is derived, never a literal: the same string the
+  // info route and the plugin page hand out, so the advice below cannot drift.
+  let capturePath = ''
+  try { capturePath = extensionDir(EXTENSION_CAPTURE_DIR_NAME) } catch (error) { capturePath = 'the extension-capture folder inside this plugin package' }
   lines.push('', 'Check these in order:')
-  lines.push('1. Is the capture extension installed? chrome://extensions must list dsh-page-capture. Its install path and the three loading steps are on this plugin\'s page under Settings -> Plugins -> dsh-ui-block.')
-  lines.push('2. Does its options page point baseURL at ' + instancePortText() + '? The extension is installed once and reports to whichever instance that baseURL names, so pointing it at the other instance makes this list empty while the other one fills up.')
-  lines.push('3. Is the extension\'s own reporting switch on? With it off the extension sends nothing at all — not even a poll — so nothing here can see it.')
-  lines.push('4. Are the plugin\'s agent switches on (agent.enabled)? Off, both endpoints answer 404 and the extension gives up. The request trail above says whether anything arrived at all: no line at all means the request never reached this instance.')
-  lines.push('5. Even when connected, some pages never reach the list: chrome:// pages, extension pages, the extension store and embedded PDFs are reported as capturable=false, and a window showing only those leaves nothing to capture.')
+  lines.push('1. Is the target page open right now? The extension reports open tabs only, so nothing appears here until the page is open in a browser that has dsh-page-capture loaded — a public page can be opened by starting a headless Chrome with --load-extension=' + capturePath + '; a page that needs a login has to be opened by the user in their own browser, since no cookie is ever copied.')
+  lines.push('2. Is the capture extension installed in that browser? chrome://extensions must list dsh-page-capture (Developer mode -> Load unpacked). Its directory on this machine: ' + capturePath)
+  lines.push('3. Does its options page point baseURL at ' + instancePortText() + '? That one line is the whole setting: installed once, the extension reports to whichever instance baseURL names, so pointing it at the other instance makes this list empty while the other one fills up.')
+  lines.push('4. Is the extension\'s own reporting switch on? With it off the extension sends nothing at all — not even a poll — so nothing here can see it.')
+  lines.push('5. Are the plugin\'s agent switches on (agent.enabled)? Off, both endpoints answer 404 and the extension gives up. The request trail above says whether anything arrived at all: no line at all means the request never reached this instance.')
+  lines.push('6. Even when connected, some pages never reach the list: chrome:// pages, extension pages, the extension store and embedded PDFs are reported as capturable=false, and a window showing only those leaves nothing to capture.')
   return lines.join('\n')
 }
 
