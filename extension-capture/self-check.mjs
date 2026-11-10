@@ -94,6 +94,12 @@ function buildFixture(P) {
     '<div class="drawerlike" id="drawerprobe">抽屉容器</div>' +
     '<div class="noopmove" id="noopmove">没移动</div>' +
     '<p><a id="rootlink" href="/abs/link">一个根绝对外链</a></p>' +
+    // 同一个 URL 换个名字写：Angular 的 ng-href、Vue 的 :href（值是字符串字面量）、SVG 的 xlink:href。
+    // 前三个必须绝对化，SVG 那个的片段引用 #icon 必须原样留着。
+    '<p><a id="anglink" ng-href="/x">angular 链接</a>' +
+    '<a id="plainlink" href="/y">普通链接</a>' +
+    '<a id="vuelink" :href="\'/z\'">vue 链接</a></p>' +
+    '<svg width="20" height="20"><use id="svguse" xlink:href="#icon"></use></svg>' +
     '<div id="bigbox"></div>' +
     '</main>';
   const big = document.createElement('img');
@@ -508,6 +514,26 @@ async function main() {
       '抽屉规则=' + (drawer.rule || '（缺）') + '；单位矩阵那条=' + (noop.rule || '（缺）') +
         '；固化规则里写了默认值的条数=' + defaultHits.length +
         '；CSS 段共 ' + computedRules.length + ' 条元素规则');
+
+    // ---- 15. 同一个 URL 换个名字写：ng-href / :href / xlink:href 也要绝对化 ------
+    // 真实事故：公开课页的 <a ng-href="/public-course#/all"> 漏在 href 绝对化之外（那是 Angular
+    // 的属性），blockcheck 对那份块报 root-absolute path + entry links missing 两条。
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const attrOf = (id, name) => {
+      const tag = (new RegExp('<[a-z]+[^>]*id="' + esc(id) + '"[^>]*>', 'i').exec(entry.content) || [''])[0];
+      const m = new RegExp('\\s' + esc(name) + '="([^"]*)"').exec(tag);
+      return m ? m[1] : null;
+    };
+    const ngHref = attrOf('anglink', 'ng-href');
+    const plainHref = attrOf('plainlink', 'href');
+    const vueHref = attrOf('vuelink', ':href');
+    const svgHref = attrOf('svguse', 'xlink:href');
+    const vueWant = "'" + hostA + "/z'";
+    assert('ng-href / :href 与 href 一样绝对化，xlink:href 的片段引用保持原样',
+      ngHref === hostA + '/x' && plainHref === hostA + '/y' && vueHref === vueWant && svgHref === '#icon',
+      'ng-href=' + JSON.stringify(ngHref) + '，href=' + JSON.stringify(plainHref) +
+        '，:href=' + JSON.stringify(vueHref) + '，xlink:href=' + JSON.stringify(svgHref) +
+        '（期望 ' + JSON.stringify(hostA + '/x') + '、' + JSON.stringify(hostA + '/y') + '、' + JSON.stringify(vueWant) + '、"#icon"）');
 
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });

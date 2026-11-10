@@ -99,7 +99,7 @@ pages/current/page.css     本页命中规则（死选择器已丢、var 已固�
 assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且降采样后仍超限的图，以及雪碧图/长条图（长宽比 ≥8，原尺寸不降采样）
 ```
 
-路径一律**段内相对**（`./`、`../`、`../../`），不出现根绝对路径。单段 2MB、单文件 2MB，与 DSH 侧默认对齐；`data:` 内嵌另有一条更紧的 1.4MB 线（base64 会胀 4/3）。调用方给 `maxBytes` 时，内嵌与计算样式两份预算跟着它缩放。
+路径一律**段内相对**（`./`、`../`、`../../`），不出现根绝对路径。元素属性里的根绝对 URL 会被改写成原站绝对地址（含 `ng-href`/`:href`/`v-bind:href`/`xlink:href` 这些同一个 URL 的别名；`#片段`、`data:`、`javascript:`、`mailto:`、`tel:` 不动）。单段 2MB、单文件 2MB，与 DSH 侧默认对齐；`data:` 内嵌另有一条更紧的 1.4MB 线（base64 会胀 4/3）。调用方给 `maxBytes` 时，内嵌与计算样式两份预算跟着它缩放。
 
 `report` 记：origin、title、bytes、files[]（每段字节）、dropped[]（丢了什么/降级成什么）、规则数与丢弃数、变量解析数、元素数、ancestors（祖先链），以及两份素材账：`assets[]`（每条 URL 的落点 kind/path、字节、取字节通道 `via`、原尺寸 w/h、是否 `downsampled`，`data:` 的 URL 只留前 48 字符）与 `srcsetPicked[]`（响应式图实际取的那档）。`report.bytes` 与 `sum(files[].bytes)` 恒等。
 

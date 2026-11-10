@@ -525,6 +525,12 @@
     // 交给下面 pickSrcsetMax 取最大候选（见「nm === 'srcset'」分支与第 6 步回写）。
     var BAD_ATTR = { integrity: 1, nonce: 1, crossorigin: 1, loading: 1, decoding: 1, referrerpolicy: 1 };
     var ROOT_ABS_ATTR = { href: 1, src: 1, action: 1, formaction: 1, poster: 1 };
+    // 同一个 URL 换个名字写：Angular 的 ng-href/ng-src、Vue 的 :href/:src 与 v-bind:href/v-bind:src、
+    // SVG 的 xlink:href。它们不是资源引用（不取字节），但根绝对路径进块一样是非法路径——
+    // 实测公开课页的 <a ng-href="/public-course#/all"> 就是这么漏过去的（href 绝对化了，ng-href 没有）。
+    // 只处理「值就是 /开头的路径」或「值是引号包着的 /开头字符串字面量」；#icon、data:、javascript:、
+    // {{表达式}} 一律不碰。
+    var BIND_ABS_ATTR = { 'ng-href': 1, 'ng-src': 1, 'v-bind:href': 1, 'v-bind:src': 1, ':href': 1, ':src': 1, 'xlink:href': 1 };
     var resolveStyleAttr = function (raw) {
       return cleanDecls(raw, vars, st);
     };
@@ -550,6 +556,17 @@
           var absolutized = absUrl(v, base);
           if (absolutized && /^https?:|^file:/i.test(absolutized)) n.setAttribute(a.name, absolutized);
           else { n.removeAttribute(a.name); drop('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
+          return;
+        }
+        if (BIND_ABS_ATTR[nm]) {
+          // Vue 的值是表达式：:href="'/z'" 只把引号里那段路径绝对化，引号原样留着。
+          var lit = /^\s*(['"])([^'"]*)\1\s*$/.exec(v);
+          var inner = lit ? lit[2] : v;
+          if (/^\/(?!\/)/.test(inner)) {
+            var absBind = absUrl(inner, base);
+            if (absBind && /^https?:|^file:/i.test(absBind)) n.setAttribute(a.name, lit ? lit[1] + absBind + lit[1] : absBind);
+            else { n.removeAttribute(a.name); drop('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
+          }
           return;
         }
         if (nm === 'style') {
