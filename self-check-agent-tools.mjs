@@ -40,7 +40,13 @@ const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   if (url.pathname === '/page') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-    res.end('<!doctype html><html><head><title>Open Page Probe</title></head><body><h1>hello</h1><img src="./a.png"></body></html>')
+    // The page reports what IT measured, so the captured DOM carries the geometry
+    // and the color scheme the page was really read at.
+    res.end('<!doctype html><html><head><title>Open Page Probe</title></head><body style="background:#ffffff">'
+      + '<h1>hello</h1><img src="./a.png"><div id="open-page-probe"></div>'
+      + '<script>document.getElementById("open-page-probe").textContent = window.innerWidth + "x" + window.innerHeight'
+      + ' + "|dark=" + matchMedia("(prefers-color-scheme: dark)").matches + "|bg=" + getComputedStyle(document.body).backgroundColor</script>'
+      + '</body></html>')
     return
   }
   if (url.pathname === '/a.png') {
@@ -464,6 +470,10 @@ await checkAsync('a name create_ui_block would reject never reaches the extensio
   await assert.rejects(() => tool('open_page').execute({ url: 'https://example.com', name: 'bad/name' }), /name must be 1-64 chars/)
   assert.deepEqual(openPage.open(), [], 'no browser was started')
 })
+await checkAsync('an unknown colorScheme is refused before a browser starts', async () => {
+  await assert.rejects(() => tool('open_page').execute({ url: 'https://example.com', colorScheme: 'sepia' }), /colorScheme must be one of light, dark, no-preference/)
+  assert.deepEqual(openPage.open(), [], 'no browser was started')
+})
 await checkAsync('closing an unknown name reports nothing closed', async () => {
   const value = await tool('open_page').execute({ close: true, name: 'never-opened' })
   assert.deepEqual(value.closed, [])
@@ -492,8 +502,14 @@ try {
   await checkAsync('that pair drives capture_page, create_ui_block and a 200 block URL', async () => {
     const captured = await tool('capture_page').execute({ instance: live.instance, tabId: live.tabId, name: 'open-live-block', timeout_ms: 30000 })
     assert.ok(captured.files.length >= 1)
+    // Defect A+B: the page is read at the pinned desktop viewport, in light.
+    const capturedEntry = captured.files.find((file) => /\.html$/i.test(file.path))
+    assert.match(readFileSync(capturedEntry.from, 'utf8'), /1440x900\|dark=false\|bg=rgb\(255, 255, 255\)/)
+    // Defect C: the next call is spelled out in the result.
+    assert.match(render('capture_page', {}, captured), /^NEXT: create_ui_block\(\{ name: "open-live-block", fromDir: ".*" \}\)$/m)
     const block = await tool('create_ui_block').execute({ name: 'open-live-block', fromDir: captured.fromDir })
     assert.ok(existsSync(join(tempHome, 'ui-blocks', 'open-live-block.uiblock')), 'the block file is on disk')
+    assert.match(render('create_ui_block', {}, block), /^NEXT: read_ui_block\(\{ name: "open-live-block" \}\)$/m)
     const res = await fetch('http://127.0.0.1:' + String(instancePort) + '/ui-blocks/open-live-block/')
     assert.equal(res.status, 200)
     assert.match(await res.text(), /hello/)
@@ -507,6 +523,16 @@ try {
 } finally {
   await tool('open_page').execute({ close: true }).catch(() => {})
 }
+
+console.log('--- 15. width / colorScheme overrides reach the page ---')
+await checkAsync('width:800 + colorScheme:"dark" is measured by the page, not the default', async () => {
+  const opened = await tool('open_page').execute({ url: 'http://127.0.0.1:' + String(instancePort) + '/page', name: 'open-override', width: 800, colorScheme: 'dark', waitMs: 30000 })
+  const captured = await tool('capture_page').execute({ instance: opened.instance, tabId: opened.tabId, name: 'open-override-block', timeout_ms: 30000 })
+  const entry = captured.files.find((file) => /\.html$/i.test(file.path))
+  assert.match(readFileSync(entry.from, 'utf8'), /800x900\|dark=true\|bg=rgb\(255, 255, 255\)/)
+  const closed = await tool('open_page').execute({ close: true, name: 'open-override' })
+  assert.deepEqual(closed.closed, ['open-override'])
+})
 
 await new Promise((done) => server.close(done))
 await rm(tempHome, { recursive: true, force: true })

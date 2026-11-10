@@ -183,6 +183,15 @@ const BROWSER_CANDIDATES = [
 const OPEN_PAGE_DEFAULT_WAIT_MS = 15000
 const OPEN_PAGE_MIN_WAIT_MS = 1000
 const OPEN_PAGE_MAX_WAIT_MS = 120000
+/**
+ * open_page's viewport and color scheme. A headless browser starts around
+ * 800x600 and inherits the HOST's dark preference, so responsive sites fold
+ * their sidebar into a menu and every capture comes back dark — neither is what
+ * a reader's browser looks like. One desktop viewport, one light scheme.
+ */
+const OPEN_PAGE_VIEWPORT = { width: 1440, height: 900 }
+const OPEN_PAGE_COLOR_SCHEMES = ['light', 'dark', 'no-preference']
+const OPEN_PAGE_DEFAULT_COLOR_SCHEME = 'light'
 
 /** The active Harness home: DSH_HOME when set, else ~/.dsh. */
 function harnessHome() {
@@ -2196,7 +2205,7 @@ function captureText(value) {
       if (index.dangling.length > 20) lines.push('    ... and ' + String(index.dangling.length - 20) + ' more')
     }
     lines.push('')
-    lines.push('NEXT CALL (the whole material set in one call — no files[] list needed): create_ui_block({ name: "' + index.suggestedName + '", fromDir: "' + value.dir + '" })')
+    lines.push('NEXT: create_ui_block({ name: "' + index.suggestedName + '", fromDir: "' + value.dir + '" })')
   }
   lines.push('')
   lines.push('files[] — `from` is the file\'s absolute path on disk. A create_ui_block call that passes them as files[].from copies the bytes on the host and none of this material enters the conversation; better still, pass fromDir (above) and list no files at all:')
@@ -2377,6 +2386,55 @@ async function waitForBrowserTarget(port, needle, timeoutMs) {
   throw new Error(OPEN_PAGE_TOOL + ': the tab ' + needle + ' never appeared in the browser (' + last + ')')
 }
 
+/**
+ * The one http(s) page target in the throwaway browser: the options page and the
+ * launch-argument about:blank are not it, and nothing else is open.
+ */
+async function waitForHttpPageTarget(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  let last = 'no answer from /json/list'
+  while (Date.now() < deadline) {
+    try {
+      const list = await (await fetch('http://127.0.0.1:' + String(port) + '/json/list', { cache: 'no-store' })).json()
+      const hit = (Array.isArray(list) ? list : []).find((target) => target.type === 'page'
+        && typeof target.webSocketDebuggerUrl === 'string' && /^https?:/i.test(String(target.url)))
+      if (hit !== undefined) return hit
+      last = 'no http(s) page target yet'
+    } catch (error) {
+      last = String(error && error.message === undefined ? error : error.message)
+    }
+    await sleep(100)
+  }
+  throw new Error(OPEN_PAGE_TOOL + ': no http(s) page target appeared in the browser (' + last + ')')
+}
+
+/**
+ * Pin the viewport and the color scheme for as long as the browser lives, then
+ * reload so the page lays out at that size from its first frame instead of
+ * adapting to the ~800x600 it was opened at.
+ *
+ * The overrides belong to the CDP SESSION, not to the browser: closing this
+ * socket would reset both before capture_page ever reaches the tab, so the
+ * session is kept on the record and closed together with the browser.
+ */
+async function applyOpenPageEmulation(record, viewport, colorScheme) {
+  const target = await waitForHttpPageTarget(record.port, 15000)
+  const session = await cdpConnect(target.webSocketDebuggerUrl)
+  record.session = session
+  await session.send('Emulation.setDeviceMetricsOverride', { width: viewport.width, height: viewport.height, deviceScaleFactor: 1, mobile: false })
+  await session.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: colorScheme }] })
+  await session.send('Page.reload', { ignoreCache: false })
+  // The evaluate can still land in the OLD document, so the navigation type is
+  // part of the condition: 'reload' only holds once the new document is live.
+  try {
+    await until(async () => {
+      try {
+        return (await evaluateInPage(session, "document.readyState === 'complete' && ((performance.getEntriesByType('navigation')[0] || {}).type === 'reload')")) === true
+      } catch { return false }
+    }, 20000, 'the page to reload at the pinned viewport')
+  } catch { /* a slow page still gets waited for by the report loop below */ }
+}
+
 /** Delete a throwaway profile, retrying while Chrome still holds a handle on it. */
 async function removeProfileDir(profile) {
   for (let attempt = 0; attempt < 25; attempt += 1) {
@@ -2411,6 +2469,9 @@ async function closeOpenPage(name) {
     if (record === undefined) continue
     openPages.delete(key)
     closed.push(key)
+    if (record.session !== undefined) {
+      try { record.session.close() } catch { /* already closed */ }
+    }
     const exited = new Promise((done) => {
       if (record.child.exitCode !== null) { done(); return }
       const limit = setTimeout(done, 3000)
@@ -2451,6 +2512,24 @@ function openPageWait(value) {
   const ms = Number(value)
   if (!Number.isFinite(ms) || ms <= 0) throw new Error(OPEN_PAGE_TOOL + ': waitMs must be a positive number of milliseconds, got ' + JSON.stringify(value))
   return Math.min(Math.max(Math.round(ms), OPEN_PAGE_MIN_WAIT_MS), OPEN_PAGE_MAX_WAIT_MS)
+}
+
+/** width/height in CSS pixels: one desktop default, clamped like a canvas. */
+function openPagePixels(value, fallback, key) {
+  if (value === undefined || value === null || value === '') return fallback
+  const px = Number(value)
+  if (!Number.isFinite(px)) throw new Error(OPEN_PAGE_TOOL + ': ' + key + ' must be a number of CSS pixels, got ' + JSON.stringify(value))
+  return Math.min(Math.max(Math.round(px), 240), 10000)
+}
+
+/** The prefers-color-scheme to pin: light by default, dark or no-preference on request. */
+function openPageColorScheme(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return OPEN_PAGE_DEFAULT_COLOR_SCHEME
+  const scheme = String(value).trim()
+  if (!OPEN_PAGE_COLOR_SCHEMES.includes(scheme)) {
+    throw new Error(OPEN_PAGE_TOOL + ': colorScheme must be one of ' + OPEN_PAGE_COLOR_SCHEMES.join(', ') + ', got ' + JSON.stringify(value))
+  }
+  return scheme
 }
 
 /** URL normalization for tab matching: the extension reports the final URL. */
@@ -2522,6 +2601,11 @@ async function launchOpenPage(options) {
   const url = openPageUrl(options.url)
   const name = openPageName(options.name)
   const waitMs = openPageWait(options.waitMs)
+  const viewport = {
+    width: openPagePixels(options.width, OPEN_PAGE_VIEWPORT.width, 'width'),
+    height: openPagePixels(options.height, OPEN_PAGE_VIEWPORT.height, 'height')
+  }
+  const colorScheme = openPageColorScheme(options.colorScheme)
   if (agentPort <= 0) throw new Error(OPEN_PAGE_TOOL + ': this instance\'s HTTP port is not known yet, so the extension cannot be pointed at it. Start the plugin through the normal DSH web server and retry.')
   const captureDir = extensionDir(EXTENSION_CAPTURE_DIR_NAME)
   if (!existsSync(join(captureDir, 'manifest.json'))) {
@@ -2546,7 +2630,7 @@ async function launchOpenPage(options) {
     '--remote-allow-origins=*',
     'about:blank'
   ], { stdio: 'ignore', windowsHide: true })
-  const record = { child, chrome, port, profile, extensionId: '', name, url, tabId: undefined, startedAt: Date.now() }
+  const record = { child, chrome, port, profile, extensionId: '', name, url, tabId: undefined, viewport, colorScheme, session: undefined, startedAt: Date.now() }
   openPages.set(name, record)
   ensureOpenPageExitHook()
   child.once('exit', () => {
@@ -2613,6 +2697,9 @@ async function launchOpenPage(options) {
         }
       }
     } catch { /* the extra row is noise, not a failure */ }
+    // Before the tab is reported and captured: the geometry and the color scheme
+    // have to be the ones the page is READ at, not the headless defaults.
+    await applyOpenPageEmulation(record, viewport, colorScheme)
     const deadline = Date.now() + waitMs
     while (Date.now() < deadline) {
       const mine = agentHub.instances.get(name)
@@ -2751,6 +2838,7 @@ export function apply(ctx, config) {
             : '')
           + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
           + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
+          + '\nNEXT: read_ui_block({ name: "' + value.name + '" })'
           + (value.backup === undefined ? '' : '\nPrevious version backed up to: ' + value.backup)
       }]
     },
@@ -3127,6 +3215,18 @@ export function apply(ctx, config) {
       waitMs: {
         type: 'number',
         description: 'How long to wait for the extension to report the tab, in milliseconds. Default 15000, clamped to 1000-120000. The extension polls every couple of seconds; a longer wait only covers a slow page.'
+      },
+      width: {
+        type: 'number',
+        description: 'Desktop viewport width in CSS pixels. Default 1440: a headless default (~800) makes responsive sites fold their sidebar into a menu, so the capture has no navigation column at all. Clamped to 240-10000.'
+      },
+      height: {
+        type: 'number',
+        description: 'Desktop viewport height in CSS pixels. Default 900. Clamped to 240-10000.'
+      },
+      colorScheme: {
+        type: 'string',
+        description: 'Fix prefers-color-scheme for the page: "light" (default — the scheme sites design their light theme for), "dark", or "no-preference". Without it the page inherits this machine\'s dark preference and the capture comes back dark.'
       },
       close: {
         type: 'boolean',
@@ -3614,7 +3714,8 @@ export const openPage = {
   normalizeUrl: openPageUrl,
   normalizeName: openPageName,
   normalizeWait: openPageWait,
-  open: () => [...openPages.keys()]
+  open: () => [...openPages.keys()],
+  record: (name) => openPages.get(String(name))
 }
 /**
  * Test seam for self-check-agent-tools.mjs: the instance registry and the
