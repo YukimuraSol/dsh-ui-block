@@ -75,7 +75,7 @@ node launch.mjs --url=https://example.com --base-url=http://127.0.0.1:4000
 ```
 POST {每个实例的 baseUrl}/ui-blocks/agent/poll[?token=…]
   { instance, tabs: [{ tabId, url, title, focused, capturable, reason? }], tabsTag }
-  → { task: null } | { task: { id, tabId, includes?, maxBytes? } }
+  → { task: null } | { task: { id, tabId, includes?, maxBytes? } }   // includes 已废弃，只记录
 
 POST {发任务那个实例的 baseUrl}/ui-blocks/agent/result[?token=…]
   { instance, taskId, ok, files?, report?, error? }
@@ -88,7 +88,7 @@ POST {发任务那个实例的 baseUrl}/ui-blocks/agent/result[?token=…]
 - 两个 URL 支持可选的 `?token=`（配对码，默认不填就不带）；
 - poll 的 body 多一个 `tabsTag`（清单指纹，见上一节），插件侧可忽略。
 
-`task.includes` 是逗号分隔的段名：`dom,css,computed,assets`（缺省全做，`all` 等价）。
+`task.includes` **已废弃**：仍然可以被接收，但只记进 `report.includesIgnored: true` 与 `report.degrade` 的一条说明，不影响抽取。抓取恒定输出 dom + 两份 CSS + 计算样式 + 全部资源落点——同一个页面任何入参产物都一样（原因见 `技术文档.md` 的「includes 废掉」一节：那个 `want()` 开关同时管「输出哪段」和「资源要不要本地化」，一关就产出带 `/static/...` 绝对引用的块）。要压体积用 `maxBytes`。
 
 ## 产出形状
 

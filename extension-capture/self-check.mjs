@@ -76,12 +76,16 @@ function buildFixture(P) {
     '.hero{background-image:url(' + noise + ');background-size:cover;height:120px;}',
     '@font-face{font-family:CapTest;src:url(data:font/woff2;base64,' + b64 + ') format("woff2");}',
     '@keyframes pulse{0%{opacity:.5}100%{opacity:1}}',
-    '.thumb{width:240px;height:120px;object-fit:cover;border-radius:8px;}'
+    '.thumb{width:240px;height:120px;object-fit:cover;border-radius:8px;}',
+    // 根绝对引用（真实事故形态）：CSS 里写 url(/static/…)。它必须被改写成本地段，
+    // 不能因为调用方传了 includes 就原样留在产物里。
+    '.probe{background-image:url(/static/probe.svg);width:16px;height:16px;}'
   ].join('') + '</style>';
   document.body.innerHTML = '<main class="wrap">' +
     '<section><h1 id="headline">抓取自检</h1><p id="tagline">目标元素在这里</p></section>' +
     '<div class="card" id="target">\u4f60\u597d\uff0cdsh</div>' +
     '<div class="hero"></div>' +
+    '<div class="probe" id="probe"></div>' +
     '<p><a id="rootlink" href="/abs/link">一个根绝对外链</a></p>' +
     '<div id="bigbox"></div>' +
     '</main>';
@@ -300,6 +304,10 @@ async function main() {
       '/p400.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(400, '#ffd6a5'), 'utf8') },
       '/p800.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(800, '#fdffb6'), 'utf8') },
       '/p1200.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(1200, '#bdb2ff'), 'utf8') },
+      // 夹具页从这台服务取（about:blank 没有 origin，根绝对 url(/static/…) 没法绝对化，
+      // 也就复现不出真实事故）。/static/probe.svg 就是 CSS 里那条根绝对引用的落点。
+      '/blank.html': { mime: 'text/html', bytes: Buffer.from('<!doctype html><html><head><title>probe</title></head><body><p>blank</p></body></html>', 'utf8') },
+      '/static/probe.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(16, '#3355ff'), 'utf8') },
     });
     srv = started.server;
     const hostA = 'http://127.0.0.1:' + started.port;
@@ -308,6 +316,8 @@ async function main() {
       p400: hostA + '/p400.svg', p800: hostA + '/p800.svg', p1200: hostA + '/p1200.svg' };
     console.log('[server] ' + hostA + ' 已就绪：sprite.png ' + spriteBytes.length + ' B（358x20870），logo.svg ' + logoBytes.length + ' B，srcset 三档 100w/300w/900w');
 
+    await cdp.navigate(s, hostA + '/blank.html');
+    const pageUrl = hostA + '/blank.html';
     const fx = await cdp.evaluate(s, '(' + buildFixture.toString() + ')(' + JSON.stringify(P) + ')', { isExpression: true });
     console.log('[fixture] about:blank 注入完成：style 规则 ' + fx.rules + ' 条，噪声 PNG ≈ ' + Math.round(fx.noiseBytes / 1024) + 'KB，假 woff2 1.5MB');
 
@@ -317,13 +327,15 @@ async function main() {
 
     // 后台取字节通道（对着 extractor 的 fetchBytes 钩子，等同 background.js 的答复形状）
     await installBgSeam(s, cdp);
-    // 对照：页面自己 fetch 这张跨域图必然被拦（服务端不发 CORS），证明上面那条不是页面取到的
+    // 对照：页面自己 fetch 这张跨域图必然被拦（服务端不发 CORS），证明上面那条不是页面取到的。
+    // 夹具页现在有自己的 origin（http 页，为了让根绝对 url(/static/…) 能绝对化），所以要拿
+    // 另一个主机名（localhost）那张图当对照——同源的 sprite 页面自己当然能取到。
     const pageFetch = await cdp.evaluate(s,
-      'fetch(' + JSON.stringify(P.sprite) + ').then(function(){return "ok"},function(e){return String((e&&e.message)||e)})',
+      'fetch(' + JSON.stringify(P.logo) + ').then(function(){return "ok"},function(e){return String((e&&e.message)||e)})',
       { isExpression: true });
-    console.log('[control] 页面直接 fetch sprite.png → ' + pageFetch);
+    console.log('[control] 页面直接 fetch 另一源的 logo.svg → ' + pageFetch);
 
-    const out = await runExtract(s, { origin: 'about:blank' });
+    const out = await runExtract(s, { origin: pageUrl });
     if (!out || !out.files) throw new Error('extract 没有返回 files');
     const files = out.files;
     const report = out.report;
@@ -380,9 +392,9 @@ async function main() {
     assert('坏资源进 dropped 且不进 entry.html', droppedOk, report.dropped.length + ' 条 dropped');
 
     // ---- 8. 祖先链停在 body 的直系子元素 ---------------------------------
-    // 带 selector 再跑一次（只抽 dom，便宜），确认没有把整个 document 塞进去，
+    // 带 selector 再跑一次，确认没有把整个 document 塞进去（includes 已废，不再传它），
     // 且"目标 → body 直系子元素"这一整段都在。
-    const sub = await runExtract(s, { origin: 'about:blank', selector: '#target', includes: 'dom' });
+    const sub = await runExtract(s, { origin: pageUrl, selector: '#target' });
     const subEntry = (sub.files.find((f) => f.path === 'entry.html') || {}).content || '';
     // entry.html 自己的 <html>/<body> 是文档壳，不算数；只看 <body> 里面有没有被塞进整份 document
     const bodyInner = (subEntry.split('<body>')[1] || '').split('</body>')[0];
@@ -430,6 +442,37 @@ async function main() {
     assert('preload imagesrcset 的最大候选计入 srcsetPicked（link 被删也不漏账）',
       picked.length === 3 && picked.some((u) => String(u).indexOf('/p1200.svg') >= 0) && !preKept,
       'srcsetPicked 长度 ' + picked.length + '：' + JSON.stringify(picked) + '；entry 里还有 link=' + preKept);
+
+    // ---- 13. includes 不再是开关：传/不传各抓一次，引用同样全部本地化、产物同构 ----
+    // 真实事故：传 includes:'css,fonts,images' 时 assets 那一支被跳过，CSS 里 url(/static/…)
+    // 一条都没改写，create_ui_block 连拒两次。现在 includes 只被记录，产物必须一模一样。
+    const incRun = await runExtract(s, { origin: pageUrl, includes: 'css,fonts,images' });
+    const cssAbs = (list) => list.filter((f) => /\.css$/.test(f.path))
+      .reduce((a, f) => a + (String(f.content).match(/url\(\s*["']?\/(?!\/)/g) || []).length, 0);
+    const incPaths = (rep) => (rep.assets || []).map((a) => a.url + '=' + a.kind).sort().join(' | ');
+    const sumBytes = (list) => list.reduce((a, f) => a + bytesOf(f), 0);
+    const baseAbs = cssAbs(files);
+    const incAbs = cssAbs(incRun.files);
+    // 同一套引用口径也要落在 includes 那份上：传了 includes 的产物一样不许有悬空引用。
+    const incPresent = new Set(incRun.files.map((f) => f.path));
+    const incBadRefs = [];
+    for (const f of incRun.files) {
+      if (f.base64) continue;
+      for (const r of resolveRefs(f.content, f.path, incPresent)) if (!r.exists) incBadRefs.push(f.path + ' -> ' + r.ref);
+    }
+    assert('includes 传/不传产物同构：assets 与落点一致、CSS 根绝对 url() 与悬空引用都是 0',
+      baseAbs === 0 && incAbs === 0 && incBadRefs.length === 0 &&
+        (report.assets || []).length >= 1 &&
+        (report.assets || []).length === (incRun.report.assets || []).length &&
+        report.assetsInlined >= 1 && report.assetsInlined === incRun.report.assetsInlined &&
+        incPaths(report) === incPaths(incRun.report) &&
+        sumBytes(files) === sumBytes(incRun.files) &&
+        report.includesIgnored === undefined && incRun.report.includesIgnored === true,
+      '不传：assets ' + (report.assets || []).length + ' 条 / 内联 ' + report.assetsInlined + ' / CSS 根绝对 ' + baseAbs +
+        ' / 悬空引用 ' + 0 + ' / ' + sumBytes(files) + ' B / includesIgnored=' + String(report.includesIgnored) +
+        '；传 css,fonts,images：assets ' + (incRun.report.assets || []).length + ' 条 / 内联 ' + incRun.report.assetsInlined +
+        ' / CSS 根绝对 ' + incAbs + ' / 悬空引用 ' + incBadRefs.length + ' / ' + sumBytes(incRun.files) + ' B / includesIgnored=' + String(incRun.report.includesIgnored) +
+        (incBadRefs.length ? '；' + incBadRefs.slice(0, 3).join(' | ') : ''));
 
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });

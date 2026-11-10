@@ -282,8 +282,11 @@
     var dropped = [];
     var drop = function (s) { if (dropped.length < 40) dropped.push(String(s).slice(0, 220)); };
 
-    var include = String(opts.includes || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-    var want = function (n) { return !include.length || include.indexOf('all') >= 0 || include.indexOf(n) >= 0; };
+    // includes 已废：它原本是三处开关（computed / css / assets），三处都会改变产物形态——
+    // 特别是 assets 那一处，一关就整段跳过资源解析，CSS 里的 url(/static/…) 原样留在块里，
+    // create_ui_block 直接判引用越界。产物必须同构：同一个页面、任何入参，落点都一样。
+    // 现在这个字段只被记录（report.includesIgnored），不再影响抽取。
+    var includesIgnored = String(opts.includes || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
 
     var maxBytes = Number(opts.maxBytes) > 0 ? Number(opts.maxBytes) : 0;
     // 预算：单段 2 MB。内嵌只花其中约七成（base64 会胀），剩下留给规则原文与元素固化；
@@ -291,6 +294,9 @@
     var inlineBudget = Math.min(MAX_INLINE_BYTES, maxBytes ? Math.floor(maxBytes * 0.7) : MAX_INLINE_BYTES);
     var computedBudget = Math.min(384 * 1024, maxBytes ? Math.floor(maxBytes * 0.2) : 384 * 1024);
     var degrade = [];
+    if (includesIgnored.length) {
+      degrade.push('includes 已忽略（' + includesIgnored.join(',') + '）：抓取恒定输出 dom+css+computed+assets，资源引用一律本地化');
+    }
 
     var win = doc.defaultView || {};
     var base = (doc.baseURI || (doc.location && doc.location.href) || '') + '';
@@ -431,44 +437,42 @@
     var computedRules = [];
     var computedUsed = 0;
     var elements = [];
-    if (want('computed')) {
-      elements = [topEl].concat(Array.prototype.slice.call(topEl.querySelectorAll('*')));
-      var capEls = Math.min(elements.length, 600);
-      for (var ei = 0; ei < capEls; ei++) {
-        var el = elements[ei];
-        var tag = String(el.tagName || '').toLowerCase();
-        if (tag === 'script' || tag === 'style' || tag === 'link' || tag === 'meta') continue;
-        var cs;
-        try { cs = win.getComputedStyle(el); } catch (e) { continue; }
-        if (!cs) continue;
-        var pcs = null;
-        try { pcs = (el.parentElement && el.parentElement !== doc.documentElement) ? win.getComputedStyle(el.parentElement) : null; } catch (e) { pcs = null; }
-        var decls = [];
-        for (var pi = 0; pi < COMPUTED_PROPS.length; pi++) {
-          var prop = COMPUTED_PROPS[pi];
-          var val = '';
-          try { val = String(cs.getPropertyValue(prop) || '').trim(); } catch (e) { val = ''; }
-          if (!val) continue;
-          if (prop === 'box-shadow' && val === 'none') continue;
-          if (prop === 'border-radius' && val === '0px') continue;
-          if (INHERITED[prop] && pcs) {
-            var pv = '';
-            try { pv = String(pcs.getPropertyValue(prop) || '').trim(); } catch (e) { pv = ''; }
-            if (pv === val) continue;
-          }
-          decls.push(prop + ':' + val);
+    elements = [topEl].concat(Array.prototype.slice.call(topEl.querySelectorAll('*')));
+    var capEls = Math.min(elements.length, 600);
+    for (var ei = 0; ei < capEls; ei++) {
+      var el = elements[ei];
+      var tag = String(el.tagName || '').toLowerCase();
+      if (tag === 'script' || tag === 'style' || tag === 'link' || tag === 'meta') continue;
+      var cs;
+      try { cs = win.getComputedStyle(el); } catch (e) { continue; }
+      if (!cs) continue;
+      var pcs = null;
+      try { pcs = (el.parentElement && el.parentElement !== doc.documentElement) ? win.getComputedStyle(el.parentElement) : null; } catch (e) { pcs = null; }
+      var decls = [];
+      for (var pi = 0; pi < COMPUTED_PROPS.length; pi++) {
+        var prop = COMPUTED_PROPS[pi];
+        var val = '';
+        try { val = String(cs.getPropertyValue(prop) || '').trim(); } catch (e) { val = ''; }
+        if (!val) continue;
+        if (prop === 'box-shadow' && val === 'none') continue;
+        if (prop === 'border-radius' && val === '0px') continue;
+        if (INHERITED[prop] && pcs) {
+          var pv = '';
+          try { pv = String(pcs.getPropertyValue(prop) || '').trim(); } catch (e) { pv = ''; }
+          if (pv === val) continue;
         }
-        if (!decls.length) continue;
-        var key = 'e' + (ei + 1);
-        var ruleText = '[data-dsh-el="' + key + '"]{' + decls.join(';') + '}';
-        if (computedUsed + ruleText.length > computedBudget) { degrade.push('computed 段到预算上限，剩 ' + (capEls - ei) + ' 个元素没固化'); break; }
-        computedUsed += ruleText.length;
-        computedRules.push(ruleText);
-        try { el.setAttribute('data-dsh-el', key); } catch (e) {}
-        st.computedRules++;
+        decls.push(prop + ':' + val);
       }
-      st.elements = elements.length;
+      if (!decls.length) continue;
+      var key = 'e' + (ei + 1);
+      var ruleText = '[data-dsh-el="' + key + '"]{' + decls.join(';') + '}';
+      if (computedUsed + ruleText.length > computedBudget) { degrade.push('computed 段到预算上限，剩 ' + (capEls - ei) + ' 个元素没固化'); break; }
+      computedUsed += ruleText.length;
+      computedRules.push(ruleText);
+      try { el.setAttribute('data-dsh-el', key); } catch (e) {}
+      st.computedRules++;
     }
+    st.elements = elements.length;
 
     // 4) 拷一份 DOM 再清理（活页面只多挂几个 data-dsh-el 属性，不动结构）
     var clone = topEl.cloneNode(true);
@@ -558,7 +562,8 @@
     var assetFiles = [];
     var assetSeq = { img: 0, font: 0, bin: 0 };
     var assetLog = [];
-    var pageCssText = (want('css') ? pageRules.join(NL) : '');
+    // 引用一律从"要输出的那份 CSS 原文"里收：CSS 总是输出，所以 CSS 里的 url() 一条都不会漏。
+    var pageCssText = pageRules.join(NL);
     pageCssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) { addUrl(u); return m; });
     Array.prototype.slice.call(clone.querySelectorAll('[src], [poster]')).forEach(function (n) {
       // 带 srcset 的元素只取最大候选（第 4 步已进清单），它的 src 是同一张图的小档，
@@ -721,25 +726,24 @@
       return out;
     };
 
-    if (want('assets')) {
-      // 并发 3：一条一条取，一百多个资源的页面能等成几分钟。压在 3 是因为解码与重编码
-      // 都在页面主线程里跑，贪多反而抖。
-      var POOL = 3;
-      var cursorIdx = 0;
-      var sameWorkers = [];
-      var workerCount = Math.min(POOL, urls.length);
-      for (var wk = 0; wk < workerCount; wk++) {
-        sameWorkers.push((async function () {
-          while (cursorIdx < urls.length) {
-            var idx = cursorIdx++;
-            await resolveAsset(urls[idx]);
-          }
-        })());
-      }
-      await Promise.all(sameWorkers);
-    } else {
-      for (var uj = 0; uj < urls.length; uj++) assetMap.set(urls[uj], { kind: 'keep' });
+    // 无条件解析：清单里的每一个引用都要拿到落点（data: / assets/… / none），
+    // 否则它在产物里就还是原站绝对地址。includes 与此无关（改前这一步挂在 want('assets') 上，
+    // 一传 includes 就整段跳过，url() 原样留存）。
+    // 并发 3：一条一条取，一百多个资源的页面能等成几分钟。压在 3 是因为解码与重编码
+    // 都在页面主线程里跑，贪多反而抖。
+    var POOL = 3;
+    var cursorIdx = 0;
+    var sameWorkers = [];
+    var workerCount = Math.min(POOL, urls.length);
+    for (var wk = 0; wk < workerCount; wk++) {
+      sameWorkers.push((async function () {
+        while (cursorIdx < urls.length) {
+          var idx = cursorIdx++;
+          await resolveAsset(urls[idx]);
+        }
+      })());
     }
+    await Promise.all(sameWorkers);
 
     // 内嵌总量超预算：把大的改判成落文件（data: 塞爆 CSS 会过单段上限）
     var inlineBytes = 0;
@@ -767,13 +771,12 @@
 
     var refFor = function (prefix, hit) {
       if (!hit) return null;
-      if (hit.kind === 'keep') return null;
       if (hit.kind === 'drop') return 'none';
       if (hit.kind === 'data') return 'url(' + hit.uri + ')';
       return 'url(' + prefix + hit.path + ')';
     };
     var srcFor = function (prefix, hit) {
-      if (!hit || hit.kind === 'keep') return undefined;
+      if (!hit) return undefined;
       if (hit.kind === 'drop') return 'none';
       if (hit.kind === 'data') return hit.uri;
       return prefix + hit.path;
@@ -830,24 +833,19 @@
     // 7) 三份文件：entry / shared / pages
     var bodyHtml = isBody ? clone.innerHTML : clone.outerHTML;
     var appCss = [];
-    if (want('css')) {
-      var fontFaces = pageRules.filter(function (r) { return r.indexOf('@font-face') === 0; });
-      var keyframes = pageRules.filter(function (r) { return r.indexOf('@keyframes') === 0; });
-      var rest = pageRules.filter(function (r) { return r.indexOf('@font-face') !== 0 && r.indexOf('@keyframes') !== 0; });
-      appCss = [
-        '/* dsh-page-capture: 基线（重置 + 字体 + 动画）——跨页可复用 */',
-        '*,*::before,*::after{box-sizing:border-box}',
-        'html,body{margin:0}',
-        'img,svg,video,canvas{max-width:100%;height:auto}'
-      ].concat(fontFaces).concat(keyframes);
-      var pageCssBody = rest.length ? rest : ['/* 本页没有命中任何样式表规则 */'];
-      var pageCss = ['/* dsh-page-capture: 本页样式表命中规则 + 元素计算样式固化 */'].concat(pageCssBody).concat(computedRules);
-      var appCssText = subCss(appCss.join(NL), '../') + NL;
-      var pageCssText2 = subCss(pageCss.join(NL), '../../') + NL;
-    } else {
-      var appCssText = '/* includes 未包含 css */' + NL;
-      var pageCssText2 = '/* includes 未包含 css */' + NL;
-    }
+    var fontFaces = pageRules.filter(function (r) { return r.indexOf('@font-face') === 0; });
+    var keyframes = pageRules.filter(function (r) { return r.indexOf('@keyframes') === 0; });
+    var rest = pageRules.filter(function (r) { return r.indexOf('@font-face') !== 0 && r.indexOf('@keyframes') !== 0; });
+    appCss = [
+      '/* dsh-page-capture: 基线（重置 + 字体 + 动画）——跨页可复用 */',
+      '*,*::before,*::after{box-sizing:border-box}',
+      'html,body{margin:0}',
+      'img,svg,video,canvas{max-width:100%;height:auto}'
+    ].concat(fontFaces).concat(keyframes);
+    var pageCssBody = rest.length ? rest : ['/* 本页没有命中任何样式表规则 */'];
+    var pageCss = ['/* dsh-page-capture: 本页样式表命中规则 + 元素计算样式固化 */'].concat(pageCssBody).concat(computedRules);
+    var appCssText = subCss(appCss.join(NL), '../') + NL;
+    var pageCssText2 = subCss(pageCss.join(NL), '../../') + NL;
     if (utf8Len(appCssText) > SECTION_MAX_BYTES) { degrade.push('shared/app.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(appCssText) + '）'); }
     if (utf8Len(pageCssText2) > SECTION_MAX_BYTES) { degrade.push('pages/current/page.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(pageCssText2) + '）'); }
 
@@ -919,6 +917,9 @@
       ancestors: ancestors,
       degrade: degrade
     };
+    // includes 已废：传了就记一个布尔 true（口径与其它布尔字段一致——没有这个字段 = 没传），
+    // 具体传了什么写在 degrade 那条说明里。产物恒定是 entry + 两份 CSS + 资源落点。
+    if (includesIgnored.length) report.includesIgnored = true;
     return { files: files, report: report };
   }
 
