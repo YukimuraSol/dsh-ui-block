@@ -156,8 +156,9 @@ await ta('the skip ledger names each left-out file and why', async () => {
   assert.equal(byPath.get('assets/empty.stream').reason, 'unknown type')
   assert.equal(byPath.get('assets/empty.stream').bytes, 12)
   assert.equal(value.referencedSkipped, undefined, 'nothing referenced is skipped here')
-  assert.equal(value.next, 'read_ui_block({ name: "from-probe-2" })', 'next spells the follow-up call out')
-  assert.deepEqual(value.warnings, [], 'neither srcset-only nor referenced-but-skipped: warnings is still an array, empty')
+  assert.equal('next' in value, false, 'no next field: the follow-up call lives in the rendered text')
+  assert.equal('warnings' in value, false, 'no warnings field either — the render carries those facts')
+  assert.match(create.output.render({}, value).map((part) => part.text).join('\n'), /^NEXT: read_ui_block\(\{ name: "from-probe-2" \}\)$/m, 'the rendered text still spells the follow-up call out')
   assert.ok(!value.files.some((file) => file.path === 'report.json'), 'the report never becomes a section')
 })
 
@@ -178,9 +179,7 @@ await ta('the 2x/3x candidates land in the block; no srcset file is called unref
   assert.ok(!value.skipped.some((item) => item.reason === 'unreferenced'), 'a srcset candidate is referenced')
   assert.deepEqual(value.srcsetReferenced, ['assets/hero@2x.png', 'assets/hero@3x.png', 'assets/icon.avif'])
   assert.ok(value.referencedSkipped.some((line) => /icon\.avif/.test(line)), 'the skipped-but-referenced report names it')
-  assert.equal(value.warnings.length, 2, 'two facts as data: srcset-only kept, and skipped-but-still-referenced: ' + JSON.stringify(value.warnings))
-  assert.match(value.warnings[0], /srcset\/imagesrcset candidate/)
-  assert.match(value.warnings[1], /left out/)
+  assert.equal('warnings' in value, false, 'the two facts stay in the data below and in the render, not in a warnings field')
 })
 await ta('the rendered report separates "srcset only" from "unreferenced"', async () => {
   const value = await create.execute({ name: 'srcset-probe-2', fromDir: retina })

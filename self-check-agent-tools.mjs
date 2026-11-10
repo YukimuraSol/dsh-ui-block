@@ -17,16 +17,18 @@
  *   8. an extension-reported failure repeats the extension's own words
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const tempHome = await mkdtemp(join(tmpdir(), 'dsh-agent-tools-home-'))
 process.env.DSH_HOME = tempHome
 
-const { apply, extensionHub, instanceRegistry, openPage } = await import('./index.js')
+const { apply, extensionHub, instanceRegistry } = await import('./index.js')
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 
 const checks = []
@@ -34,8 +36,9 @@ const checkAsync = async (name, fn) => { await fn(); checks.push(name); console.
 
 const tools = new Map()
 const routes = []
-// A REAL loopback server, because open_page's browser must poll it: the tools
-// still call handlers directly below, but section 13 runs the whole path.
+// A REAL loopback server: the live sections (13-15) drive tools/open-page.mjs,
+// whose browser polls this endpoint, and the info route is read over HTTP there.
+// Everything else still calls handlers directly.
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   if (url.pathname === '/page') {
@@ -79,6 +82,48 @@ const tool = (name) => {
 /** The rendered text of one tool value — what the model actually reads. */
 const render = (name, args, value) => tool(name).output.render(args, value).map((part) => part.text).join('\n')
 
+/**
+ * tools/open-page.mjs — the dev-only script that puts the page in front of the
+ * extension. It is NOT a product path: the plugin declares no such tool, and
+ * this check drives the script instead of pretending a tool exists.
+ */
+const OPEN_PAGE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'tools', 'open-page.mjs')
+/** Start the script; it may stay resident holding the CDP session, so this never waits for exit. */
+function startScript(args) {
+  const child = spawn(process.execPath, [OPEN_PAGE_SCRIPT, ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const state = { child, stdout: '', stderr: '' }
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => { state.stdout += chunk })
+  child.stderr.on('data', (chunk) => { state.stderr += chunk })
+  return state
+}
+/** The one-line JSON answer the script prints once the page is open and reported. */
+async function openPageScript(args) {
+  const state = startScript(args)
+  const deadline = Date.now() + 90000
+  while (Date.now() < deadline) {
+    const lines = state.stdout.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('{'))
+    if (lines.length > 0) {
+      try { return JSON.parse(lines[lines.length - 1]) } catch { /* still a partial line */ }
+    }
+    if (state.child.exitCode !== null) break
+    await sleep(200)
+  }
+  throw new Error('tools/open-page.mjs gave no answer (' + state.stdout + state.stderr + ')')
+}
+/** Run it to completion — the --close and guard paths exit on their own. */
+async function runScript(args) {
+  const state = startScript(args)
+  await new Promise((done) => {
+    if (state.child.exitCode !== null) { done(); return }
+    // Cleared on exit: a pending timer would keep this process alive for a minute.
+    const limit = setTimeout(done, 60000)
+    state.child.once('exit', () => { clearTimeout(limit); done() })
+  })
+  return { code: state.child.exitCode, stdout: state.stdout, stderr: state.stderr }
+}
+
 /** The slice of http.IncomingMessage the handler touches, plus a JSON body. */
 function request({ method = 'POST', path = '/', body } = {}) {
   const text = body === undefined ? '' : JSON.stringify(body)
@@ -115,12 +160,10 @@ const TABS = [
 ]
 
 console.log('--- 1. nothing connected: [] and a checklist, never a blank ---')
-await checkAsync('list_pages answers pages: [] and hints with the first move, never a blank', async () => {
+await checkAsync('list_pages answers a plain array — empty here — and text that says what to check', async () => {
   const value = await tool('list_pages').execute({})
-  assert.deepEqual(value.pages, [])
-  assert.equal(Array.isArray(value.hints), true, 'hints is always an array, never missing')
-  assert.equal(value.hints.length > 0, true, 'nothing is connected, so hints says what to do first')
-  assert.match(value.hints.join('\n'), /open_page/)
+  assert.equal(Array.isArray(value), true, 'the value itself is the row array, not a wrapper')
+  assert.deepEqual(value, [])
 })
 await checkAsync('the rendered text names all five things to check', async () => {
   const value = await tool('list_pages').execute({})
@@ -132,7 +175,7 @@ await checkAsync('the rendered text names all five things to check', async () =>
   assert.doesNotMatch(text, /^\s*$/)
 })
 await checkAsync('the port is this instance\'s, learned from the web server', async () => {
-  const text = render('list_pages', {}, { pages: [], hints: [] })
+  const text = render('list_pages', {}, [])
   assert.match(text, new RegExp('http://127\\.0\\.0\\.1:' + String(instancePort)))
 })
 
@@ -141,8 +184,9 @@ await checkAsync('two tabs -> two rows, capturable:false keeps its reason', asyn
   const res = await poll({ instance: 'probe-ext', tabs: TABS })
   assert.equal(res.out.status, 200)
   const value = await tool('list_pages').execute({})
-  assert.equal(value.pages.length, 2)
-  const [first, second] = value.pages
+  assert.equal(Array.isArray(value), true, 'rows come back as an array')
+  assert.equal(value.length, 2)
+  const [first, second] = value
   assert.deepEqual(
     { instance: first.instance, tabId: first.tabId, url: first.url, title: first.title, focused: first.focused, capturable: first.capturable, stale: first.stale },
     { instance: 'probe-ext', tabId: 7, url: 'https://example.com/a', title: 'Example A', focused: true, capturable: true, stale: false }
@@ -163,9 +207,9 @@ await checkAsync('the rendered table marks the uncapturable row and explains why
 console.log('--- 3. the instance filter ---')
 await checkAsync('a second instance is listed, and the filter separates them', async () => {
   await poll({ instance: 'other-ext', tabs: [{ tabId: 1, url: 'https://example.org/', title: 'Org', focused: true, capturable: true }] })
-  assert.equal((await tool('list_pages').execute({})).pages.length, 3)
+  assert.equal((await tool('list_pages').execute({})).length, 3)
   const only = await tool('list_pages').execute({ instance: 'other-ext' })
-  assert.deepEqual(only.pages.map((row) => row.tabId), [1])
+  assert.deepEqual(only.map((row) => row.tabId), [1])
 })
 await checkAsync('an unknown instance lists nothing and says which ones are reporting', async () => {
   const text = render('list_pages', { instance: 'ghost' }, await tool('list_pages').execute({ instance: 'ghost' }))
@@ -178,7 +222,7 @@ await checkAsync('a report 50 seconds old is still listed, marked stale:true', a
   const seen = extensionHub.hub.instances.get('probe-ext')
   seen.at = Date.now() - 50 * 1000
   const rows = await tool('list_pages').execute({ instance: 'probe-ext' })
-  assert.deepEqual(rows.pages.map((row) => row.stale), [true, true])
+  assert.deepEqual(rows.map((row) => row.stale), [true, true])
   assert.match(render('list_pages', { instance: 'probe-ext' }, rows), /STALE: last reported/)
   seen.at = Date.now()
 })
@@ -186,14 +230,11 @@ await checkAsync('a report 70 seconds old leaves the list and is named as quiet,
   const seen = extensionHub.hub.instances.get('probe-ext')
   seen.at = Date.now() - 70 * 1000
   const rows = await tool('list_pages').execute({ instance: 'probe-ext' })
-  assert.deepEqual(rows.pages, [], 'an offline instance contributes no rows at all')
-  assert.equal(rows.hints.length > 0, true, 'the quiet instance is data a PTC caller can read, not just prose')
-  assert.match(rows.hints.join('\n'), /instance probe-ext went quiet \d+ seconds ago/, 'how long ago it went quiet')
-  assert.match(rows.hints.join('\n'), /open_page/, 'and the first call to make')
+  assert.deepEqual(rows, [], 'an offline instance contributes no rows at all')
   const text = render('list_pages', { instance: 'probe-ext' }, rows)
   assert.match(text, /instance probe-ext went quiet \d+ seconds ago and is not listed/)
   // The other instances are unaffected: filtering is per instance.
-  assert.equal((await tool('list_pages').execute({ instance: 'other-ext' })).pages.length, 1)
+  assert.equal((await tool('list_pages').execute({ instance: 'other-ext' })).length, 1)
   seen.at = Date.now()
 })
 
@@ -223,9 +264,11 @@ await checkAsync('the whole loop returns dir + files[].from with real bytes', as
   }
   assert.equal(readFileSync(value.files[0].from, 'utf8'), '<p>captured</p>')
   assert.match(value.summary, /2 file\(s\), 34 bytes total, 2 resource\(s\) dropped/)
-  // The two facts the rendered text carries and a PTC caller would otherwise miss.
-  assert.equal(value.next, 'create_ui_block({ name: "agent-tools-check", fromDir: "' + value.dir + '" })', 'next spells the call out, name and dir filled in')
-  assert.deepEqual(value.dangling, [], 'dangling is [] here: nothing in this material points at a missing file')
+  // The structured extras are GONE: the flow and the dangling list live in the
+  // rendered text only, and the value is the material itself.
+  assert.equal('next' in value, false, 'no next field — the flow is in the rendered text')
+  assert.equal('dangling' in value, false, 'no dangling field — the render lists them')
+  assert.deepEqual(value.index.dangling, [], 'nothing in this material points at a missing file')
 })
 await checkAsync('the report is report.json verbatim, and the text points at files[].from', async () => {
   // Same shape as the call above, run again to get a value to inspect.
@@ -244,7 +287,7 @@ await checkAsync('the report is report.json verbatim, and the text points at fil
   assert.match(text, /none of this material enters the conversation/)
 })
 
-await checkAsync('dangling lists the unresolved references, capped at five', async () => {
+await checkAsync('dangling stays in the rendered text: every unresolved reference, spelled out', async () => {
   const pending = tool('capture_page').execute({ instance: 'probe-ext', tabId: 7, name: 'agent-tools-dangling' })
   const taken = (await poll({ instance: 'probe-ext', tabs: TABS })).json()
   const imgs = [1, 2, 3, 4, 5, 6].map((n) => '<img src="./m' + String(n) + '.png">').join('')
@@ -256,9 +299,11 @@ await checkAsync('dangling lists the unresolved references, capped at five', asy
     report: { origin: 'https://example.com/a', title: 'A', dropped: [] }
   })
   const value = await pending
-  assert.equal(Array.isArray(value.dangling), true, 'dangling is always an array')
-  assert.equal(value.dangling.length, 5, 'six unresolved references, the first five reported: ' + JSON.stringify(value.dangling))
-  assert.match(value.dangling[0], /^entry\.html:\d+ \.\/m1\.png -> m1\.png$/, 'each item is "where:line ref -> path"')
+  assert.equal(Array.isArray(value.index.dangling), true, 'the index still counts every one')
+  assert.equal(value.index.dangling.length, 6, 'six unresolved references')
+  const text = render('capture_page', {}, value)
+  assert.match(text, /DANGLING — referenced but not captured \(6\)/, 'the render says how many, and that they 404')
+  assert.match(text, /^    entry\.html:\d+  \.\/m1\.png -> m1\.png$/m, 'each line is "where:line ref -> path"')
 })
 
 console.log('--- 6. a timeout names the silence ---')
@@ -307,7 +352,7 @@ await checkAsync('tab gone -> names the tabId, does NOT substitute another tab',
 })
 await checkAsync('the tab comes back and the list is usable again', async () => {
   await poll({ instance: 'probe-ext', tabs: TABS })
-  assert.equal((await tool('list_pages').execute({ instance: 'probe-ext' })).pages.length, 2)
+  assert.equal((await tool('list_pages').execute({ instance: 'probe-ext' })).length, 2)
 })
 
 console.log('--- 8. an extension-reported failure keeps its own words ---')
@@ -350,16 +395,16 @@ await checkAsync('a non-numeric tabId never reaches the queue', async () => {
 console.log('--- 10. a poll that omits tabs keeps the last list; tabs:[] clears it ---')
 await checkAsync('a poll without the tabs field keeps the previous list', async () => {
   await poll({ instance: 'keep-ext', tabs: TABS })
-  assert.equal((await tool('list_pages').execute({ instance: 'keep-ext' })).pages.length, 2)
+  assert.equal((await tool('list_pages').execute({ instance: 'keep-ext' })).length, 2)
   // The extension's fingerprint-only round: instance + tabsTag, no tabs.
   const fingerprintOnly = await poll({ instance: 'keep-ext', tabsTag: 'same-ish-tag' })
   assert.equal(fingerprintOnly.out.status, 200)
-  assert.deepEqual((await tool('list_pages').execute({ instance: 'keep-ext' })).pages.map((row) => row.tabId), [7, 9])
+  assert.deepEqual((await tool('list_pages').execute({ instance: 'keep-ext' })).map((row) => row.tabId), [7, 9])
 })
 await checkAsync('tabs: [] is the one way to say "this browser has no tabs now"', async () => {
   await poll({ instance: 'keep-ext', tabs: [] })
-  assert.equal((await tool('list_pages').execute({ instance: 'keep-ext' })).pages.length, 0)
-  assert.match(render('list_pages', { instance: 'keep-ext' }, { pages: [], hints: [] }), /No browser tab is on the list for instance "keep-ext"/)
+  assert.equal((await tool('list_pages').execute({ instance: 'keep-ext' })).length, 0)
+  assert.match(render('list_pages', { instance: 'keep-ext' }, []), /No browser tab is on the list for instance "keep-ext"/)
   // The hub itself now holds zero tabs for it — the cleared list, not a stale copy.
   assert.equal(extensionHub.hub.instances.get('keep-ext').tabs.length, 0)
 })
@@ -393,7 +438,7 @@ await checkAsync('an offline instance STAYS in agents, marked stale with its las
   assert.equal(quiet.stale, true)
   assert.equal(Math.abs(new Date(quiet.lastSeenAt).getTime() - seen.at) < 1000, true)
   // ... and it contributes no rows, so the card's "已断开" and the tool agree.
-  assert.deepEqual((await tool('list_pages').execute({ instance: 'keep-ext' })).pages, [])
+  assert.deepEqual(await tool('list_pages').execute({ instance: 'keep-ext' }), [])
   seen.at = Date.now()
 })
 await checkAsync('the info answer keeps the install fields and carries no token', async () => {
@@ -485,81 +530,96 @@ await checkAsync('a non-registry listener on the port is reported once, never re
 })
 reg.stop('test done')
 
-console.log('--- 13. open_page guards: bad URLs and names never start a browser ---')
-await checkAsync('only http(s) is accepted, and url is required unless close is true', async () => {
-  await assert.rejects(() => tool('open_page').execute({}), /url is required/)
-  await assert.rejects(() => tool('open_page').execute({ url: 'file:///C:/x.html' }), /must be http or https/)
-  await assert.rejects(() => tool('open_page').execute({ url: 'chrome://settings' }), /must be http or https/)
-  await assert.rejects(() => tool('open_page').execute({ url: 'not a url' }), /not a URL/)
+console.log('--- 13. the tool table has no open_page, and list_pages hands back an array ---')
+await checkAsync('the declared tools are exactly four, and open_page is not one of them', async () => {
+  const names = [...tools.keys()].sort()
+  assert.deepEqual(names, ['capture_page', 'create_ui_block', 'list_pages', 'read_ui_block'], 'the whole tool table: ' + names.join(', '))
+  assert.equal(names.includes('open_page'), false)
 })
-await checkAsync('a name create_ui_block would reject never reaches the extension', async () => {
-  await assert.rejects(() => tool('open_page').execute({ url: 'https://example.com', name: 'bad/name' }), /name must be 1-64 chars/)
-  assert.deepEqual(openPage.open(), [], 'no browser was started')
+await checkAsync('no tool description names open_page, a launch flag or a skill', async () => {
+  for (const name of ['capture_page', 'create_ui_block', 'list_pages', 'read_ui_block']) {
+    assert.equal(/open_page/.test(tool(name).description), false, name + ' description still names open_page')
+  }
+  const list = tool('list_pages').description
+  assert.match(list, /YOUR call/, 'whether a browser with the extension exists is the agent\'s judgement')
+  assert.match(list, /captureDir in GET \/ui-block-extension\/info/, 'where the extension directory comes from')
+  assert.match(list, /reuse it/, 'one fixed browser, reused instead of rebuilt')
+  assert.equal(/--load-extension|--headless|--user-data-dir|--remote-debugging/.test(list), false, 'no launch flags in the description')
+  assert.equal(/cdp-test|skill/i.test(list), false, 'no skill name in the description')
+  assert.match(tool('capture_page').description, /previous step is one row's instance \+ tabId, and the next one is create_ui_block\(\{ name, fromDir \}\)/, 'the three-step flow is spelled out')
 })
-await checkAsync('an unknown colorScheme is refused before a browser starts', async () => {
-  await assert.rejects(() => tool('open_page').execute({ url: 'https://example.com', colorScheme: 'sepia' }), /colorScheme must be one of light, dark, no-preference/)
-  assert.deepEqual(openPage.open(), [], 'no browser was started')
+await checkAsync('list_pages declares an array and returns one', async () => {
+  assert.equal(tool('list_pages').output.schema.type, 'array', 'the schema itself is an array of rows')
+  const value = await tool('list_pages').execute({})
+  assert.equal(Array.isArray(value), true, 'Array.isArray(value) === true')
 })
-await checkAsync('closing an unknown name reports nothing closed', async () => {
-  const value = await tool('open_page').execute({ close: true, name: 'never-opened' })
-  assert.deepEqual(value.closed, [])
-  assert.match(render('open_page', {}, value), /nothing was open under that name/)
-})
-await checkAsync('the capture description points at open_page, and open_page says what it returns', async () => {
-  assert.match(tool('capture_page').description, /call open_page\(\{ url \}\) first/)
-  assert.match(tool('open_page').description, /\{ instance, tabId \}/)
-  assert.match(tool('open_page').description, /stays open/i)
-  assert.match(render('open_page', {}, { instance: 'x', tabId: 7, url: 'https://x/', title: '' }), /capture_page\(\{ instance: "x", tabId: 7 \}\)/)
+await checkAsync('tools/open-page.mjs refuses a non-http URL without starting a browser', async () => {
+  const out = await runScript(['--url', 'file:///C:/x.html'])
+  assert.equal(out.code, 1, 'exit code 1')
+  assert.match(out.stderr, /must be http or https/)
 })
 
-console.log('--- 14. open_page -> list_pages -> capture_page -> create_ui_block, live ---')
+console.log('--- 14. list_pages -> capture_page -> create_ui_block, live (the page comes from tools/open-page.mjs) ---')
 let live
 try {
-  await checkAsync('a real headless browser opens the page and returns the pair list_pages shows', async () => {
-    live = await tool('open_page').execute({ url: 'http://127.0.0.1:' + String(instancePort) + '/page', name: 'open-live', waitMs: 30000 })
+  await checkAsync('the script opens the page and list_pages shows that pair as a row', async () => {
+    live = await openPageScript(['--url', 'http://127.0.0.1:' + String(instancePort) + '/page', '--name', 'open-live', '--instance-port', String(instancePort), '--wait-ms', '30000'])
     assert.equal(live.instance, 'open-live')
     assert.equal(Number.isFinite(live.tabId), true)
     assert.match(live.url, /\/page$/)
     assert.equal(live.title, 'Open Page Probe')
-    const rows = await tool('list_pages').execute({ instance: 'open-live' })
-    assert.ok(rows.pages.some((row) => row.tabId === live.tabId), 'the same tabId is in list_pages')
-    assert.ok(openPage.open().includes('open-live'), 'the browser is kept, not closed after the call')
+    // list_pages is the product path: poll it until the extension's report has
+    // caught up, and take the row it hands back rather than trusting the script.
+    let row
+    const deadline = Date.now() + 20000
+    while (Date.now() < deadline && row === undefined) {
+      const rows = await tool('list_pages').execute({ instance: 'open-live' })
+      assert.equal(Array.isArray(rows), true, 'list_pages hands back the rows themselves')
+      row = rows.find((item) => item.capturable === true && item.tabId === live.tabId)
+      if (row === undefined) await sleep(500)
+    }
+    assert.ok(row, 'the script\'s { instance, tabId } shows up as a capturable row: ' + JSON.stringify({ instance: live.instance, tabId: live.tabId }))
+    live = { ...live, instance: row.instance, tabId: row.tabId }
   })
-  await checkAsync('that pair drives capture_page, create_ui_block and a 200 block URL', async () => {
-    const captured = await tool('capture_page').execute({ instance: live.instance, tabId: live.tabId, name: 'open-live-block', timeout_ms: 30000 })
+  await checkAsync('that row drives capture_page, create_ui_block and a 200 block URL', async () => {
+    const rows = await tool('list_pages').execute({ instance: live.instance })
+    const row = rows.find((item) => item.tabId === live.tabId)
+    assert.ok(row, 'the row is still listed')
+    const captured = await tool('capture_page').execute({ instance: row.instance, tabId: row.tabId, name: 'open-live-block', timeout_ms: 30000 })
     assert.ok(captured.files.length >= 1)
-    // Defect A+B: the page is read at the pinned desktop viewport, in light.
+    // The page is read at the pinned desktop viewport, in light.
     const capturedEntry = captured.files.find((file) => /\.html$/i.test(file.path))
     assert.match(readFileSync(capturedEntry.from, 'utf8'), /1440x900\|dark=false\|bg=rgb\(255, 255, 255\)/)
-    // Defect C: the next call is spelled out in the result.
+    // The next call is spelled out in the rendered text.
     assert.match(render('capture_page', {}, captured), /^NEXT: create_ui_block\(\{ name: "open-live-block", fromDir: ".*" \}\)$/m)
     const block = await tool('create_ui_block').execute({ name: 'open-live-block', fromDir: captured.fromDir })
     assert.ok(existsSync(join(tempHome, 'ui-blocks', 'open-live-block.uiblock')), 'the block file is on disk')
-    assert.match(render('create_ui_block', {}, block), /^NEXT: read_ui_block\(\{ name: "open-live-block" \}\)$/m)
+    assert.equal('next' in block, false, 'create_ui_block no longer carries a next field')
+    assert.equal('warnings' in block, false, 'nor a warnings field')
+    assert.match(render('create_ui_block', {}, block), /^NEXT: read_ui_block\(\{ name: "open-live-block" \}\)$/m, 'the rendered text still spells it out')
     const res = await fetch('http://127.0.0.1:' + String(instancePort) + '/ui-blocks/open-live-block/')
     assert.equal(res.status, 200)
     assert.match(await res.text(), /hello/)
   })
-  await checkAsync('close:true shuts that browser down and forgets it', async () => {
-    const value = await tool('open_page').execute({ close: true, name: 'open-live' })
-    assert.deepEqual(value.closed, ['open-live'])
-    assert.deepEqual(openPage.open(), [])
+  await checkAsync('--close shuts that browser down and says which instance it closed', async () => {
+    const out = await runScript(['--close', '--name', 'open-live'])
+    assert.equal(out.code, 0)
+    assert.deepEqual(JSON.parse(out.stdout).closed, ['open-live'])
     await sleep(300)
   })
 } finally {
-  await tool('open_page').execute({ close: true }).catch(() => {})
+  await runScript(['--close']).catch(() => {})
 }
 
 console.log('--- 15. width / colorScheme overrides reach the page ---')
-await checkAsync('width:800 + colorScheme:"dark" is measured by the page, not the default', async () => {
-  const opened = await tool('open_page').execute({ url: 'http://127.0.0.1:' + String(instancePort) + '/page', name: 'open-override', width: 800, colorScheme: 'dark', waitMs: 30000 })
+await checkAsync('--width 800 + --color-scheme dark are measured by the page, not the default', async () => {
+  const opened = await openPageScript(['--url', 'http://127.0.0.1:' + String(instancePort) + '/page', '--name', 'open-override', '--width', '800', '--color-scheme', 'dark', '--instance-port', String(instancePort), '--wait-ms', '30000'])
   const captured = await tool('capture_page').execute({ instance: opened.instance, tabId: opened.tabId, name: 'open-override-block', timeout_ms: 30000 })
   const entry = captured.files.find((file) => /\.html$/i.test(file.path))
   assert.match(readFileSync(entry.from, 'utf8'), /800x900\|dark=true\|bg=rgb\(255, 255, 255\)/)
-  const closed = await tool('open_page').execute({ close: true, name: 'open-override' })
-  assert.deepEqual(closed.closed, ['open-override'])
+  const closed = await runScript(['--close', '--name', 'open-override'])
+  assert.deepEqual(JSON.parse(closed.stdout).closed, ['open-override'])
 })
-
 await new Promise((done) => server.close(done))
 await rm(tempHome, { recursive: true, force: true })
 console.log('self-check-agent-tools: ' + checks.length + ' checks OK')
