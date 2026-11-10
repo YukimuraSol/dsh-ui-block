@@ -320,6 +320,11 @@ async function main() {
       // 夹具页从这台服务取（about:blank 没有 origin，根绝对 url(/static/…) 没法绝对化，
       // 也就复现不出真实事故）。/static/probe.svg 就是 CSS 里那条根绝对引用的落点。
       '/blank.html': { mime: 'text/html', bytes: Buffer.from('<!doctype html><html><head><title>probe</title></head><body><p>blank</p></body></html>', 'utf8') },
+      // frame 夹具：正文整个在 iframe 里，iframe 占 90% 可视高，顶层文档只有它一个元素。
+      // 真实事故就是这个形态（教务页），扩展只注入顶层文档，抓回来是空的。
+      '/shell.html': { mime: 'text/html', bytes: Buffer.from('<!doctype html><html><head><meta charset="utf-8"><title>frame shell</title><style>html,body{margin:0;height:100%}iframe{display:block;width:100vw;height:90vh;border:0}</style></head><body><iframe id="shell" src="/blank.html"></iframe></body></html>', 'utf8') },
+      // 反例：普通页面，正文就在顶层文档里，没有任何 frame —— 不许喊 FRAME SHELL。
+      '/normal.html': { mime: 'text/html', bytes: Buffer.from('<!doctype html><html><head><meta charset="utf-8"><title>normal page</title><style>body{margin:0;font-family:system-ui}main{padding:24px}h1{margin:0 0 12px}p{margin:0 0 8px}</style></head><body><main><h1>普通页面</h1><p>这一页的正文就在顶层文档里，没有任何 frame。</p><p>第二段用来凑够可见元素数。</p><ul><li>一</li><li>二</li><li>三</li></ul></main></body></html>', 'utf8') },
       '/static/probe.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(16, '#3355ff'), 'utf8') },
     });
     srv = started.server;
@@ -535,6 +540,45 @@ async function main() {
         '，:href=' + JSON.stringify(vueHref) + '，xlink:href=' + JSON.stringify(svgHref) +
         '（期望 ' + JSON.stringify(hostA + '/x') + '、' + JSON.stringify(hostA + '/y') + '、' + JSON.stringify(vueWant) + '、"#icon"）');
 
+    // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
+    // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是
+    // 自己猜三轮、再问用户三选一，白等 1 分 54 秒。这里证明两件事：report.frames 点名了
+    // 那个框，并且返回的第一条就是那句固定的话。
+    const FRAME_SHELL_TEXT = 'THIS PAGE IS A FRAME SHELL — the visible content lives inside a frame; capturing the top document yields nothing usable.';
+    await cdp.navigate(s, hostA + '/shell.html');
+    const injShell = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injShell.exceptionDetails) throw new Error('shell 页注入 extractor 失败：' + JSON.stringify(injShell.exceptionDetails));
+    const shellRun = await runExtract(s, { origin: hostA + '/shell.html' });
+    const shellReport = shellRun.report;
+    const shellEntry = (shellRun.files.find((f) => f.path === 'entry.html') || {}).content || '';
+    const shellFrames = shellReport.frames || {};
+    const shellFirst = String((shellReport.dropped || [])[0] || '');
+    assert('frame 夹具：report.frames 点名那个 iframe（total 1、同源、占比 > 30%、有尺寸）',
+      shellFrames.total === 1 && shellFrames.sameOrigin === 1 && shellFrames.crossOrigin === 0 &&
+        !!shellFrames.dominant && shellFrames.dominant.areaRatio > 0.3 && shellFrames.dominant.w > 0 && shellFrames.dominant.h > 0 &&
+        String(shellFrames.dominant.src).indexOf('/blank.html') >= 0,
+      JSON.stringify(shellFrames) + '；entry ' + shellEntry.length + ' 字符（空壳）');
+    assert('frame 夹具：frameShell 触发，dropped 首条就是那句固定话（可 grep）',
+      shellReport.frameShell === true && shellFirst === FRAME_SHELL_TEXT &&
+        (shellReport.notes || []).some((n) => String(n).indexOf('在标签页中打开框架') >= 0),
+      'frameShell=' + String(shellReport.frameShell) + '；dropped[0]=' + JSON.stringify(shellFirst) +
+        '；notes=' + JSON.stringify(shellReport.notes));
+
+    // ---- 17. 正常页不许喊 FRAME SHELL（避免误报）-----------------------------
+    await cdp.navigate(s, hostA + '/normal.html');
+    const injNormal = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injNormal.exceptionDetails) throw new Error('normal 页注入 extractor 失败：' + JSON.stringify(injNormal.exceptionDetails));
+    const normalRun = await runExtract(s, { origin: hostA + '/normal.html' });
+    const normalReport = normalRun.report;
+    const normalEntry = (normalRun.files.find((f) => f.path === 'entry.html') || {}).content || '';
+    const normalDroppedText = (normalReport.dropped || []).join(' | ');
+    assert('正常页不误报：frames.total=0、没有 frameShell、正文在 entry 里',
+      !!normalReport.frames && normalReport.frames.total === 0 && normalReport.frames.dominant === null &&
+        normalReport.frameShell === undefined && normalDroppedText.indexOf('FRAME SHELL') < 0 &&
+        normalEntry.indexOf('普通页面') >= 0 && (normalReport.notes || []).length === 0,
+      'frames=' + JSON.stringify(normalReport.frames) + '；frameShell=' + String(normalReport.frameShell) +
+        '；entry ' + normalEntry.length + ' 字符；dropped 里有 FRAME SHELL=' + String(normalDroppedText.indexOf('FRAME SHELL') >= 0));
+
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });
     mkdirSync(OUT, { recursive: true });
@@ -571,6 +615,7 @@ async function main() {
     console.log('  元素              子树 ' + report.elements + ' 个，固化 ' + report.computedRules + ' 条计算样式规则');
     console.log('  资源              内嵌 ' + report.assetsInlined + ' · 落 assets/ ' + report.assetsSpilled);
     console.log('  祖先链            ' + report.ancestors.map((a) => a.tag + (a.id ? '#' + a.id : '')).join(' < '));
+    console.log('  frames            ' + JSON.stringify(report.frames));
     if (report.degrade.length) console.log('  降级              ' + report.degrade.join(' | '));
     console.log('  dropped ' + report.dropped.length + ' 条：');
     for (const d of report.dropped.slice(0, 8)) console.log('    - ' + d);

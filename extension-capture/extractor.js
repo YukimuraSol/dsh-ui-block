@@ -37,6 +37,21 @@
   var MAX_FETCH_BYTES = 12 * 1024 * 1024;
   var SECTION_MAX_BYTES = 2 * 1024 * 1024; // 块格式单段上限（DSH 侧默认值）
 
+  // ---- frame 盲区 ---------------------------------------------------------
+  // 正文装在 iframe 里的页面（实测教务页就是），顶层文档抓下来是一片空：扩展只注入
+  // 顶层文档，没有 all_frames，跨域 frame 连读都读不到。不点名的话，模型会当成
+  // 「页面没内容」或「我抓错了」，自己猜三轮再去问用户三选一，白等两分钟。
+  var FRAME_SEL = 'iframe, frame, object, embed';
+  /** 一个 frame 盖住可视区 30% 以上，就算「正文在框里」。 */
+  var FRAME_DOMINANT_RATIO = 0.3;
+  /** 顶层文档的「空」判据：可见文字 < 50 字符，可见元素 < 5 个。 */
+  var FRAME_SHELL_TEXT_MAX = 50;
+  var FRAME_SHELL_ELEMENTS_MAX = 5;
+  /** 固定一句话，可 grep：模型第一步就知道空的不是它的错。 */
+  var FRAME_SHELL_LINE = 'THIS PAGE IS A FRAME SHELL — the visible content lives inside a frame; capturing the top document yields nothing usable.';
+  var FRAME_NOTE = '页面正文在一个 iframe 里，顶层文档抓不到它；最省事的解法是在该框架上右键「在标签页中打开框架」，然后把那个新标签页的 DOM 抓下来。';
+  var FRAME_ASK = '遇到 frame shell 不要问用户三选一：直接说「把那个框架在新标签打开，我抓那个标签」——截图只能当参考，按公开样式硬猜是下策。';
+
   var ENTRY = 'entry.html';
   var APP_CSS = 'shared/app.css';
   var PAGE_CSS = 'pages/current/page.css';
@@ -314,6 +329,72 @@
 
     var win = doc.defaultView || {};
     var base = (doc.baseURI || (doc.location && doc.location.href) || '') + '';
+
+    // 0.0) frame 盲区：正文装在 iframe 里的页面，顶层文档抓下来是空的
+    // 统计 iframe/frame/object/embed：数量、每个的 src、可见尺寸、占可视区比例；
+    // 同源/跨域按「摸不摸得到 contentDocument」判（跨域那份门是关的，读出来是 null）。
+    var frameEls = [];
+    try { frameEls = Array.prototype.slice.call(doc.querySelectorAll(FRAME_SEL)); } catch (e) { frameEls = []; }
+    var viewW = Number(win.innerWidth) || (doc.documentElement && doc.documentElement.clientWidth) || 0;
+    var viewH = Number(win.innerHeight) || (doc.documentElement && doc.documentElement.clientHeight) || 0;
+    var viewArea = Math.max(1, viewW * viewH);
+    var pageOrigin = '';
+    try { pageOrigin = String((win.location && win.location.origin) || ''); } catch (e) { pageOrigin = ''; }
+    var frameItems = [];
+    var frameSame = 0, frameCross = 0;
+    for (var fi = 0; fi < frameEls.length && fi < 16; fi++) {
+      var fe = frameEls[fi];
+      var fsrc = '';
+      try { fsrc = String(fe.getAttribute('src') || fe.getAttribute('data') || ''); } catch (e) { fsrc = ''; }
+      var fabs = fsrc ? absUrl(fsrc, base) : '';
+      var fw = 0, fh = 0, fratio = 0;
+      try {
+        var frect = fe.getBoundingClientRect();
+        fw = Math.round(frect.width);
+        fh = Math.round(frect.height);
+        // 只算落在视口里的那部分：整块在折叠线以下，就不算占住主区域
+        var fvw = Math.max(0, Math.min(frect.right, viewW) - Math.max(frect.left, 0));
+        var fvh = Math.max(0, Math.min(frect.bottom, viewH) - Math.max(frect.top, 0));
+        fratio = Math.round((fvw * fvh) / viewArea * 1000) / 1000;
+      } catch (e) { fw = 0; fh = 0; fratio = 0; }
+      // 同源 = 摸得到 contentDocument，或 src 的源就是本页的源（覆盖还在加载的那一下）
+      var freadable = false;
+      try { freadable = !!fe.contentDocument; } catch (e) { freadable = false; }
+      var fsameByUrl = false;
+      if (fabs) { try { fsameByUrl = new URL(fabs).origin === pageOrigin; } catch (e) { fsameByUrl = false; } }
+      var fSame = freadable || fsameByUrl;
+      if (fSame) frameSame++; else frameCross++;
+      var fshown = fabs || fsrc;
+      if (fshown.length > 300) fshown = fshown.slice(0, 300) + '…';
+      frameItems.push({ tag: String(fe.tagName || '').toLowerCase(), src: fshown, w: fw, h: fh, areaRatio: fratio, sameOrigin: fSame });
+    }
+    frameItems.sort(function (a, b) { return b.areaRatio - a.areaRatio; });
+    var frameDominant = (frameItems.length > 0 && frameItems[0].areaRatio > FRAME_DOMINANT_RATIO) ? frameItems[0] : null;
+
+    // 顶层文档是不是空壳：可见文字少、可见元素也少，同时有个 frame 占着主区域。
+    // 三条同时成立才算，正常页（有正文、元素多）永远不会走到这里。
+    var shellText = '';
+    try { shellText = String((doc.body && (doc.body.innerText || doc.body.textContent)) || '').replace(/\s+/g, ''); } catch (e) { shellText = ''; }
+    var shellVisible = 0;
+    var shellScan = [];
+    try { shellScan = doc.body ? Array.prototype.slice.call(doc.body.querySelectorAll('*')) : []; } catch (e) { shellScan = []; }
+    for (var sv = 0; sv < shellScan.length && sv < 3000; sv++) {
+      var svTag = String(shellScan[sv].tagName || '').toLowerCase();
+      if (svTag === 'script' || svTag === 'style' || svTag === 'link' || svTag === 'meta' || svTag === 'title') continue;
+      var svRect = null;
+      try { svRect = shellScan[sv].getBoundingClientRect(); } catch (e) { continue; }
+      if (svRect && svRect.width > 0 && svRect.height > 0) shellVisible++;
+    }
+    var frameShell = !!frameDominant && shellText.length < FRAME_SHELL_TEXT_MAX && shellVisible < FRAME_SHELL_ELEMENTS_MAX;
+    var notes = [];
+    if (frameDominant) notes.push(FRAME_NOTE);
+    if (frameShell) {
+      notes.push(FRAME_ASK);
+      // 双保险：有的客户端只打印 dropped，那句必须在 dropped 里也有，且排在最前
+      // （本块跑在一切资源解析之前，所以 drop() 进去就是第 0 条）。
+      drop(FRAME_SHELL_LINE);
+      drop(FRAME_NOTE);
+    }
 
     // 0) 变量表：:root 打底，body 覆盖（页面常把主题变量挂在 body 上）
     var vars = readVars(win.getComputedStyle ? win.getComputedStyle(doc.documentElement) : null);
@@ -948,8 +1029,21 @@
       srcsetPicked: srcsetPickedUrls,
       removedNodes: removedNodes,
       ancestors: ancestors,
-      degrade: degrade
+      degrade: degrade,
+      // frame 盲区：扩展只注入顶层文档，正文装在 iframe 里时抓到的就是空壳。
+      // dominant = 盖住可视区 30% 以上的那个 frame（没有就是 null）。
+      frames: {
+        total: frameEls.length,
+        sameOrigin: frameSame,
+        crossOrigin: frameCross,
+        dominant: frameDominant,
+        items: frameItems
+      },
+      notes: notes
     };
+    // 空壳标记：只在这一种情况下出现（与 hiddenTab / includesIgnored 同一口径——
+    // 没有这个字段 = 没发生），调用方看到它就该把「正文在框里」直接说出来。
+    if (frameShell) report.frameShell = true;
     // includes 已废：传了就记一个布尔 true（口径与其它布尔字段一致——没有这个字段 = 没传），
     // 具体传了什么写在 degrade 那条说明里。产物恒定是 entry + 两份 CSS + 资源落点。
     if (includesIgnored.length) report.includesIgnored = true;

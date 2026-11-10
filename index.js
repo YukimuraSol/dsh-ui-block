@@ -1729,6 +1729,8 @@ const CAPTURE_DESCRIPTION = [
   '',
   'SAY WHAT DIFFERS, EVERY TIME — a capture is not the site: the stylesheets that could not be fetched (report.sheetsFailed; a missing <link> takes all its rules with it), the files a ceiling left out (report.dropped, skipped), and the positioning the capture froze into element rules (position / inset / top / right / bottom / transform / z-index / overflow written as values, so a sticky header no longer sticks). One line per difference, named. "已完成" on its own is not a delivery.',
   '',
+  'If the report says the page is a frame shell, the visible content lives in a frame the top document does not expose. Do not ask the user to choose between a screenshot, a rebuild and a guess. Give one instruction: right-click inside that frame, open it in its own tab, and capture that tab — that is the only route to real DOM and real styles.',
+  '',
   'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer (60 seconds; a tab closed or navigated since list_pages fails here, and a timeout means the extension never answered — either way call list_pages again instead of retrying the same tabId), and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
   '',
   'files[].from is the ABSOLUTE path of each file on disk. Pass those strings as create_ui_block\'s files[].from and the host copies the bytes itself: a few hundred KB of material then costs no context at all. Read a file only when the caller asked to change its content.',
@@ -2671,9 +2673,31 @@ function indexGroupsText(index) {
   return 'index: ' + String(index.count) + ' file(s), ' + String(index.totalBytes) + ' bytes — ' + parts.join(', ')
 }
 
+/**
+ * The one sentence a frame-shell capture must lead with. Fixed wording, and greppable
+ * on purpose: the extension writes the same string first into report.dropped.
+ */
+const FRAME_SHELL_LINE = 'THIS PAGE IS A FRAME SHELL — the visible content lives inside a frame; capturing the top document yields nothing usable.'
+/** The follow-up instruction that belongs with that sentence, in the same voice. */
+const FRAME_SHELL_NEXT = 'The visible content is not in the document that was captured: right-click inside that frame, open it in its own tab, and capture THAT tab — it is the only route to the real DOM and the real styles.'
+
+/**
+ * True when the extension flagged the page as a frame shell. The extension decides
+ * (it is the one that can measure the frames); this only reads its answer, so a
+ * report without the flag never invents one.
+ */
+function isFrameShell(report) {
+  return report !== null && typeof report === 'object' && report.frameShell === true
+}
+
 /** The capture tool's rendered text: where it landed, what to do with it, the index, the report. */
 function captureText(value) {
-  const lines = ['Capture landed in ' + value.dir + ' — ' + value.summary, '']
+  const lines = []
+  // A frame shell goes FIRST, before any file list, byte count or dropped summary.
+  // Buried in report.dropped it reads like the 40 false "lost resource" lines that
+  // sent a model off to re-capture the whole page; this one decides what to do next.
+  if (isFrameShell(value.report)) lines.push(FRAME_SHELL_LINE, FRAME_SHELL_NEXT, '')
+  lines.push('Capture landed in ' + value.dir + ' — ' + value.summary, '')
   const index = value.index
   if (index !== undefined && index !== null) {
     lines.push(indexGroupsText(index))

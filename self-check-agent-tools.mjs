@@ -553,6 +553,30 @@ await checkAsync('no tool description names open_page, a launch flag or a skill'
   assert.match(tool('capture_page').description, /132 seconds/, 'the cost of that question is recorded')
   assert.match(tool('capture_page').description, /SAY WHAT DIFFERS, EVERY TIME/, 'the differences are part of the delivery')
   assert.equal(/已完成/.test(tool('capture_page').description), true, 'saying only 已完成 is refused in so many words')
+  // A frame shell is not a menu: one instruction, and no three-way question. The
+  // wording is fixed so the model can act on it without re-deriving the case.
+  assert.match(tool('capture_page').description, /frame shell, the visible content lives in a frame the top document does not expose/, 'the frame-shell case is named')
+  assert.match(tool('capture_page').description, /open it in its own tab, and capture that tab/, 'the one instruction is spelled out')
+  assert.match(tool('capture_page').description, /Do not ask the user to choose between a screenshot, a rebuild and a guess/, 'the three-way question is refused by name')
+})
+await checkAsync('a frame-shell capture leads with the fixed sentence; a normal capture never does', async () => {
+  const base = {
+    dir: join(tempHome, 'ui-captures', 'frame-shell'),
+    summary: '2 file(s), 900 bytes total, nothing lost',
+    files: [{ path: 'entry.html', bytes: 120, from: join(tempHome, 'ui-captures', 'frame-shell', 'entry.html') }]
+  }
+  const shellText = render('capture_page', {}, {
+    ...base,
+    report: { origin: 'https://jw.example/', frameShell: true, frames: { total: 1, sameOrigin: 0, crossOrigin: 1, dominant: { src: 'https://jw.example/sso', w: 1200, h: 800, areaRatio: 0.9 } } }
+  })
+  assert.equal(shellText.split('\n')[0], 'THIS PAGE IS A FRAME SHELL — the visible content lives inside a frame; capturing the top document yields nothing usable.', 'the sentence is line one, before any file list or byte count')
+  assert.match(shellText, /open it in its own tab/, 'the one instruction follows it')
+  const normalText = render('capture_page', {}, {
+    ...base,
+    report: { origin: 'https://jw.example/', frames: { total: 0, sameOrigin: 0, crossOrigin: 0, dominant: null } }
+  })
+  assert.equal(normalText.indexOf('FRAME SHELL'), -1, 'a normal page never says it')
+  assert.match(normalText.split('\n')[0], /^Capture landed in /, 'the normal text starts where it always did')
 })
 await checkAsync('list_pages declares an array and returns one', async () => {
   assert.equal(tool('list_pages').output.schema.type, 'array', 'the schema itself is an array of rows')
