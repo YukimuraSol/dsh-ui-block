@@ -547,6 +547,12 @@ await checkAsync('no tool description names open_page, a launch flag or a skill'
   assert.equal(/--load-extension|--headless|--user-data-dir|--remote-debugging/.test(list), false, 'no launch flags in the description')
   assert.equal(/cdp-test|skill/i.test(list), false, 'no skill name in the description')
   assert.match(tool('capture_page').description, /previous step is one row's instance \+ tabId, and the next one is create_ui_block\(\{ name, fromDir \}\)/, 'the three-step flow is spelled out')
+  // 复刻 = capture + build, delivered at once: no plan first, no "which kind" question.
+  assert.match(tool('capture_page').description, /RECREATING A PAGE MEANS CAPTURE \+ BUILD, DELIVERED IN ONE GO/, 'the recreation contract is named')
+  assert.match(tool('capture_page').description, /Do NOT write a plan for the recreation first and do NOT ask which kind/, 'no plan and no either-or question before building')
+  assert.match(tool('capture_page').description, /132 seconds/, 'the cost of that question is recorded')
+  assert.match(tool('capture_page').description, /SAY WHAT DIFFERS, EVERY TIME/, 'the differences are part of the delivery')
+  assert.equal(/已完成/.test(tool('capture_page').description), true, 'saying only 已完成 is refused in so many words')
 })
 await checkAsync('list_pages declares an array and returns one', async () => {
   assert.equal(tool('list_pages').output.schema.type, 'array', 'the schema itself is an array of rows')

@@ -18,6 +18,9 @@
  *   7. per-file ceiling: the message carries size, limit, DIFFERENCE and the exits
  *   8. limits config: block ceiling read from config, missing fields defaulted
  *   9. soft warn: past 16 MB the block still writes and says why it is heavy
+ *  10. the capture index, and the capture text saying capture+build IS delivery
+ *  11. tag hygiene: a raw-text tag (<title> ...) used as a container becomes <div>
+ *      at build time, the head title and the material file stay untouched
  */
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
@@ -376,6 +379,46 @@ await ta('the dangling list is what the capture does NOT have, and the render sa
   assert.match(text, /DANGLING — referenced but not captured \(1\)/)
   assert.match(text, /entry\.html:2 +\.\/missing\.png -> missing\.png/)
   assert.match(text, /create_ui_block\(\{ name: "capture-index", fromDir: "/)
+  // The delivery rule, at the one place the next action is chosen.
+  assert.match(text, /RECREATING A PAGE IS CAPTURE \+ BUILD/)
+  assert.match(text, /THEN SAY WHAT DIFFERS/)
+  assert.match(text, /not a delivery/)
+})
+
+console.log('--- 11. tag hygiene: a raw-text tag used as a container in the body ---')
+// The material a capture really produces: Vue built <title> with createElement,
+// so it has element children; parsed as HTML it is RCDATA and its children come
+// back as text. The block is built from a rewritten copy, the material is not.
+const rawTag = material('raw-tag')
+const RAW_CONTAINER = '<title class="title flex-row" data-dsh-el="e255"><b>t</b></title>'
+put(rawTag, 'entry.html', [
+  '<!doctype html>',
+  '<html><head><title>page</title></head>',
+  '<body>',
+  RAW_CONTAINER,
+  '<p>after</p>',
+  '</body></html>',
+  ''
+].join('\n'))
+await ta('a body <title> with element children is rewritten to a div; the head title is not', async () => {
+  const value = await create.execute({ name: 'raw-tag', fromDir: rawTag })
+  const text = readFileSync(blockFile('raw-tag'), 'utf8')
+  assert.equal(text.includes('<div class="title flex-row" data-dsh-el="e255"><b>t</b></div>'), true, 'the container renders as an element with a div tag')
+  assert.equal(text.includes('<title class="title flex-row"'), false, 'no raw-text container survives in the block')
+  assert.equal(text.includes('<title>page</title>'), true, 'the real page title in <head> is untouched')
+  assert.deepEqual(value.hygiene, [{ from: '<title class="title flex-row" data-dsh-el="e255">', to: '<div class="title flex-row" data-dsh-el="e255">' }])
+  const rendered = create.output.render({ name: 'raw-tag' }, value).map((part) => part.text).join('\n')
+  assert.match(rendered, /FIXED 1 element\(s\) that used a raw-text tag as a container: <title class="title flex-row" data-dsh-el="e255"> → <div class="title flex-row" data-dsh-el="e255"> \(otherwise its children would render as plain text\)\. Original material untouched; this rewrite happens at build time\./)
+})
+await ta('the material file on disk is NOT rewritten (fromDir never writes its source)', () => {
+  assert.equal(readFileSync(join(rawTag, 'entry.html'), 'utf8').includes('<title class="title flex-row"'), true)
+})
+await ta('conservative: text-only titles, the head title and a real style/script body are left alone', () => {
+  const html = '<!doctype html><html><head><title>page</title></head><body>'
+    + '<title>text only</title><style>a>b{c:d}</style><textarea>plain</textarea><script>if (1 < 2) x()</script><p>x</p></body></html>'
+  const out = blockBuild.rewriteRawTextContainers(html)
+  assert.equal(out.text, html, 'nothing rewritten')
+  assert.deepEqual(out.fixed, [])
 })
 
 await rm(home, { recursive: true, force: true })

@@ -106,6 +106,18 @@ check('both descriptions teach the ::dsh-ui line and nothing about fences', () =
     assert.equal(/fenced code block|dsh-ui ref:/.test(byName[tool].description), false)
   }
 })
+// The pitfall that cost two sessions: editing a 5.6 MB .uiblock by hand fails
+// with "file has not been read" (or, worse, gets read first and is then lost at
+// the next rebuild). Both descriptions must say the block is a product.
+check('both descriptions say a block is a product, not an edit target, and point at the material', () => {
+  for (const tool of ['create_ui_block', 'read_ui_block']) {
+    assert.equal(byName[tool].description.includes('A BLOCK IS A PRODUCT, NOT AN EDIT TARGET'), true, tool + ' does not say the block is a product')
+    assert.match(byName[tool].description, /rebuild/, tool + ' does not say to rebuild from the material')
+    assert.match(byName[tool].description, /\.uiblock by hand/, tool + ' does not name editing the .uiblock by hand')
+    assert.match(byName[tool].description, /lost/, tool + ' does not say the hand edit is lost')
+  }
+  assert.match(byName.create_ui_block.description, /file has not been read/, 'the failure two sessions hit is named')
+})
 check('read_ui_block declares a timeout budget', () => {
   assert.equal(byName.read_ui_block.timeoutMs > 0, true)
 })

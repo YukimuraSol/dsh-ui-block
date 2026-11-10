@@ -597,6 +597,107 @@ const BUDGET_REASONS = new Set(['over limit'])
  */
 const DEGRADED_TEXT = 'NOTE ON THE CEILINGS: every file above that was left out for a size / budget reason is a DELIBERATE degradation, not a defect — do not fetch, inline or copy those files by hand to "fix" it. The block renders without them: what is missing shows as a placeholder or falls back to the default.'
 /**
+ * Names whose content the HTML parser does NOT build elements from: everything
+ * up to the matching close tag comes back as text (RCDATA / raw text).
+ */
+const RAW_TEXT_TAGS = new Set(['title', 'textarea', 'style', 'script', 'xmp', 'plaintext'])
+/**
+ * The index just past the `>` that closes an open tag, quote-aware: a `>` inside
+ * an attribute value is not the end of the tag.
+ */
+function openTagEnd(text, start) {
+  let quote = ''
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote !== '') {
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '>') return i + 1
+  }
+  return -1
+}
+/**
+ * Where the BODY content of this document lies. A real <title> sits in <head> and
+ * must never be touched, so only the body is a candidate region. A fragment with
+ * no <body> is body unless it carries a <head>.
+ */
+function bodyRegion(text) {
+  const bodyOpen = /<body\b/i.exec(text)
+  if (bodyOpen !== null) {
+    const start = openTagEnd(text, bodyOpen.index)
+    if (start < 0) return undefined
+    const bodyClose = /<\/body\s*>/i.exec(text.slice(start))
+    return { start, end: bodyClose === null ? text.length : start + bodyClose.index }
+  }
+  if (/<head\b/i.test(text) === false) return { start: 0, end: text.length }
+  const headClose = /<\/head\s*>/i.exec(text)
+  if (headClose === null) return undefined
+  return { start: headClose.index + headClose[0].length, end: text.length }
+}
+/**
+ * A raw-text tag used as a CONTAINER in the body is rewritten to <div>, every
+ * attribute kept. Nothing on disk is touched: this runs on the text the build
+ * hands to assembleBlock.
+ *
+ * Why: a DOM built with createElement (Vue, React, anything imperative) treats
+ * <title> as an ordinary element with children, so serializing it is fine — but
+ * parse that HTML again and <title> is RCDATA, so a card whose header is a
+ * <title> renders its own markup as source text AND swallows the siblings it
+ * wrapped. The material is not wrong, the reparse is; the fix belongs at build
+ * time so the capture stays the truth.
+ *
+ * Deliberately conservative — two conditions, both required:
+ *   1. inside the body (a <head> title is a real page title: no children, leave it);
+ *   2. the content holds a CLOSING tag, which is the proof it was serialized with
+ *      element children. That also keeps a real <style> or <script> body out of
+ *      this rewrite: CSS `a > b` and JS `x < y` have no closing tag.
+ *
+ * @returns { text, fixed } — `fixed` is [{ from, to }] of the ORIGINAL and the
+ *   rewritten opening tag, so the build can report exactly what it changed.
+ */
+function rewriteRawTextContainers(text) {
+  const region = bodyRegion(text)
+  if (region === undefined) return { text, fixed: [] }
+  const swaps = []
+  const fixed = []
+  const open = /<([A-Za-z][A-Za-z0-9:_-]*)/g
+  open.lastIndex = region.start
+  let match
+  while ((match = open.exec(text)) !== null && match.index < region.end) {
+    const tagEnd = openTagEnd(text, match.index)
+    if (tagEnd < 0 || tagEnd > region.end) break
+    open.lastIndex = tagEnd
+    const name = match[1].toLowerCase()
+    if (!RAW_TEXT_TAGS.has(name)) continue
+    const close = new RegExp('</' + name + '\\s*>', 'i').exec(text.slice(tagEnd, region.end))
+    const contentEnd = close === null ? region.end : tagEnd + close.index
+    if (/<\/[A-Za-z][A-Za-z0-9:_-]*\s*>/.test(text.slice(tagEnd, contentEnd)) === false) continue
+    const from = text.slice(match.index, tagEnd)
+    const to = '<div' + from.slice(1 + match[1].length)
+    swaps.push({ start: match.index, end: match.index + 1 + match[1].length, text: '<div' })
+    if (close !== null) {
+      const closeStart = tagEnd + close.index
+      swaps.push({ start: closeStart, end: closeStart + 2 + match[1].length, text: '</div' })
+    }
+    fixed.push({ from, to })
+  }
+  if (swaps.length === 0) return { text, fixed: [] }
+  swaps.sort((a, b) => a.start - b.start)
+  let out = ''
+  let cursor = 0
+  for (const swap of swaps) {
+    if (swap.start < cursor) continue
+    out += text.slice(cursor, swap.start) + swap.text
+    cursor = swap.end
+  }
+  return { text: out + text.slice(cursor), fixed }
+}
+/**
  * Turn one material directory into an assembly argument list, doing the picking
  * a caller should not have to do by hand.
  *
@@ -708,17 +809,33 @@ async function collectFromDir(dir, entryHint) {
   const carried = [...accepted, ...deinlined]
   accepted.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   srcsetReferenced.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  // Tag hygiene, ENTRY ONLY, build time (see rewriteRawTextContainers): a capture
+  // serializes a DOM whose <title>/<textarea> were ordinary containers, and
+  // parsing that HTML back turns their children into text. The directory is read,
+  // never written — the block is built from a rewritten copy of the entry text, so
+  // the material stays byte-identical and a rebuild repeats the same fix.
+  const entryInfo = found.get(entryPath)
+  const entryText = bodies.get(entryPath)
+  const hygiene = typeof entryText === 'string' && entryText !== ''
+    ? rewriteRawTextContainers(entryText)
+    : { text: entryText, fixed: [] }
+  const rewritten = hygiene.fixed.length > 0
   return {
     root,
     entryPath,
-    files: [{ path: entryPath, from: found.get(entryPath).abs }].concat(carried.map((file) => (file.content === undefined
+    files: [rewritten
+      ? { path: entryPath, content: hygiene.text }
+      : { path: entryPath, from: entryInfo.abs }].concat(carried.map((file) => (file.content === undefined
       ? { path: file.path, from: file.from }
       : { path: file.path, content: file.content }))) ,
-    loaded: [{ path: entryPath, bytes: found.get(entryPath).bytes, from: found.get(entryPath).abs }].concat(carried.map((file) => (file.content === undefined
+    loaded: [rewritten
+      ? { path: entryPath, bytes: Buffer.byteLength(hygiene.text, 'utf8'), from: entryInfo.abs, rewrittenRawTextTags: hygiene.fixed.length }
+      : { path: entryPath, bytes: entryInfo.bytes, from: entryInfo.abs }].concat(carried.map((file) => (file.content === undefined
       ? { path: file.path, bytes: file.bytes, from: file.from }
       : { path: file.path, bytes: file.bytes, deinlinedFrom: file.referencedBy }))) ,
     skipped,
     srcsetReferenced,
+    hygiene: hygiene.fixed,
     tolerated: skipped.map((item) => item.path)
   }
 }
@@ -1573,7 +1690,7 @@ const CREATE_DESCRIPTION = [
   '- To CREATE a UI block, call this tool.',
   '- A TAKEN NAME IS NEITHER AN ERROR NOR AN OVERWRITE: if <name>.uiblock already exists and holds different bytes, this block is written as <name>-2 (then -3, -4 ...) — the same numbering the capture\'s material directory uses — and the result carries the name actually used, plus one line saying so. READ THAT NAME: read_ui_block and the ::dsh-ui line must both use it, otherwise you are looking at the other page. Byte-identical content keeps the requested name (an idempotent rebuild writes nothing). overwrite: true is the only way to replace a block in place, and it keeps the old file as <name>.uiblock.bak-<ISO timestamp>. Do NOT delete the block first, and do not try to "clear" it: deleting is the only operation here that loses the old version, and it is never needed.',
   '- Do NOT create a .uiblock file with write. A block that was not created through this tool has no registered metadata, so read_ui_block and the reference line cannot find it.',
-  '- To UPDATE an existing block, change the .uiblock file in place: `edit` for a targeted change, or `write` when the block is almost entirely new. Then reference it again in the same message. Do NOT call this tool again to update it, and do NOT write it through a shell command or a script.',
+  '- A BLOCK IS A PRODUCT, NOT AN EDIT TARGET. A block built from a material directory (fromDir — a capture) is assembled output: to change its layout, change the MATERIAL and rebuild (call this tool again with overwrite: true). Do NOT edit that .uiblock by hand — the edit is lost the next time the block is rebuilt from the same material, and reading a 5.6 MB block just to change one line is what produces "file has not been read" in the first place. Only a block you authored here from `files` (no material directory, nothing to rebuild from) is edited in place: `edit` for a targeted change, or `write` when it is almost entirely new. Then reference it again in the same message. Do NOT write a block through a shell command or a script.',
   '- Editing by hand means writing the file format: every extra member is a section that starts on a whole line `<!-- @@file <path> [base64] -->` and runs to the next such line or to the end. Add `base64` to a binary one (png webp jpg jpeg woff woff2 ttf) — unmarked, its bytes are decoded as text and the member arrives corrupted. No member\'s own content may contain such a line; it would split the file.'
 ].join('\n')
 
@@ -1583,6 +1700,8 @@ const READ_DESCRIPTION = [
   'The entry is laid out at the width/height you pass — media queries re-evaluate, it is not a PNG downscale. Pass the same pair you will declare on the reference line, otherwise you are checking a different layout than the user is looking at.',
   '',
   'Use it to check layout, spacing, overflow and colour before handing a draft to the user. It renders the entry page, so a demo block comes back as its still screen, not as a timeline frame.',
+  '',
+  'A BLOCK IS A PRODUCT, NOT AN EDIT TARGET: when the layout is wrong, change the material directory (or the source files it was built from) and rebuild with create_ui_block — do not edit the .uiblock by hand. The edit is lost on the next rebuild, and the whole file has to be read before it can be edited.',
 
   'When a size is not readable from the image — cards that should end up equal height — pass `probe` and compare the numbers it returns.',
   '',
@@ -1605,6 +1724,10 @@ const CAPTURE_DESCRIPTION = [
   'Capture one web page — a row from list_pages, given as { instance, tabId } — into a material directory, and hand back a file list that create_ui_block can load straight off disk, so no page content has to pass through this conversation.',
   '',
   'THE PAIR COMES FROM list_pages: this tool can only target a tab that already exists in a browser with dsh-page-capture loaded, so the previous step is one row\'s instance + tabId, and the next one is create_ui_block({ name, fromDir }) with the material this call hands back.',
+  '',
+  'RECREATING A PAGE MEANS CAPTURE + BUILD, DELIVERED IN ONE GO: when the user says "clone this page" / "复刻这个页面 in dsh-ui", the deliverable is capture_page -> create_ui_block({ name, fromDir }) -> one message that references ::dsh-ui <name>:: and states the differences. Do NOT write a plan for the recreation first and do NOT ask which kind of recreation is wanted: a session that asked that question up front cost the user 132 seconds and then handed over a 5.6 MB static snapshot plus a plan nobody ever ran. Capture, build, deliver.',
+  '',
+  'SAY WHAT DIFFERS, EVERY TIME — a capture is not the site: the stylesheets that could not be fetched (report.sheetsFailed; a missing <link> takes all its rules with it), the files a ceiling left out (report.dropped, skipped), and the positioning the capture froze into element rules (position / inset / top / right / bottom / transform / z-index / overflow written as values, so a sticky header no longer sticks). One line per difference, named. "已完成" on its own is not a delivery.',
   '',
   'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer (60 seconds; a tab closed or navigated since list_pages fails here, and a timeout means the extension never answered — either way call list_pages again instead of retrying the same tabId), and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
   '',
@@ -2586,6 +2709,12 @@ function captureText(value) {
     }
     lines.push('')
     lines.push('NEXT: create_ui_block({ name: "' + index.suggestedName + '", fromDir: "' + value.dir + '" })')
+    // The delivery rule, said where the next action is chosen: a capture is not
+    // the site, and "recreate this page" is finished by a block plus its
+    // differences — not by a plan, not by a question, not by "已完成".
+    lines.push('')
+    lines.push('RECREATING A PAGE IS CAPTURE + BUILD: create_ui_block({ name, fromDir }) above IS the deliverable — reference it with ::dsh-ui <name>:: in the same message. Do not plan the recreation first and do not ask which kind of recreation is wanted; build it and hand it over.')
+    lines.push('THEN SAY WHAT DIFFERS — this is a capture, not the site: the stylesheets that could not be fetched, the files a ceiling left out, and the position / inset / top / right / bottom / transform / z-index / overflow values frozen into element rules (a sticky header no longer sticks). One line per difference. "已完成" alone is not a delivery.')
   }
   lines.push('')
   lines.push('files[] — `from` is the file\'s absolute path on disk. A create_ui_block call that passes them as files[].from copies the bytes on the host and none of this material enters the conversation; better still, pass fromDir (above) and list no files at all:')
@@ -2760,6 +2889,18 @@ export function apply(ctx, config) {
             description: 'fromDir only: references that point at a file this block left out — one line each, "where:line ref -> path".',
             items: { type: 'string' }
           },
+          hygiene: {
+            type: 'array',
+            description: 'fromDir only: raw-text tags (title / textarea / style / script / xmp / plaintext) the entry used as CONTAINERS inside the body. Each was rewritten to <div> at build time with all its attributes, because parsed as HTML a raw-text tag turns its children into plain text. Nothing on disk was changed — the material still holds the original bytes.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                from: { type: 'string', required: true, description: 'The opening tag as the entry has it, e.g. <title class="title flex-row">.' },
+                to: { type: 'string', required: true, description: 'What the block carries instead, e.g. <div class="title flex-row">.' }
+              }
+            }
+          },
           warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' }
         }
       },
@@ -2769,6 +2910,12 @@ export function apply(ctx, config) {
           + (value.requested === undefined ? '' : '\nRENAMED — "' + value.requested + '" is already taken, so this one was written as "' + value.name + '". Use the NEW name everywhere: read_ui_block({ name: "' + value.name + '" }) and the ::dsh-ui ' + value.name + ':: line.')
           + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
           + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
+          + (Array.isArray(value.hygiene) && value.hygiene.length > 0
+            ? '\nFIXED ' + String(value.hygiene.length) + ' element(s) that used a raw-text tag as a container: '
+              + value.hygiene[0].from + ' → ' + value.hygiene[0].to
+              + (value.hygiene.length > 1 ? '\n  ' + value.hygiene.slice(1).map((row) => row.from + ' → ' + row.to).join('\n  ') : '')
+              + ' (otherwise its children would render as plain text). Original material untouched; this rewrite happens at build time.'
+            : '')
           + (Array.isArray(value.skipped) && value.skipped.length > 0
             ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + (item.via === 'srcset' ? '; referenced via srcset' : '') + ')').join('\n')
             : '')
@@ -2800,12 +2947,14 @@ export function apply(ctx, config) {
       let skipped
       let srcsetReferenced
       let referencedSkipped
+      let hygiene
       if (hasDir) {
         const collected = await collectFromDir(args.fromDir, args.entry)
         from = collected.root
         assembled = await assembleBlock(collected.files, collected.entryPath, { toleratedMissing: collected.tolerated })
         skipped = collected.skipped
         srcsetReferenced = collected.srcsetReferenced
+        hygiene = collected.hygiene
         referencedSkipped = assembled.toleratedRefs.map((row) => row.where + ':' + String(row.line) + ' ' + row.ref + ' -> ' + row.path)
       } else {
         assembled = await assembleBlock(args.files, args.entry)
@@ -2835,6 +2984,7 @@ export function apply(ctx, config) {
         ...skipped === undefined ? {} : { skipped },
         ...srcsetReferenced === undefined || srcsetReferenced.length === 0 ? {} : { srcsetReferenced },
         ...referencedSkipped === undefined || referencedSkipped.length === 0 ? {} : { referencedSkipped },
+        ...hygiene === undefined || hygiene.length === 0 ? {} : { hygiene },
         ...assembled.warning === undefined ? {} : { warning: assembled.warning },
       }
     },
@@ -3559,6 +3709,7 @@ export const blockBuild = {
   LIMIT_DEFAULTS,
   applyLimitsConfig,
   collectFromDir,
+  rewriteRawTextContainers,
   assertRefsResolve,
   collectRefs,
   resolveRef,
