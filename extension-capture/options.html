@@ -23,8 +23,8 @@
 <h1>dsh-page-capture</h1>
 <p class="hint">把当前页整页抽成素材包，交给本地 DSH（<code>list_pages</code> / <code>capture_page</code> 的原料来源）。</p>
 
-<label for="baseUrl">base URL（DSH 实例地址）</label>
-<input type="text" id="baseUrl" placeholder="http://127.0.0.1:4000" spellcheck="false">
+<label for="baseUrl">base URL（DSH 实例地址；留空 = 自动发现，打登记表里每个实例）</label>
+<input type="text" id="baseUrl" placeholder="留空自动发现，或 http://127.0.0.1:4000" spellcheck="false">
 
 <label for="instance">instance 名（同一浏览器只填一个，用来区分 Chrome A / Edge B）</label>
 <input type="text" id="instance" placeholder="chrome" spellcheck="false">
@@ -39,6 +39,7 @@
 
 <div class="btns">
   <button class="primary" id="save">保存</button>
+  <button id="discover">自动发现</button>
   <button id="test">测试连接</button>
 </div>
 
@@ -47,6 +48,12 @@
 <div class="warn">
   装好之后不用点任何按钮：后台每 2 秒轮询一次，你点到想抓的那一页，DSH 的 <code>list_pages</code> 就能看见它。
   改了 base URL 立刻生效，不用重装扩展。
+</div>
+
+<div class="warn">
+  <b>不填 base URL 也行</b>：后台先向登记台（<code>127.0.0.1:38520</code> 的 <code>/instances</code>）要实例表，
+  台不在就用 <code>chrome.storage</code> 里上次的表，都没有才探一遍本机 3000-4100。
+  拿到几个实例就打几个，每个实例各收各的任务，结果回到发它的那个。
 </div>
 
 <script src="options.js"></script>

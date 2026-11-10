@@ -1,4 +1,5 @@
-// self-check.mjs — 离线自检：不依赖 DSH 端点，也不依赖 chrome.* API。
+// self-check.mjs — 离线自检：不依赖 DSH 端点。前半段（hub-check.mjs）用假 chrome
+// 跑 background.js / options.js 的发现与上报，后半段用无头 Chrome 跑 extractor.js。
 // 做法：无头 Chrome 打开 about:blank → 注入一段带 --dsw-* 变量的测试 DOM →
 // 把 extractor.js 原文 Runtime.evaluate 进去 → 跑抽取 → 对产出做断言 → 落盘。
 // 跑法：node self-check.mjs      （产出写在 out-selfcheck/，已 gitignore）
@@ -6,6 +7,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+// 扩展侧「发现 / 多播 / 缓存 / ?baseURL=」这几条不依赖浏览器，由 hub-check.mjs 跑
+// （假登记台 + 两个假实例，装的是 background.js / options.js 的真实源码）。
+import { runHubChecks } from './hub-check.mjs';
 
 const NL = String.fromCharCode(10);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -266,6 +270,9 @@ async function runExtract(s, opts) {
 }
 
 async function main() {
+  // 0) 扩展侧：发现 / 多播 / 缓存 / ?baseURL= —— 不需要浏览器，先跑
+  await runHubChecks(assert)
+
   const cdpPath = pickCdp();
   const cdp = await import(pathToFileURL(cdpPath).href);
   console.log('[cdp] ' + cdpPath);
