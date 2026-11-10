@@ -206,6 +206,16 @@ export async function runHubChecks(assert) {
     'A 收到 result ' + instanceA.results.length + ' 条（taskId=' + String(instanceA.results[0] && instanceA.results[0].body.taskId) +
       '，ok=' + String(instanceA.results[0] && instanceA.results[0].body.ok) + '）；B 收到 result ' + instanceB.results.length + ' 条')
 
+  // ---- 2b. tabs-fingerprint：同一份清单的第二轮只带 tabsTag，不重发整份 ------
+  const firstTag = instanceA.polls[0].body.tabsTag
+  await tick1()
+  const secondPoll = instanceA.polls[1] ? instanceA.polls[1].body : null
+  assert('tabs-fingerprint：第二轮同一份清单只带 tabsTag（不发 tabs，插件侧沿用上次）',
+    !!secondPoll && secondPoll.tabs === undefined && String(secondPoll.tabsTag) === String(firstTag),
+    '第 1 轮 tabs=' + (instanceA.polls[0].body.tabs || []).length + ' 行 / tag=' + String(firstTag) +
+      '；第 2 轮 tabs=' + (secondPoll && secondPoll.tabs === undefined ? '（无该字段）' : JSON.stringify(secondPoll && secondPoll.tabs)) +
+      ' / tag=' + String(secondPoll && secondPoll.tabsTag))
+
   // ---- 3. ext-cache：实例表写进 storage ----------------------------------
   const cached = store.get('registryTable')
   const cachedPorts = cached && Array.isArray(cached.instances) ? cached.instances.map((row) => row.port).sort() : []

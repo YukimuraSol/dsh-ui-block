@@ -41,7 +41,9 @@
 
 连续 3 轮**整轮全失败**（所有实例都没应答）才重发现一次——那通常意味着换实例或重启过了。
 
-标签页清单的设计是「每 10 秒整份一次，其余轮次只带指纹 `tabsTag`」。**目前整份照传**：插件侧把每次 poll 的 `tabs` 直接覆盖写（`normalizeTabs(undefined)` 回空数组，会把它记着的清单清掉），真按指纹传会把实例侧清单清空。`background.js` 里 `TABS_FINGERPRINT_ONLY` 就是那个开关，插件侧改成「tabs 缺失即沿用上次」之后打开即可；`tabsTag` 现在每轮都带，插件侧可以先拿它做去重。
+标签页清单**每 10 秒整份一次，其余轮次只带指纹 `tabsTag`**（`background.js` 的 `TABS_FINGERPRINT_ONLY`）。靠的是插件侧那条语义：poll **没有 `tabs` 字段就沿用上一次的清单**，只有显式 `tabs: []` 才算"这个浏览器现在真的没有标签页"。
+
+三种情况仍旧整份传：① 这个实例第一次被看到（它还没有缓存）；② 指纹变了（开/关标签、跳页、激活切换）；③ 距上次整份超过 10 秒。`lastFullByTarget` 按实例各记一份，所以多播时新加入的实例第一轮就能拿到完整清单。
 
 ## 让 agent 自己开一个网址（可选路径）
 
@@ -137,15 +139,16 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 node self-check.mjs
 ```
 
-不依赖 DSH 端点，分两段跑，一共断言 **16 条**：
+不依赖 DSH 端点，分两段跑，一共断言 **17 条**：
 
-**前半段（5 条，`hub-check.mjs`）**：把 `background.js` / `options.js` 原文装进一个假 `chrome`（storage 用内存 Map），再起**一个假登记台 + 两个假实例**（本地 http 服务，记录每个请求），手动跑 tick：
+**前半段（6 条，`hub-check.mjs`）**：把 `background.js` / `options.js` 原文装进一个假 `chrome`（storage 用内存 Map），再起**一个假登记台 + 两个假实例**（本地 http 服务，记录每个请求），手动跑 tick：
 
 1. 没有配置时向 `/instances` 取实例表，一轮 poll 打到表里两个实例（带 `tabs` 与 `tabsTag`）；
 2. 任务由 A 下发、结果只回 A（B 一次 result 都没收到）；
-3. 实例表写进 `chrome.storage`（`registryTable`）；
-4. 登记台停掉 + 扩展重启后，仍按缓存里的表上报（`status.registry.source === 'cache'`）；
-5. `options.html?baseURL=` 写进 `chrome.storage` 并回填输入框。
+3. 同一份清单的第二轮只带 `tabsTag`、**不发 `tabs`**（插件侧沿用上次）；
+4. 实例表写进 `chrome.storage`（`registryTable`）；
+5. 登记台停掉 + 扩展重启后，仍按缓存里的表上报（`status.registry.source === 'cache'`）；
+6. `options.html?baseURL=` 写进 `chrome.storage` 并回填输入框。
 
 单独跑这一段：`node hub-check.mjs`。
 

@@ -32,10 +32,11 @@ const PROBE = { from: 3000, to: 4100, concurrency: 6, timeoutMs: 500 }
 const DISCOVER_MIN_INTERVAL_MS = 5000
 const TABLE_KEY = 'registryTable'
 // 标签页清单每 10 秒整份传一次，其余轮次只带指纹 tabsTag（行数 + tabId/url 长度
-// 混出的短串），省重复体积。但插件侧现在把每次 poll 的 tabs 直接覆盖写——
-// normalizeTabs(undefined) 回空数组，会把实例侧记着的清单清掉——所以下面这个开关
-// 默认关：插件侧改成"tabs 缺失即沿用上次"之后再打开。
-const TABS_FINGERPRINT_ONLY = false
+// 混出的短串），省重复体积。插件侧的 poll 已经按这个语义落地：**没有 tabs 字段
+// 就沿用上一次的清单，显式 tabs: [] 才清空**，所以这里默认开。
+// 三种情况仍旧整份传：这个实例第一次被看到（它还没有缓存）、指纹变了（开关/跳页/
+// 新标签）、距上次整份超过 TABS_FULL_MS。
+const TABS_FINGERPRINT_ONLY = true
 const TABS_FULL_MS = 10000
 
 // ---- 取字节（fetch 代理）---------------------------------------------------
@@ -278,8 +279,9 @@ async function currentTargets() {
 }
 
 // ---- 标签页清单：全量 / 指纹 ------------------------------------------------
-let lastFullTabsAt = 0
-let lastTabsTag = ''
+// 每个实例各记一份"上次整份是什么时候、指纹是什么"：新实例第一次一定要收到整份，
+// 否则它会以为自己没有标签页。
+const lastFullByTarget = new Map()
 
 function tabsTag(tabs) {
   let hash = 0
@@ -291,12 +293,12 @@ function tabsTag(tabs) {
   return tabs.length + '-' + (hash >>> 0).toString(36)
 }
 
-function tabsPayload(tabs) {
-  const tag = tabsTag(tabs)
-  const full = !TABS_FINGERPRINT_ONLY || tag !== lastTabsTag || Date.now() - lastFullTabsAt >= TABS_FULL_MS
+function tabsPayload(row, tabs, tag) {
+  const key = baseOf(row)
+  const state = lastFullByTarget.get(key)
+  const full = !TABS_FINGERPRINT_ONLY || state === undefined || state.tag !== tag || Date.now() - state.at >= TABS_FULL_MS
   if (!full) return { tabsTag: tag }
-  lastFullTabsAt = Date.now()
-  lastTabsTag = tag
+  lastFullByTarget.set(key, { at: Date.now(), tag: tag })
   return { tabs: tabs, tabsTag: tag }
 }
 
@@ -428,12 +430,12 @@ async function tick() {
     const rows = await currentTargets()
     if (!rows.length) { badge('?', '#b45309'); return }     // 没有实例可上报（下一轮再试）
     const tabs = await listTabs()
-    const payload = tabsPayload(tabs)
+    const tag = tabsTag(tabs)
     let okAny = false
     // 多播：登记表里每一个实例都打一遍，各收各的任务；结果回到发它的那个实例
     for (const row of rows) {
       try {
-        const task = await poll(row, payload)
+        const task = await poll(row, tabsPayload(row, tabs, tag))
         okAny = true
         if (task) {
           log('task', task.id, 'tab', task.tabId, 'via', baseOf(row))
@@ -474,6 +476,7 @@ chrome.storage.onChanged.addListener(function (changes) {
   if (keys.length > 0 && keys.every(function (key) { return key === TABLE_KEY })) return
   targets = []
   targetsAt = 0
+  lastFullByTarget.clear()   // 配置变了：下一轮给每个实例都发整份
   stop(); schedule(0)
 })
 
