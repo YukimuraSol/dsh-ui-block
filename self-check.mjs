@@ -83,7 +83,7 @@ const CREATE_CLAUSES = [
   'SAME NAME MEANS SAFE REPLACE',
   'Do NOT delete the block first',
   '- Do NOT create a .uiblock file with write.',
-  '\u0060edit\u0060 for a targeted change',
+  '`edit` for a targeted change',
   'FROMDIR — THE WAY TO LAND A WHOLE PAGE IN ONE CALL',
   'capture_page -> create_ui_block({ name, fromDir })'
 ]
