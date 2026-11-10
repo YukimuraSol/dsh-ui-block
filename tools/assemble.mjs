@@ -13,8 +13,10 @@ const outDir = path.resolve(arg('out', 'out/site'));
 const timelineFile = arg('timeline', null);
 const blockFile = path.resolve(arg('block', 'out/data.uiblock'));
 
-const PER_FILE = 262144;      // 单文件硬顶
-const BLOCK = 2097152;        // 块总量硬顶
+// 与插件默认值对齐（dsh-ui-block/index.js 的 LIMIT_DEFAULTS，可由配置 limits.* 覆盖）：
+// 单文件 2 MB、整块 64 MB；16 MB 起插件只给软提示，不拦。
+const PER_FILE = 2097152;     // 单文件硬顶
+const BLOCK = 67108864;       // 块总量硬顶
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 const bytes = (s) => Buffer.byteLength(s, 'utf8');
 

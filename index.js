@@ -82,15 +82,34 @@ const AGENT_RECENT_MAX = 20
 const EXT = '.uiblock'
 /** A section marker: a WHOLE line, `<!-- @@file <path> [base64] -->`. */
 const SECTION_RE = /^<!--\s*@@file\s+(\S+?)(\s+base64)?\s*-->\s*$/
-/** Ceilings per section and per file; the route answers 413 past either. */
-const SECTION_MAX_BYTES = 256 * 1024
-const BLOCK_MAX_BYTES = 2 * 1024 * 1024
+/**
+ * The three write-path ceilings, as DEFAULTS. The plugin config overrides each
+ * one under `limits:` (a sibling of `agent:`), and every read of `limits`
+ * below happens at request time, so a config bump needs no restart.
+ *
+ * These are not render limits: the block route only sends the ENTRY out, and
+ * every other section is fetched on its own URL. What a big block really costs
+ * is edit weight — each rewrite reads the whole text, keeps one history
+ * baseline and appends one patch line. The single-file one is the real grain,
+ * because a binary section is stored as base64 text: 4/3 of its bytes.
+ */
+const LIMIT_DEFAULTS = {
+  /** One file's own bytes, measured on the decoded bytes. */
+  sectionBytes: 2 * 1024 * 1024,
+  /** The whole stored block text, section markers included. */
+  blockBytes: 64 * 1024 * 1024,
+  /** Not a ceiling: past this a block still writes, with one advisory line. */
+  softWarnBytes: 16 * 1024 * 1024
+}
+/** The live limits every check reads; apply() overwrites the fields it is given. */
+const limits = { ...LIMIT_DEFAULTS }
 /** What a section may be, by extension; anything else is a 415, never a guess. */
 const SECTION_TYPES = {
   // A page section: a sectioned block can carry whole pages the entry links to,
   // which is what a demo block needs (one served document per timeline snapshot).
   // The block CSP still ships with every one of them, so script-src stays 'none'.
   html: 'text/html; charset=utf-8',
+  htm: 'text/html; charset=utf-8',
   css: 'text/css; charset=utf-8',
   svg: 'image/svg+xml',
   json: 'application/json; charset=utf-8',
@@ -156,6 +175,62 @@ function assertName(value) {
     throw new Error(CREATE_TOOL + '/' + READ_TOOL + ': name must be 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit, got ' + JSON.stringify(value))
   }
   return text
+}
+
+/** One byte count as a human number: 2097152 -> "2.0 MB". */
+function sizeText(bytes) {
+  const n = Number(bytes)
+  if (!Number.isFinite(n)) return String(bytes) + ' bytes'
+  if (n < 1024) return String(n) + ' B'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+  return (n / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+/**
+ * One over-limit refusal, in the shape a caller can act on: what it weighed,
+ * what the ceiling is, and HOW MUCH OVER it was — the difference is what says
+ * whether "shrink it a bit" is enough. Then the three ways out, best first.
+ * @param scope - 'per file' or 'per block', the limit that was hit.
+ * @param subject - the file (or "the assembled block") that exceeded it.
+ * @param size - its bytes.
+ * @param max - the ceiling it exceeded.
+ * @param key - the config field that controls it (limits.sectionBytes / limits.blockBytes).
+ * @param exits - the three one-line ways out.
+ */
+function overLimitText(scope, subject, size, max, key, exits) {
+  const over = Number(size) - Number(max)
+  return CREATE_TOOL + ': ' + subject + ' is ' + String(size) + ' bytes; the limit is ' + String(max) + ' bytes (' + scope + ', '
+    + sizeText(max) + ') — ' + String(over) + ' bytes over (' + sizeText(over) + ' too big).'
+    + '\nThree ways out, best first:'
+    + exits.map((exit, index) => '\n  ' + String(index + 1) + '. ' + exit).join('')
+    + '\nIf the ceiling itself is wrong for this case, raise ' + key + ' in the plugin config (currently ' + String(max) + ' bytes).'
+}
+
+/**
+ * Read the `limits:` block off the plugin config, keeping the defaults per
+ * field: a missing block, a missing key and a non-positive or non-numeric value
+ * all fall back to LIMIT_DEFAULTS. A value is bytes, unrounded.
+ * @param config - the plugin config; `limits` is a sibling of `agent`.
+ * @returns the live limits object every check reads.
+ */
+function applyLimitsConfig(config) {
+  const raw = config !== null && typeof config === 'object' && config.limits !== null && typeof config.limits === 'object' ? config.limits : {}
+  const read = (key) => {
+    const value = Number(raw[key])
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : LIMIT_DEFAULTS[key]
+  }
+  limits.sectionBytes = read('sectionBytes')
+  limits.blockBytes = read('blockBytes')
+  limits.softWarnBytes = read('softWarnBytes')
+  return limits
+}
+
+/** The advisory a block past limits.softWarnBytes carries: it still writes. */
+function softWarnText(bytes) {
+  if (!(bytes > limits.softWarnBytes)) return undefined
+  return 'This block is ' + String(bytes) + ' bytes (' + sizeText(bytes) + '), past the ' + String(limits.softWarnBytes)
+    + '-byte soft-warn line (' + sizeText(limits.softWarnBytes) + '). It is written and renders normally, but every later edit reads and rewrites the whole text'
+    + ' and keeps one history baseline, so edits get slower and .history grows. Prefer fewer, leaner files — or raise limits.softWarnBytes if this is deliberate.'
 }
 
 /** The path the message line and the tool result both spell. */
@@ -239,6 +314,222 @@ function sectionType(path) {
   return type
 }
 
+/** The lowercase extension of a path, without the dot. */
+function extOf(path) {
+  const text = String(path)
+  const dot = text.lastIndexOf('.')
+  return dot < 0 ? '' : text.slice(dot + 1).toLowerCase()
+}
+
+/** Section types whose body is TEXT we can parse for references to siblings. */
+const REFERENCE_TEXT_EXTENSIONS = new Set(['html', 'htm', 'css', 'svg'])
+
+/**
+ * One reference a text file makes, as a block-relative path; undefined when it
+ * is not a reference to a sibling file at all (a data: URL, a fragment, a
+ * remote URL, a bare directory).
+ *
+ * Navigation is NOT a reference: <a href> and <form action> are allowed to
+ * point anywhere, because a dead link renders nothing wrong. What this looks at
+ * is what the document LOADS — <link href>, src= on an element that fetches,
+ * and CSS url() / @import.
+ */
+function resolveRef(raw, ownPath) {
+  const text = String(raw === undefined || raw === null ? '' : raw).trim()
+  if (text === '') return undefined
+  if (/^(?:data:|blob:|about:|#|mailto:|tel:|javascript:|https?:\/\/|\/\/)/i.test(text)) return undefined
+  let url
+  try {
+    url = new URL(text, 'http://block.invalid/' + String(ownPath))
+  } catch {
+    return undefined
+  }
+  let path
+  try {
+    path = decodeURIComponent(url.pathname)
+  } catch {
+    path = url.pathname
+  }
+  path = path.replace(/^\/+/, '')
+  // The block root itself ("./") and a directory link are not missing files.
+  if (path === '' || path.endsWith('/')) return undefined
+  return path
+}
+
+/** Every reference one text body makes: { line, ref, path }, with a 1-based line. */
+function collectRefs(body, ownPath) {
+  const refs = []
+  const lines = splitLines(body)
+  for (let index = 0; index < lines.length; index += 1) {
+    // Inline style is serialized with &quot; / &#39;: unescape, or the entity
+    // becomes part of the path.
+    const line = lines[index].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+    const push = (raw) => {
+      const path = resolveRef(raw, ownPath)
+      if (path !== undefined) refs.push({ line: index + 1, ref: String(raw).trim(), path })
+    }
+    for (const match of line.matchAll(/<link\b[^>]*?(?<![\w-])href\s*=\s*["']([^"']+)["']/gi)) push(match[1])
+    for (const match of line.matchAll(/<(?:img|script|source|video|audio|iframe|embed|track)\b[^>]*?(?<![\w-])src\s*=\s*["']([^"']+)["']/gi)) push(match[1])
+    for (const match of line.matchAll(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi)) push(match[1])
+    for (const match of line.matchAll(/@import\s+["']([^"']+)["']/gi)) push(match[1])
+  }
+  return refs
+}
+
+/**
+ * Refuse a block whose own files point at files it does not have.
+ *
+ * This is the one failure that LOOKS like success: the block is written, the
+ * entry renders, and one icon or font silently 404s. So it is an error here,
+ * with the line, the missing member and the URL as written.
+ *
+ * "tolerated" is the account of files that exist on disk but were deliberately
+ * left out (over the per-file ceiling, an extension no section type serves);
+ * a reference to one of those is reported back, not refused — the caller
+ * already has that ledger.
+ * @param files - [{ path, body }] in block order, entry first.
+ * @param tolerated - block-relative paths that are knowingly absent.
+ * @returns the tolerated references, so the caller can report them.
+ */
+function assertRefsResolve(files, tolerated) {
+  const present = new Set(files.map((file) => file.path))
+  const allowed = tolerated === undefined || tolerated === null ? new Set() : new Set(tolerated)
+  const missing = []
+  const known = []
+  for (const file of files) {
+    if (!REFERENCE_TEXT_EXTENSIONS.has(extOf(file.path))) continue
+    for (const ref of collectRefs(file.body, file.path)) {
+      if (present.has(ref.path)) continue
+      if (allowed.has(ref.path)) known.push({ where: file.path, ...ref })
+      else missing.push({ where: file.path, ...ref })
+    }
+  }
+  if (missing.length > 0) {
+    const rows = missing.slice(0, 20).map((row) => '  ' + row.where + ':' + String(row.line) + '  ' + row.ref + ' -> ' + row.path)
+    const more = missing.length > 20 ? '\n  ... and ' + String(missing.length - 20) + ' more' : ''
+    throw new Error(CREATE_TOOL + ': ' + String(missing.length) + ' reference(s) point at files this block does not have — every loaded file must be one of its own members (or a data: URL):'
+      + '\n' + rows.join('\n') + more
+      + '\nAdd each missing file to files[] (or put it in the fromDir directory and let the entry link it), or fix the URL. Nothing was written.')
+  }
+  return known
+}
+
+/**
+ * Walk one material directory into a map of relativePath -> { abs, bytes }.
+ * Forward slashes only, so the keys ARE the block's virtual paths. Dot-prefixed
+ * entries are skipped: a .git or a .DS_Store is never block material.
+ */
+async function walkMaterial(root, rel, out, depth) {
+  if (depth > 8) return out
+  let entries
+  try {
+    entries = await readdir(rel === '' ? root : join(root, rel), { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    const childRel = rel === '' ? entry.name : rel + '/' + entry.name
+    if (entry.isDirectory()) {
+      await walkMaterial(root, childRel, out, depth + 1)
+      continue
+    }
+    if (!entry.isFile()) continue
+    try {
+      const info = await stat(join(root, childRel))
+      out.set(childRel, { abs: join(root, childRel), bytes: info.size })
+    } catch { /* vanished mid-walk: leave it out */ }
+  }
+  return out
+}
+
+/**
+ * Turn one material directory into an assembly argument list, doing the picking
+ * a caller should not have to do by hand.
+ *
+ * Four decisions, each accounted for:
+ *   1. the entry is entry.html, else index.html, else the call fails and names
+ *      the candidates — guessing an entry renders the wrong page;
+ *   2. a file nobody loads is left out: the block carries what the page loads;
+ *   3. a file past limits.sectionBytes is left out (it cannot be a section);
+ *   4. an extension no section type serves is left out (no 415 at read time).
+ * Every left-out file lands in "skipped" with its bytes and reason, and a
+ * reference to one of them is reported back rather than refused.
+ *
+ * @param dir - absolute path of the material directory.
+ * @param entryHint - optional entry file name at the root.
+ * @returns the files argument, the entry path, and the ledger.
+ */
+async function collectFromDir(dir, entryHint) {
+  const root = String(dir === undefined || dir === null ? '' : dir).trim()
+  if (root === '') throw new Error(CREATE_TOOL + ': fromDir must be an absolute directory path')
+  if (!isAbsolute(root)) throw new Error(CREATE_TOOL + ': fromDir must be an absolute path, got ' + JSON.stringify(dir))
+  if (!existsSync(root)) throw new Error(CREATE_TOOL + ': fromDir does not exist: ' + root)
+  const rootInfo = await stat(root)
+  if (!rootInfo.isDirectory()) throw new Error(CREATE_TOOL + ': fromDir is not a directory: ' + root)
+  const found = await walkMaterial(root, '', new Map(), 0)
+  if (found.size === 0) throw new Error(CREATE_TOOL + ': fromDir holds no files (dot-prefixed entries are ignored): ' + root)
+  const rootHtml = [...found.keys()].filter((path) => !path.includes('/') && /\.html?$/i.test(path))
+  const wanted = entryHint === undefined || entryHint === null || String(entryHint).trim() === '' ? undefined : String(entryHint).trim()
+  const entryPath = wanted !== undefined
+    ? wanted
+    : (found.has('entry.html') ? 'entry.html' : (found.has('index.html') ? 'index.html' : undefined))
+  if (entryPath === undefined) {
+    throw new Error(CREATE_TOOL + ': fromDir has no entry: expected entry.html or index.html at the top of ' + root
+      + (rootHtml.length === 0 ? ' — and there is no .html file at the root at all, so name one with "entry".' : ' — candidates: ' + rootHtml.join(', ') + '. Name one with "entry".'))
+  }
+  if (!found.has(entryPath)) throw new Error(CREATE_TOOL + ': entry ' + JSON.stringify(entryPath) + ' is not a file in fromDir ' + root)
+  // Reachability: only what the page actually loads. Text is read as text, with
+  // a ceiling, so a giant file in the folder is not slurped for nothing.
+  const reachable = new Set([entryPath])
+  const queue = [entryPath]
+  const bodies = new Map()
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (!REFERENCE_TEXT_EXTENSIONS.has(extOf(current))) continue
+    if (!bodies.has(current)) {
+      const info = found.get(current)
+      try {
+        bodies.set(current, info.bytes > limits.softWarnBytes ? '' : await readFile(info.abs, 'utf8'))
+      } catch {
+        bodies.set(current, '')
+      }
+    }
+    for (const ref of collectRefs(bodies.get(current), current)) {
+      if (found.get(ref.path) === undefined || reachable.has(ref.path)) continue
+      reachable.add(ref.path)
+      queue.push(ref.path)
+    }
+  }
+  const accepted = []
+  const skipped = []
+  for (const [path, info] of found) {
+    if (path === entryPath) continue
+    if (SECTION_TYPES[extOf(path)] === undefined) {
+      skipped.push({ path, bytes: info.bytes, reason: 'unknown type', detail: 'no section type for ".' + extOf(path) + '"' })
+      continue
+    }
+    if (info.bytes > limits.sectionBytes) {
+      skipped.push({ path, bytes: info.bytes, reason: 'over limit', detail: String(info.bytes - limits.sectionBytes) + ' bytes over the per-file limit ' + String(limits.sectionBytes) })
+      continue
+    }
+    if (!reachable.has(path)) {
+      skipped.push({ path, bytes: info.bytes, reason: 'unreferenced', detail: 'nothing the entry loads points at it' })
+      continue
+    }
+    accepted.push({ path, from: info.abs, bytes: info.bytes })
+  }
+  accepted.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  return {
+    root,
+    entryPath,
+    files: [{ path: entryPath, from: found.get(entryPath).abs }, ...accepted.map((file) => ({ path: file.path, from: file.from }))],
+    loaded: [{ path: entryPath, bytes: found.get(entryPath).bytes, from: found.get(entryPath).abs }, ...accepted],
+    skipped,
+    tolerated: skipped.map((item) => item.path)
+  }
+}
+
 /**
  * Assemble the virtual folder the tool receives into the one block body the
  * route already serves: the ENTRY text, then one `<!-- @@file <path> -->`
@@ -246,16 +537,21 @@ function sectionType(path) {
  *
  * Every check happens here, before anything touches the disk: a bad path, a
  * broken content/from pair, a body that would forge a section marker, a file
- * past SECTION_MAX_BYTES, or a block past BLOCK_MAX_BYTES all throw with the
- * offending file named. The route's 404/413 answers stay the last resort; this
- * is the first.
+ * past limits.sectionBytes, a block past limits.blockBytes, and a reference to
+ * a file the block does not carry all throw with the offending file named. The
+ * route's 404/413 answers stay the last resort; this is the first.
  *
  * @param files - [{ path, content } | { path, from }], at least one.
  * @param entryPath - which file renders; must be in files and at the root.
- * @returns the body to store, the chosen entry path, and the per-file facts the
- *   tool result reports.
+ * @param options - { toleratedMissing: string[] }: files the caller knowingly
+ *   left out (fromDir's ledger), so a reference to one is reported by the
+ *   caller instead of refused here.
+ * @returns the body to store, the chosen entry path, the per-file facts the
+ *   tool result reports, the references that only resolve to a tolerated file,
+ *   and one advisory line when the block is past the soft-warn size.
  */
-async function assembleBlock(files, entryPath) {
+async function assembleBlock(files, entryPath, options) {
+  const tolerated = options !== undefined && options !== null && Array.isArray(options.toleratedMissing) ? options.toleratedMissing : []
   if (!Array.isArray(files) || files.length === 0) {
     throw new Error(CREATE_TOOL + ': files must be a non-empty array of { path, content } or { path, from }')
   }
@@ -293,13 +589,23 @@ async function assembleBlock(files, entryPath) {
       if (!existsSync(from)) throw new Error(CREATE_TOOL + ': from file does not exist: ' + from)
       const info = await stat(from)
       if (!info.isFile()) throw new Error(CREATE_TOOL + ': from is not a file: ' + from)
-      if (info.size > SECTION_MAX_BYTES) throw new Error(CREATE_TOOL + ': from file is ' + String(info.size) + ' bytes; the limit is ' + String(SECTION_MAX_BYTES) + ': ' + from)
+      if (info.size > limits.sectionBytes) {
+        throw new Error(overLimitText('per file', 'file ' + path + ' (' + from + ')', info.size, limits.sectionBytes, 'limits.sectionBytes', [
+          'leave it out of the block: with fromDir it stays in the material directory and is listed in skipped[], and the page still renders',
+          'shrink it: an image to webp, a font to woff2 and only the weight the page uses',
+          'split it: a CSS file that big is usually two stylesheets, a JSON that big is usually data the entry does not need'
+        ]))
+      }
       const raw = await readFile(from)
       bytes = raw.length
       body = binary ? raw.toString('base64') : raw.toString('utf8')
     }
-    if (bytes > SECTION_MAX_BYTES) {
-      throw new Error(CREATE_TOOL + ': file ' + path + ' is ' + String(bytes) + ' bytes; the limit is ' + String(SECTION_MAX_BYTES))
+    if (bytes > limits.sectionBytes) {
+      throw new Error(overLimitText('per file', 'file ' + path, bytes, limits.sectionBytes, 'limits.sectionBytes', [
+        'pass the file with "from" instead of "content", or leave it out of the block entirely',
+        'shrink it: an image to webp, a font to woff2 and only the weight the page uses',
+        'split it: a CSS file that big is usually two stylesheets, a JSON that big is usually data the entry does not need'
+      ]))
     }
     for (const line of splitLines(body)) {
       if (SECTION_RE.test(line)) {
@@ -338,9 +644,17 @@ async function assembleBlock(files, entryPath) {
   const rest = items.filter((item) => item.path !== entryName)
   const text = [entry.body, ...rest.map((item) => '<!-- @@file ' + item.path + (item.binary ? ' base64' : '') + ' -->\n' + item.body)].join('\n')
   const total = Buffer.byteLength(text, 'utf8')
-  if (total > BLOCK_MAX_BYTES) {
-    throw new Error(CREATE_TOOL + ': the assembled block is ' + String(total) + ' bytes; the limit is ' + String(BLOCK_MAX_BYTES) + ' — keep binary sections small (an SVG text section costs almost nothing)')
+  if (total > limits.blockBytes) {
+    throw new Error(overLimitText('per block', 'the assembled block', total, limits.blockBytes, 'limits.blockBytes', [
+      'load fewer files: fromDir keeps the block to what the entry loads, so a leftover copy of the page (a _build/ or a report.json) is not the problem — check what IS loaded',
+      'shrink the big sections: base64 costs 4/3, so a 3 MB font is 4 MB of block text; woff2 of the used subset is usually under 100 KB',
+      'drop the heavy originals from the directory: with fromDir an over-limit file is skipped and listed, and the page still renders without it'
+    ]))
   }
+  const toleratedRefs = assertRefsResolve(
+    [{ path: entry.path, body: entry.body }, ...rest.map((item) => ({ path: item.path, body: item.body }))],
+    tolerated
+  )
   return {
     text,
     entry: entry.path,
@@ -348,7 +662,9 @@ async function assembleBlock(files, entryPath) {
       path: item.path,
       bytes: item.bytes,
       ...item.from === undefined ? {} : { from: item.from }
-    }))
+    })),
+    toleratedRefs,
+    warning: softWarnText(total)
   }
 }
 
@@ -822,6 +1138,10 @@ const CREATE_DESCRIPTION = [
   '',
   'FILES: prefer `from` — an absolute disk path the host copies verbatim — for anything large (compiled CSS, fonts, images) instead of retyping its text.',
   '',
+  'FROMDIR — THE WAY TO LAND A WHOLE PAGE IN ONE CALL: pass `fromDir` (an absolute directory, e.g. what capture_page just wrote) INSTEAD of `files`, and the host does the picking. It takes entry.html as the entry, else index.html, else it fails and names the candidates (pass `entry` to choose); every other file becomes a section at its own relative path, binaries base64 automatically. It leaves out, and lists in `skipped` with bytes and reason, three kinds: files the entry loads nothing from (a leftover _build/ copy, report.json), files past the per-file limit, and extensions no section type serves (.stream, .pdf). A reference to a file that does not exist at all is refused before anything is written; a reference to one it skipped is reported under referencedSkipped and the page still renders. So a capture of 100+ files costs one call and no content in the conversation: capture_page -> create_ui_block({ name, fromDir }) -> read_ui_block.',
+  '',
+  'REFERENCES MUST RESOLVE: every file the entry or one of its stylesheets LOADS (link href, img/script/source/video/audio/iframe src, CSS url() and @import) must be a member of this block or a data: URL. Resolution is relative to that file\'s own URL, so ./card.css from the entry and ../assets/x.woff2 from shared/app.css both work; a bare /assets/x.png does not (the block is served under /ui-blocks/<name>/, not at the site root). A dangling reference fails the call with the line, the member and the URL as written — a block that builds and then silently 404s is worse than one that refuses. Navigation is exempt: an <a href> or a <form action> may point anywhere.',
+  '',
   'ENTRY AND URLS: the entry is served at /ui-blocks/<name>/, every other file at /ui-blocks/<name>/<path>, so all of them are siblings. Link them relatively from the entry: ./card.css, ./icons/ok.svg, ./pages/error.html — and ./ on its own comes back to the entry. Writing index.html does not: only a real member answers at its own path, and the entry has its own URL.',
   '',
   'PAGES: any .html member is a whole page of its own, so one block can carry several screens of the same product — the same form at rest, in error, mid-load — instead of faking them inside one document.',
@@ -834,6 +1154,7 @@ const CREATE_DESCRIPTION = [
   '',
   'CREATING vs UPDATING:',
   '- To CREATE a UI block, call this tool.',
+  '- SAME NAME MEANS SAFE REPLACE, NOT "already exists": calling this tool with a name that is taken renames the old file to <name>.uiblock.bak-<ISO timestamp> first, writes the new one, and appends one patch to that block\'s history (.history/<name>) — so the previous version is still there, replayable. Do NOT delete the block first, and do not try to "clear" it: deleting is the only operation here that loses the old version, and it is never needed.',
   '- Do NOT create a .uiblock file with write. A block that was not created through this tool has no registered metadata, so read_ui_block and the reference line cannot find it.',
   '- To UPDATE an existing block, change the .uiblock file in place: `edit` for a targeted change, or `write` when the block is almost entirely new. Then reference it again in the same message. Do NOT call this tool again to update it, and do NOT write it through a shell command or a script.',
   '- Editing by hand means writing the file format: every extra member is a section that starts on a whole line `<!-- @@file <path> [base64] -->` and runs to the next such line or to the end. Add `base64` to a binary one (png webp jpg jpeg woff woff2 ttf) — unmarked, its bytes are decoded as text and the member arrives corrupted. No member\'s own content may contain such a line; it would split the file.'
@@ -865,6 +1186,8 @@ const CAPTURE_DESCRIPTION = [
   'The extension does the extraction: the DOM, the styles that actually apply, and the fonts and images, plus a report of what it kept and what it dropped. This tool only queues the task for that instance, waits for the answer, and lets the plugin write the material to <DSH_HOME>/ui-captures/<name>/ — the entry document, its shared/pages/assets material and report.json.',
   '',
   'files[].from is the ABSOLUTE path of each file on disk. Pass those strings as create_ui_block\'s files[].from and the host copies the bytes itself: a few hundred KB of material then costs no context at all. Read a file only when the caller asked to change its content.',
+  '',
+  'THE RESULT IS AN INDEX, NOT A PILE: files grouped by type with their bytes, the totals, report.dropped summarised, and "dangling" — every url()/src/link href the captured documents make to something the capture does NOT have. That list is the honest answer to "which icon is missing", so read it instead of re-capturing. fromDir names the directory to hand create_ui_block, so the whole material set becomes one block in one call: capture_page -> create_ui_block({ name, fromDir }) -> read_ui_block.',
   '',
   'A failure is always one concrete cause: the extension never reported in, it reported but never took the task, it took the task and never answered, the target tab is gone (call list_pages again — do not substitute another tab), or the extension itself failed, in which case its own message is repeated verbatim.'
 ].join('\n')
@@ -1228,10 +1551,121 @@ function captureSummary(files, report) {
   return String(files.length) + ' file(s), ' + String(total) + ' bytes total, ' + droppedText
 }
 
-/** The capture tool's rendered text: where it landed, what to do with it, the report. */
+/** The type bucket one captured file belongs to, for the index. */
+function materialGroup(path) {
+  const ext = extOf(path)
+  if (ext === 'html' || ext === 'htm') return 'html'
+  if (ext === 'css') return 'css'
+  if (['png', 'jpg', 'jpeg', 'webp', 'svg', 'gif', 'ico', 'avif', 'bmp'].includes(ext)) return 'images'
+  if (['woff2', 'woff', 'ttf', 'otf', 'eot'].includes(ext)) return 'fonts'
+  return 'other'
+}
+
+/**
+ * The material INDEX: what a capture actually left on disk, grouped, counted,
+ * and — the part that answers "which icon is missing" without a re-capture —
+ * every reference the captured documents make to something that was NOT
+ * captured.
+ *
+ * The extension's own report says what IT dropped; this says what the PRODUCT
+ * of that dropping looks like: a url() with no file behind it.
+ * @param dir - the capture directory.
+ * @param files - [{ path, bytes }] as written.
+ * @param report - report.json as written, for its dropped account.
+ * @returns the index object the tool returns and renders.
+ */
+async function indexMaterial(dir, files, report) {
+  const groups = { html: [], css: [], images: [], fonts: [], other: [] }
+  let totalBytes = 0
+  const present = new Set(files.map((file) => file.path))
+  for (const file of files) {
+    groups[materialGroup(file.path)].push({ path: file.path, bytes: file.bytes })
+    totalBytes += file.bytes
+  }
+  const droppedRaw = report !== null && typeof report === 'object' ? report.dropped : undefined
+  const droppedItems = Array.isArray(droppedRaw)
+    ? droppedRaw.slice(0, 20).map((item) => {
+      if (item === null || typeof item !== 'object') return { url: String(item), reason: '' }
+      return { url: String(item.url === undefined ? (item.src === undefined ? item.ref : item.src) : item.url), reason: String(item.reason === undefined ? item.why : item.reason) }
+    })
+    : []
+  const dropped = {
+    count: Array.isArray(droppedRaw) ? droppedRaw.length : (typeof droppedRaw === 'number' ? droppedRaw : 0),
+    items: droppedItems
+  }
+  // Dangling: read the text members (capped) and resolve every reference. A
+  // capture of a real page is 100+ files, so the read is bounded on purpose.
+  const dangling = []
+  let scanned = 0
+  for (const file of files) {
+    if (!REFERENCE_TEXT_EXTENSIONS.has(extOf(file.path))) continue
+    if (scanned >= 60 || file.bytes > limits.sectionBytes) continue
+    scanned += 1
+    let body
+    try {
+      body = await readFile(join(dir, file.path), 'utf8')
+    } catch {
+      continue
+    }
+    for (const ref of collectRefs(body, file.path)) {
+      if (present.has(ref.path)) continue
+      dangling.push({ where: file.path, line: ref.line, ref: ref.ref, path: ref.path })
+    }
+  }
+  return {
+    dir,
+    count: files.length,
+    totalBytes,
+    groups,
+    dropped,
+    dangling,
+    /** What create_ui_block needs: the directory itself is the whole material set. */
+    fromDir: dir,
+    suggestedName: baseNameOf(dir)
+  }
+}
+
+/** One line: how many files and bytes, per bucket. */
+function indexGroupsText(index) {
+  const parts = []
+  for (const key of ['html', 'css', 'images', 'fonts', 'other']) {
+    const bucket = index.groups[key]
+    if (bucket.length === 0) continue
+    const bytes = bucket.reduce((sum, file) => sum + file.bytes, 0)
+    parts.push(key + ' ' + String(bucket.length) + ' (' + String(bytes) + ' bytes)')
+  }
+  return 'index: ' + String(index.count) + ' file(s), ' + String(index.totalBytes) + ' bytes — ' + parts.join(', ')
+}
+
+/** The capture tool's rendered text: where it landed, what to do with it, the index, the report. */
 function captureText(value) {
   const lines = ['Capture landed in ' + value.dir + ' — ' + value.summary, '']
-  lines.push('files[] — `from` is the file\'s absolute path on disk. Hand those strings to create_ui_block as files[].from and the host copies the bytes itself, so none of this material enters the conversation:')
+  const index = value.index
+  if (index !== undefined && index !== null) {
+    lines.push(indexGroupsText(index))
+    for (const key of ['html', 'css', 'images', 'fonts', 'other']) {
+      const bucket = index.groups[key]
+      if (bucket.length === 0) continue
+      lines.push('  ' + key + ': ' + bucket.map((file) => file.path + ' ' + String(file.bytes)).join(', '))
+    }
+    if (index.dropped.count > 0) {
+      lines.push('  report.dropped: ' + String(index.dropped.count) + ' resource(s)'
+        + (index.dropped.items.length === 0 ? '' : ' — ' + index.dropped.items.slice(0, 8).map((item) => (item.url === '' ? '(no url)' : item.url) + (item.reason === '' ? '' : ' [' + item.reason + ']')).join('; ')))
+    } else {
+      lines.push('  report.dropped: nothing')
+    }
+    if (index.dangling.length === 0) {
+      lines.push('  references: every url()/src/href in the captured documents resolves to a captured file')
+    } else {
+      lines.push('  DANGLING — referenced but not captured (' + String(index.dangling.length) + '), these 404 if you build the block as-is:')
+      for (const row of index.dangling.slice(0, 20)) lines.push('    ' + row.where + ':' + String(row.line) + '  ' + row.ref + ' -> ' + row.path)
+      if (index.dangling.length > 20) lines.push('    ... and ' + String(index.dangling.length - 20) + ' more')
+    }
+    lines.push('')
+    lines.push('NEXT CALL (the whole material set in one call — no files[] list needed): create_ui_block({ name: "' + index.suggestedName + '", fromDir: "' + value.dir + '" })')
+  }
+  lines.push('')
+  lines.push('files[] — `from` is the file\'s absolute path on disk. A create_ui_block call that passes them as files[].from copies the bytes on the host and none of this material enters the conversation; better still, pass fromDir (above) and list no files at all:')
   for (const file of value.files) lines.push('  ' + file.path + '  ' + String(file.bytes) + ' bytes  from=' + file.from)
   const entry = value.files.find((file) => /\.html$/.test(file.path))
   if (entry !== undefined) {
@@ -1303,6 +1737,8 @@ function noResultText(task, timeoutMs) {
  */
 export function apply(ctx, config) {
   applyAgentConfig(config)
+  // limits is a SIBLING of agent: the ceilings are not a switch, they are sizes.
+  applyLimitsConfig(config)
   ctx.tools.register(defineTool({
     name: CREATE_TOOL,
     description: CREATE_DESCRIPTION,
@@ -1314,16 +1750,19 @@ export function apply(ctx, config) {
       },
       entry: {
         type: 'string',
-        description: 'Which file renders: a path at the block ROOT (no "/"). Omitted, it is the file called index.html, else the first file.'
+        description: 'Which file renders: a path at the block ROOT (no "/"). Omitted, it is the file called index.html, else the first file. With fromDir, omitted means entry.html then index.html at the top of that directory.'
       },
       title: {
         type: 'string',
         description: 'Optional human label for the preview card. Not stored in the file.'
       },
+      fromDir: {
+        type: 'string',
+        description: 'Absolute path of a material directory (a capture from capture_page, or any folder of a page and its assets). The host walks it and builds the whole block itself: entry.html (else index.html, else name one with entry), every other file at its own relative path, binary extensions base64 automatically. Files nobody loads, files past the per-file limit and extensions no section type serves are LEFT OUT and listed in the result with their bytes and reason — nothing to pick by hand. Use this OR files, not both. A reference the entry or a stylesheet makes to a file that does not exist at all is refused before anything is written.'
+      },
       files: {
         type: 'array',
-        required: true,
-        description: 'One item per file: { path, content } for text you write, or { path, from } for an absolute disk path the host copies verbatim. Binary extensions (woff2 woff ttf png jpg jpeg webp) are stored as base64 automatically, so pass a binary either as a base64 string in `content` or, better, as `from`. At least one item; the entry must be among them. 256 KB per file, measured on the decoded bytes; 2 MB per block, measured on the stored file text, where a base64 payload counts about 4/3 of its real size.',
+        description: 'One item per file: { path, content } for text you write, or { path, from } for an absolute disk path the host copies verbatim. Binary extensions (woff2 woff ttf png jpg jpeg webp) are stored as base64 automatically, so pass a binary either as a base64 string in `content` or, better, as `from`. At least one item, and the entry must be among them. Defaults: 2 MB per file measured on the decoded bytes, 64 MB per block measured on the stored file text (a base64 payload counts about 4/3 of its real size); both are configurable under `limits`. Every resource the entry or a stylesheet loads must be one of these files (or a data: URL) — otherwise the call fails and names what is missing.',
         items: {
           type: 'object',
           additionalProperties: false,
@@ -1343,6 +1782,10 @@ export function apply(ctx, config) {
           path: { type: 'string', required: true },
           name: { type: 'string', required: true },
           backup: { type: 'string' },
+          entry: { type: 'string', required: true },
+          fromDir: { type: 'string', description: 'The material directory this block was built from, when fromDir was used.' },
+          blockBytes: { type: 'number', required: true, description: 'The stored block text, which is what the limits measure.' },
+          totalBytes: { type: 'number', required: true, description: 'Sum of the loaded files\' own bytes.' },
           files: {
             type: 'array',
             required: true,
@@ -1355,23 +1798,79 @@ export function apply(ctx, config) {
                 from: { type: 'string' }
               }
             }
-          }
+          },
+          skipped: {
+            type: 'array',
+            description: 'fromDir only: every file left out, with its bytes and why (unknown type / over limit / unreferenced).',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                bytes: { type: 'number', required: true },
+                reason: { type: 'string', required: true },
+                detail: { type: 'string' }
+              }
+            }
+          },
+          referencedSkipped: {
+            type: 'array',
+            description: 'fromDir only: references that point at a file this block left out — one line each, "where:line ref -> path".',
+            items: { type: 'string' }
+          },
+          warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' }
         }
       },
       render: (args, value) => [{
         type: 'text',
-        text: 'UI block: ' + value.path + '\nFiles:\n' + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n') + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::' + (value.backup === undefined ? '' : '\nPrevious version backed up to: ' + value.backup)
+        text: 'UI block: ' + value.path + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
+          + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
+          + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
+          + (Array.isArray(value.skipped) && value.skipped.length > 0
+            ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + ')').join('\n')
+            : '')
+          + (Array.isArray(value.referencedSkipped) && value.referencedSkipped.length > 0
+            ? '\nReferenced but skipped — those 404 inside the block, the page still renders:\n' + value.referencedSkipped.map((line) => '  - ' + line).join('\n')
+            : '')
+          + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
+          + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
+          + (value.backup === undefined ? '' : '\nPrevious version backed up to: ' + value.backup)
       }]
     },
     execute: async (args) => {
       const blockName = assertName(args.name)
-      const assembled = await assembleBlock(args.files, args.entry)
+      const hasFiles = args.files !== undefined && args.files !== null
+      const hasDir = typeof args.fromDir === 'string' && args.fromDir.trim() !== ''
+      if (hasFiles === hasDir) {
+        throw new Error(CREATE_TOOL + ': pass exactly one of files / fromDir'
+          + (hasDir || hasFiles ? '' : ' — files is the explicit list, fromDir builds the block from a material directory'))
+      }
+      let assembled
+      let from
+      let skipped
+      let referencedSkipped
+      if (hasDir) {
+        const collected = await collectFromDir(args.fromDir, args.entry)
+        from = collected.root
+        assembled = await assembleBlock(collected.files, collected.entryPath, { toleratedMissing: collected.tolerated })
+        skipped = collected.skipped
+        referencedSkipped = assembled.toleratedRefs.map((row) => row.where + ':' + String(row.line) + ' ' + row.ref + ' -> ' + row.path)
+      } else {
+        assembled = await assembleBlock(args.files, args.entry)
+      }
       const written = await writeBlock(blockName, assembled.text)
       return {
         path: blockPath(blockName),
         name: blockName,
         ...written.backup === undefined ? {} : { backup: written.backup },
-        files: assembled.files
+        entry: assembled.entry,
+        ...from === undefined ? {} : { fromDir: from },
+        blockBytes: Buffer.byteLength(assembled.text, 'utf8'),
+        totalBytes: assembled.files.reduce((sum, file) => sum + file.bytes, 0),
+        files: assembled.files,
+        ...skipped === undefined ? {} : { skipped },
+        ...referencedSkipped === undefined || referencedSkipped.length === 0 ? {} : { referencedSkipped },
+        ...assembled.warning === undefined ? {} : { warning: assembled.warning }
       }
     },
     presentCall: (args) => {
@@ -1620,7 +2119,13 @@ export function apply(ctx, config) {
             }
           },
           report: { type: 'json', required: true, description: 'report.json exactly as written: the extension report plus a "capture" section of our bookkeeping. Nothing is trimmed.' },
-          summary: { type: 'string', required: true, description: 'One line for humans: file count, total bytes, how many resources the extension dropped.' }
+          summary: { type: 'string', required: true, description: 'One line for humans: file count, total bytes, how many resources the extension dropped.' },
+          fromDir: { type: 'string', required: true, description: 'The directory to hand create_ui_block as fromDir — the whole material set becomes a block in one call.' },
+          index: {
+            type: 'json',
+            required: true,
+            description: 'The material index: files grouped by type (html/css/images/fonts/other) with bytes, the totals, report.dropped summarised, and "dangling" — every reference the captured documents make to something that was NOT captured (where, line, ref, resolved path).'
+          }
         }
       },
       render: (args, value) => [{ type: 'text', text: captureText(value) }]
@@ -1674,7 +2179,9 @@ export function apply(ctx, config) {
         dir: done.dir,
         files: done.files.map((file) => ({ path: file.path, bytes: file.bytes, from: join(done.dir, file.path) })),
         report,
-        summary: captureSummary(done.files, report)
+        summary: captureSummary(done.files, report),
+        fromDir: done.dir,
+        index: await indexMaterial(done.dir, done.files, report)
       }
     }
   }))
@@ -1755,8 +2262,9 @@ export function apply(ctx, config) {
           // point: <link href="./panel.css">, url(./x.woff2) and <img src="./y.svg">
           // resolve against the section URLs below instead of about:srcdoc.
           const wholeFile = Buffer.byteLength(served)
-          if (wholeFile > BLOCK_MAX_BYTES) {
-            sendText(res, 413, 'block ' + blockPath(blockName) + ' is ' + String(wholeFile) + ' bytes; the limit is ' + String(BLOCK_MAX_BYTES) + ' — keep binary sections small (an SVG text section costs almost nothing)')
+          if (wholeFile > limits.blockBytes) {
+            sendText(res, 413, 'block ' + blockPath(blockName) + ' is ' + String(wholeFile) + ' bytes; the limit is ' + String(limits.blockBytes)
+              + ' bytes (per block) — ' + String(wholeFile - limits.blockBytes) + ' bytes over. Shrink or drop the heavy sections (base64 costs 4/3: woff2 instead of ttf), or raise limits.blockBytes in the plugin config.')
             return
           }
           const sections = splitSections(served)
@@ -1791,8 +2299,9 @@ export function apply(ctx, config) {
             return
           }
           const bytes = file.base64 ? Buffer.from(file.body.trim(), 'base64') : Buffer.from(file.body, 'utf8')
-          if (bytes.length > SECTION_MAX_BYTES) {
-            sendText(res, 413, 'section ' + file.path + ' is ' + String(bytes.length) + ' bytes; the limit is ' + String(SECTION_MAX_BYTES) + ' — use an SVG text section or a smaller asset')
+          if (bytes.length > limits.sectionBytes) {
+            sendText(res, 413, 'section ' + file.path + ' is ' + String(bytes.length) + ' bytes; the limit is ' + String(limits.sectionBytes)
+              + ' bytes (per file) — ' + String(bytes.length - limits.sectionBytes) + ' bytes over. Shrink the asset, or raise limits.sectionBytes in the plugin config.')
             return
           }
           res.writeHead(200, {
@@ -2029,6 +2538,25 @@ export function apply(ctx, config) {
     })
   })
 }
+/**
+ * Test seam for self-check-blockbuild.mjs: the block-building path — the live
+ * limits, the directory collector, the reference guard and the material index —
+ * so fromDir, the ceilings and the dangling-reference refusal can be asserted
+ * against real files in a throwaway DSH_HOME.
+ */
+export const blockBuild = {
+  limits,
+  LIMIT_DEFAULTS,
+  applyLimitsConfig,
+  collectFromDir,
+  assertRefsResolve,
+  collectRefs,
+  resolveRef,
+  indexMaterial,
+  softWarnText,
+  overLimitText
+}
+
 /**
  * Test seam for self-check-agent.mjs: the queue, the instance table and the
  * live switches, so the endpoint contract can be asserted without HTTP.
