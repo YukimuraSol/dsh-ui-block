@@ -41,7 +41,8 @@
  * @module dsh-ui-block
  */
 import { spawn } from 'node:child_process'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -79,6 +80,39 @@ const CAPTURES_DIR_NAME = 'ui-captures'
 const AGENT_BODY_MAX_BYTES = 32 * 1024 * 1024
 /** How many requests the ring keeps in memory. */
 const AGENT_RECENT_MAX = 20
+// ---------------------------------------------------------------------------
+// The instance registry ("登记台"): ONE fixed loopback address that answers
+// "which DSH instances are alive right now?".
+//
+// Why it exists: a Chrome extension cannot listen on a port, so it needs a fixed
+// place to ask. Why it is not a broker: the extension still POSTs its poll to
+// every instance in this table and every instance still writes its own tasks —
+// the registry only publishes addresses.
+//
+// Lifecycle, in the order it happens:
+//   * every instance first GETs /health. An answer that identifies the registry
+//     is REUSED: the instance registers and heartbeats every 10 seconds.
+//   * only when nobody answers does an instance try to listen on the fixed port.
+//     EADDRINUSE means "someone won the race", so it waits and asks again
+//     instead of fighting for the port.
+//   * a registration older than 45 seconds is dropped from the table.
+//   * with no heartbeat from ANY instance for 20 seconds the registry closes
+//     itself, so it never sits on the fixed port as an orphan. The next
+//     instance to start (or to heartbeat) brings one back.
+//   * a port held by something that is NOT the registry is reported once and
+//     the instance continues without one — no retry loop.
+// ---------------------------------------------------------------------------
+const REGISTRY_PORT = 38520
+const REGISTRY_HOST = '127.0.0.1'
+/** What /health must answer for a listener to count as OUR registry. */
+const REGISTRY_SERVICE = 'dsh-ui-block-registry'
+const REGISTRY_HEARTBEAT_MS = 10 * 1000
+const REGISTRY_EXPIRE_MS = 45 * 1000
+const REGISTRY_IDLE_MS = 20 * 1000
+/** /register carries four small fields; nothing else may arrive on that port. */
+const REGISTRY_BODY_MAX_BYTES = 4096
+/** A table this size is already wrong: a real machine runs one to three. */
+const REGISTRY_MAX_INSTANCES = 16
 const EXT = '.uiblock'
 /** A section marker: a WHOLE line, `<!-- @@file <path> [base64] -->`. */
 const SECTION_RE = /^<!--\s*@@file\s+(\S+?)(\s+base64)?\s*-->\s*$/
@@ -1175,7 +1209,7 @@ const READ_DESCRIPTION = [
 const LIST_DESCRIPTION = [
   'List the web pages a browser extension is reporting to this DSH instance right now, so a capture targets a page that exists instead of a URL someone guessed.',
   '',
-  'THE PAGE HAS TO BE OPEN FIRST. The extension reports open tabs, so the page must already be open in a browser that has dsh-page-capture installed: prefer a headless Chrome this agent starts itself with --load-extension=<captureDir> (captureDir comes from GET /ui-block-extension/info), and fall back to the user\'s own browser when the page will not open there. The list is the same either way.',
+  'THE PAGE HAS TO BE OPEN FIRST. The extension reports open tabs, so the page must already be open in a browser that has dsh-page-capture installed: prefer a browser this agent starts itself and loads the extension into (the extension folder comes from GET /ui-block-extension/info), and fall back to the user\'s own browser when the page will not open there. The list is the same either way.',
   '',
   'Call this first, then capture_page with one row\'s { instance, tabId }: a tab id is unique only inside one instance, so the pair is the identity. url and title say what the page is, focused says whether it is the active tab, and capturable:false carries the reason that tab can never be captured (a chrome:// page, the extension store, an extension page, an embedded PDF).',
   '',
@@ -1350,6 +1384,375 @@ async function readJsonBody(req, limit) {
     const error = new Error('request body is not JSON')
     error.status = 400
     throw error
+  }
+}
+
+/**
+ * Where the registry token lives: the USER's own DSH home, not this instance's.
+ * 4000 and 3080 have different DSH_HOMEs, and a token an instance keeps to
+ * itself cannot be used to register with another instance's registry.
+ * ponytail: a file every instance can read is a guard against accidents (a web
+ * page, a blind local scan), not against a process that goes looking for it.
+ */
+function registryTokenFile() {
+  return join(homedir(), '.dsh', 'instance-registry.token')
+}
+
+/**
+ * The token a registration must carry.
+ *
+ * Order: the profile's own pairing code (agent.token) when set — the documented
+ * way to make two instances agree — then DSH_INSTANCE_REGISTRY_TOKEN, then one
+ * random string per user, created once and kept across restarts.
+ */
+function registryToken() {
+  if (agentHub.options.token !== '') return agentHub.options.token
+  const fromEnv = String(process.env.DSH_INSTANCE_REGISTRY_TOKEN === undefined ? '' : process.env.DSH_INSTANCE_REGISTRY_TOKEN).trim()
+  if (fromEnv !== '') return fromEnv
+  const file = registryTokenFile()
+  try {
+    const found = readFileSync(file, 'utf8').trim()
+    if (/^[A-Za-z0-9._-]{16,128}$/.test(found)) return found
+  } catch { /* first run: created below */ }
+  const made = randomBytes(16).toString('hex')
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    // 'wx' loses the race on purpose: the loser re-reads the winner's token
+    // instead of overwriting it, so two instances starting together still agree.
+    writeFileSync(file, made + '\n', { encoding: 'utf8', flag: 'wx' })
+    return made
+  } catch {
+    try {
+      const found = readFileSync(file, 'utf8').trim()
+      if (found !== '') return found
+    } catch { /* unreadable: fall through to a per-process token */ }
+    return randomBytes(16).toString('hex')
+  }
+}
+
+/** The token a registration carries: a header only, never a query string in a log. */
+function registryRequestToken(req) {
+  const header = req.headers['x-uiblock-token']
+  if (typeof header === 'string' && header !== '') return header
+  const authorization = req.headers.authorization
+  if (typeof authorization === 'string' && /^bearer\s+/i.test(authorization)) return authorization.replace(/^bearer\s+/i, '').trim()
+  return ''
+}
+
+/**
+ * One registry: the table, three routes and two clocks.
+ *
+ * Every timing is an option with the real default, so a self-check can drive
+ * expiry and self-shutdown in milliseconds instead of seconds.
+ *
+ * @param options - { host, port, token, expireMs, idleMs, log }.
+ * @returns the registry; call start() to listen.
+ */
+function createRegistry(options = {}) {
+  const host = options.host === undefined ? REGISTRY_HOST : String(options.host)
+  const wanted = options.port === undefined ? REGISTRY_PORT : Number(options.port)
+  const token = options.token === undefined ? '' : String(options.token)
+  const expireMs = options.expireMs === undefined ? REGISTRY_EXPIRE_MS : Number(options.expireMs)
+  const idleMs = options.idleMs === undefined ? REGISTRY_IDLE_MS : Number(options.idleMs)
+  const log = typeof options.log === 'function' ? options.log : () => {}
+  /**
+   * port -> { port, instance, bootAt, lastSeenAt }. Keyed by port so a
+   * re-announcing instance cannot double a row; sorted on read so the extension
+   * always sees one stable order.
+   */
+  const entries = new Map()
+  let server = null
+  let startedAt = 0
+  let lastBeatAt = Date.now()
+  let closedAt = 0
+  let watchdog = null
+
+  /** The table as the extension reads it, expired rows already gone. */
+  function table(now = Date.now()) {
+    for (const [key, entry] of entries) if (now - entry.lastSeenAt > expireMs) entries.delete(key)
+    return [...entries.values()].sort((left, right) => left.port - right.port)
+  }
+
+  /**
+   * Record one instance. The token is checked by the CALLER (the HTTP handler
+   * and the hosting client both know it), so this stays a plain table write and
+   * an in-process call cannot quietly become a way around the check.
+   */
+  function register(body) {
+    const now = Date.now()
+    const port = Number(body.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return { status: 400, body: { ok: false, error: 'port must be an integer 1-65535' } }
+    if (!entries.has(port) && entries.size >= REGISTRY_MAX_INSTANCES) {
+      return { status: 429, body: { ok: false, error: 'the instance table is full (' + String(REGISTRY_MAX_INSTANCES) + ')' } }
+    }
+    const instance = (String(body.instance === undefined ? '' : body.instance).trim() || String(port)).slice(0, 64)
+    const bootAt = Number(body.bootAt) > 0 ? Number(body.bootAt) : 0
+    entries.set(port, { port, instance, bootAt, lastSeenAt: now })
+    lastBeatAt = now
+    return { status: 200, body: { ok: true, port, instance, instances: entries.size } }
+  }
+
+  function authorized(carried) {
+    return token !== '' && carried !== '' && carried === token
+  }
+
+  function send(res, status, payload) {
+    const text = JSON.stringify(payload)
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': String(Buffer.byteLength(text)),
+      'cache-control': 'no-store'
+    })
+    res.end(text)
+  }
+
+  async function handle(req, res) {
+    try {
+      const url = new URL(req.url === undefined || req.url === null ? '/' : req.url, 'http://' + host)
+      if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/health') {
+        send(res, 200, { ok: true, service: REGISTRY_SERVICE, pid: process.pid, instances: entries.size, startedAt: new Date(startedAt).toISOString() })
+        return
+      }
+      if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/instances') {
+        // No token in this answer, ever: the extension only needs addresses.
+        send(res, 200, { ok: true, instances: table() })
+        return
+      }
+      if (req.method === 'POST' && url.pathname === '/register') {
+        if (!authorized(registryRequestToken(req))) {
+          send(res, 401, { ok: false, error: 'a registry token is required: x-uiblock-token or Authorization: Bearer' })
+          log('registry: rejected a registration from ' + String(req.socket === undefined ? '?' : req.socket.remoteAddress) + ' (bad token)')
+          return
+        }
+        const made = register(await readJsonBody(req, REGISTRY_BODY_MAX_BYTES))
+        send(res, made.status, made.body)
+        return
+      }
+      send(res, 404, { ok: false, error: 'unknown registry path: ' + url.pathname })
+    } catch (error) {
+      try { send(res, httpStatus(error), { ok: false, error: String(error && error.message ? error.message : error) }) } catch { /* client gone */ }
+    }
+  }
+
+  /** The port actually bound (the asked one before start, or when ephemeral). */
+  function port() {
+    if (server === null) return wanted
+    const address = server.address()
+    return address === null || typeof address === 'string' ? wanted : address.port
+  }
+
+  /** Close the listener. Called by the watchdog and by whoever owns this registry. */
+  function stop(reason) {
+    if (closedAt !== 0) return
+    closedAt = Date.now()
+    if (watchdog !== null) {
+      clearInterval(watchdog)
+      watchdog = null
+    }
+    const made = server
+    server = null
+    if (made !== null) made.close(() => {})
+    log('registry: closed at ' + new Date(closedAt).toISOString() + ' (' + String(reason) + ')')
+  }
+
+  function start() {
+    return new Promise((resolve, reject) => {
+      const made = createServer((req, res) => { handle(req, res).catch(() => {}) })
+      const onError = (error) => { reject(error) }
+      made.once('error', onError)
+      made.listen(wanted, host, () => {
+        made.removeListener('error', onError)
+        made.on('error', (error) => log('registry: server error: ' + String(error && error.message ? error.message : error)))
+        server = made
+        startedAt = Date.now()
+        lastBeatAt = startedAt
+        // A quarter of the idle window, capped, so the shutdown lands within a
+        // second of the deadline instead of a minute after it.
+        watchdog = setInterval(() => {
+          if (Date.now() - lastBeatAt <= idleMs) return
+          stop('no instance heartbeat for ' + String(Math.round(idleMs / 1000)) + 's')
+        }, Math.max(50, Math.min(500, Math.floor(idleMs / 4))))
+        if (typeof watchdog.unref === 'function') watchdog.unref()
+        log('registry: listening on http://' + host + ':' + String(port()) + ' (pid ' + String(process.pid) + ')')
+        resolve(api)
+      })
+    })
+  }
+
+  const api = {
+    port,
+    start,
+    stop,
+    table,
+    register,
+    authorized,
+    handle,
+    entries,
+    isClosed: () => closedAt !== 0,
+    closedAt: () => closedAt,
+    startedAt: () => startedAt,
+    lastBeatAt: () => lastBeatAt,
+    idleMs: () => idleMs,
+    expireMs: () => expireMs
+  }
+  return api
+}
+
+/**
+ * One instance's side of the registry: announce this instance, keep the
+ * heartbeat, and host the registry when nobody else does.
+ *
+ * @param options - { instancePort, instance, bootAt, registryPort, token,
+ *   heartbeatMs, expireMs, idleMs, log }.
+ * @returns the client; start() announces now and keeps announcing.
+ */
+function createRegistryClient(options = {}) {
+  const instancePort = Number(options.instancePort)
+  const instance = String(options.instance === undefined ? 'dsh-' + String(instancePort) : options.instance)
+  const bootAt = Number(options.bootAt) > 0 ? Number(options.bootAt) : Date.now()
+  const registryPort = Number(options.registryPort === undefined ? REGISTRY_PORT : options.registryPort)
+  const token = options.token === undefined || options.token === '' ? registryToken() : String(options.token)
+  const heartbeatMs = Number(options.heartbeatMs === undefined ? REGISTRY_HEARTBEAT_MS : options.heartbeatMs)
+  const expireMs = Number(options.expireMs === undefined ? REGISTRY_EXPIRE_MS : options.expireMs)
+  const idleMs = Number(options.idleMs === undefined ? REGISTRY_IDLE_MS : options.idleMs)
+  const log = typeof options.log === 'function' ? options.log : () => {}
+  const base = 'http://' + REGISTRY_HOST + ':' + String(registryPort)
+  let hosted = null
+  let degraded = ''
+  let timer = null
+  let running = false
+
+  /**
+   * What the fixed port answers: 'registry', 'other' (something that is not
+   * us) or 'down'. The distinction is why nobody retries blindly: 'other' is a
+   * decision to stop, 'down' is a port that is simply free.
+   */
+  async function probe() {
+    try {
+      const res = await fetch(base + '/health', { cache: 'no-store', signal: AbortSignal.timeout(1000) })
+      let body = null
+      try { body = await res.json() } catch { body = null }
+      if (res.ok && body !== null && body.service === REGISTRY_SERVICE) return 'registry'
+      return 'other'
+    } catch {
+      return 'down'
+    }
+  }
+
+  async function announce() {
+    const res = await fetch(base + '/register', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'content-type': 'application/json', 'x-uiblock-token': token },
+      body: JSON.stringify({ port: instancePort, instance, bootAt }),
+      signal: AbortSignal.timeout(2000)
+    })
+    let body = null
+    try { body = await res.json() } catch { body = null }
+    return { status: res.status, body }
+  }
+
+  /** One attempt: register with whoever is there, or become the registry. */
+  async function beat() {
+    if (!running) return
+    if (hosted !== null) {
+      if (!hosted.isClosed()) {
+        hosted.register({ port: instancePort, instance, bootAt })
+        return
+      }
+      // It closed itself (nothing beat it for the idle window) yet this instance
+      // is alive: host a new one instead of leaving the extension without an address.
+      hosted = null
+    }
+    let state = await probe()
+    if (state === 'registry') {
+      const answer = await announce().catch(() => null)
+      if (answer === null) { degrade('the registry at ' + base + ' stopped answering mid-registration'); return }
+      if (answer.status === 401) degrade('the registry at ' + base + ' rejected this token (401): both instances must use the same agent.token, or delete ' + registryTokenFile() + ' and restart')
+      return
+    }
+    if (state === 'other') { degrade('127.0.0.1:' + String(registryPort) + ' answers but is not the instance registry'); return }
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const made = createRegistry({ host: REGISTRY_HOST, port: registryPort, token, expireMs, idleMs, log })
+      try {
+        await made.start()
+      } catch (error) {
+        made.stop('bind failed')
+        if (error === null || typeof error !== 'object' || error.code !== 'EADDRINUSE') {
+          degrade('cannot listen on ' + base + ': ' + String(error && error.message ? error.message : error))
+          return
+        }
+        // Lost the race: somebody else is binding the port right now. Wait, then
+        // look again — a second bind attempt only repeats the failure.
+        await sleep(200 * attempt)
+        state = await probe()
+        if (state === 'registry') {
+          const answer = await announce().catch(() => null)
+          if (answer !== null && answer.status === 401) degrade('the registry at ' + base + ' rejected this token (401): both instances must use the same agent.token')
+          return
+        }
+        if (state === 'other') { degrade('127.0.0.1:' + String(registryPort) + ' answers but is not the instance registry'); return }
+        continue
+      }
+      hosted = made
+      const registered = made.register({ port: instancePort, instance, bootAt })
+      if (registered.status !== 200) {
+        made.stop('registration refused: ' + String(registered.body.error))
+        hosted = null
+        degrade('the registry refused this instance: ' + String(registered.body.error))
+        return
+      }
+      degraded = ''
+      log('registry: this instance hosts http://' + REGISTRY_HOST + ':' + String(registryPort) + ' as ' + instance)
+      return
+    }
+    degrade('could not host or reach the registry at ' + base + ' (5 attempts)')
+  }
+
+  /** Stop trying, once, with one line that says what to fix. It never loops. */
+  function degrade(reason) {
+    if (degraded === reason) return
+    degraded = reason
+    log('registry: ' + reason + ' — the registry is disabled for this instance (no retry; free the port or align the token, then restart)')
+    if (timer !== null) {
+      clearInterval(timer)
+      timer = null
+    }
+  }
+
+  function start() {
+    if (running) return Promise.resolve()
+    running = true
+    timer = setInterval(() => { beat().catch(() => {}) }, heartbeatMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    return beat()
+  }
+
+  function stop() {
+    running = false
+    if (timer !== null) {
+      clearInterval(timer)
+      timer = null
+    }
+    if (hosted !== null) {
+      hosted.stop('this instance stopped its registry client')
+      hosted = null
+    }
+  }
+
+  return {
+    instance,
+    instancePort,
+    registryPort,
+    start,
+    stop,
+    beat,
+    status: () => ({
+      url: base,
+      degraded,
+      hosting: hosted !== null && !hosted.isClosed(),
+      table: hosted === null ? [] : hosted.table()
+    })
   }
 }
 
@@ -1539,7 +1942,7 @@ function pagesText(rows, args) {
   let capturePath = ''
   try { capturePath = extensionDir(EXTENSION_CAPTURE_DIR_NAME) } catch (error) { capturePath = 'the extension-capture folder inside this plugin package' }
   lines.push('', 'Check these in order:')
-  lines.push('1. Is the target page open right now? The extension reports open tabs only, so nothing appears here until the page is open in a browser that has dsh-page-capture loaded — a public page can be opened by starting a headless Chrome with --load-extension=' + capturePath + '; a page that needs a login has to be opened by the user in their own browser, since no cookie is ever copied.')
+  lines.push('1. Is the target page open right now? The extension reports open tabs only, so nothing appears here until the page is open in a browser that has dsh-page-capture loaded — a public page can be opened by a browser this agent starts itself, with the extension loaded from ' + capturePath + '; a page that needs a login has to be opened by the user in their own browser, since no cookie is ever copied.')
   lines.push('2. Is the capture extension installed in that browser? chrome://extensions must list dsh-page-capture (Developer mode -> Load unpacked). Its directory on this machine: ' + capturePath)
   lines.push('3. Does its options page point baseURL at ' + instancePortText() + '? That one line is the whole setting: installed once, the extension reports to whichever instance baseURL names, so pointing it at the other instance makes this list empty while the other one fills up.')
   lines.push('4. Is the extension\'s own reporting switch on? With it off the extension sends nothing at all — not even a poll — so nothing here can see it.')
@@ -1746,6 +2149,11 @@ export function apply(ctx, config) {
   applyAgentConfig(config)
   // limits is a SIBLING of agent: the ceilings are not a switch, they are sizes.
   applyLimitsConfig(config)
+  // registry is a third sibling. enabled:false turns the whole 登记台 off for
+  // this instance — the self-check uses it so a test run never fights a running
+  // instance over the fixed port.
+  const registryConfig = config !== null && typeof config === 'object' && config.registry !== null && typeof config.registry === 'object' ? config.registry : {}
+  const registryAllowed = registryConfig.enabled !== false
   ctx.tools.register(defineTool({
     name: CREATE_TOOL,
     description: CREATE_DESCRIPTION,
@@ -2367,6 +2775,14 @@ export function apply(ctx, config) {
               captureDir = capture.dir
               captureVersion = String(capture.manifest.version ?? '')
             } catch { /* not installed in this build: the card reports it */ }
+            // Who has reported in, out of the hub's own table — no new storage.
+            // lastSeenAt is that instance's last POST /poll, which is exactly what
+            // the card needs to say "connected: chrome (12s ago)".
+            const agents = [...agentHub.instances.entries()].map(([instance, seen]) => ({
+              instance,
+              lastSeenAt: new Date(seen.at).toISOString(),
+              tabs: seen.tabs.length
+            }))
             send(200, {
               ok: true,
               dir: facts.dir,
@@ -2375,7 +2791,8 @@ export function apply(ctx, config) {
               manifestVersion: facts.manifest.manifest_version,
               captureDir,
               captureVersion,
-              captureExists: existsSync(captureDir)
+              captureExists: existsSync(captureDir),
+              agents
             })
             return
           }
@@ -2437,6 +2854,22 @@ export function apply(ctx, config) {
     // instead of telling the user to guess between 3080 and 4000.
     const listened = Number(webCtx.webServer.port)
     if (Number.isFinite(listened) && listened > 0) agentPort = listened
+    // The registry starts HERE, where the port is finally known: publishing that
+    // port is its entire job. agent.token has been applied above, so a profile
+    // that configures a pairing code uses it as the registry token too.
+    if (registryAllowed && Number.isFinite(listened) && listened > 0) {
+      const registryClient = createRegistryClient({
+        instancePort: listened,
+        instance: 'dsh-' + String(listened),
+        bootAt: Math.round(Date.now() - process.uptime() * 1000),
+        log: (line) => { if (ctx.logger !== undefined && typeof ctx.logger.info === 'function') ctx.logger.info('dsh-ui-block: ' + line) }
+      })
+      const begin = () => registryClient.start().catch((error) => {
+        if (ctx.logger !== undefined) ctx.logger.warn('dsh-ui-block: instance registry failed: ' + String(error && error.message ? error.message : error))
+      })
+      if (typeof ctx.effect === 'function') ctx.effect(() => { begin(); return () => registryClient.stop() })
+      else begin()
+    }
     webCtx.webServer.register({
       kind: 'prefix',
       path: AGENT_ROUTE,
@@ -2495,7 +2928,15 @@ export function apply(ctx, config) {
               send(400, { task: null, error: 'instance is required' })
               return
             }
-            const tabs = normalizeTabs(posted.tabs)
+            // TABS: a poll that CARRIES the field replaces the list; a poll without
+            // it KEEPS the previous one. The extension sends the whole list now and
+            // then (every 10s) and only a fingerprint (tabsTag) in between, so an
+            // absent field must not be read as "no tabs" — that would blank the list
+            // on every intermediate poll. An explicit `tabs: []` is the only way to
+            // say "this browser really has no tabs now".
+            const previous = agentHub.instances.get(instance)
+            const carried = Object.prototype.hasOwnProperty.call(posted, 'tabs') && Array.isArray(posted.tabs)
+            const tabs = carried ? normalizeTabs(posted.tabs) : (previous === undefined ? [] : previous.tabs)
             agentHub.instances.set(instance, { tabs, at: Date.now(), origin })
             const task = agentHub.take(instance)
             note('poll', instance, tokenState, '200 tabs=' + String(tabs.length) + ' task=' + (task === undefined ? 'none' : task.id))
@@ -2573,6 +3014,23 @@ export const extensionHub = {
   capturesDir,
   captureRelativePath,
   applyAgentConfig
+}
+/**
+ * Test seam for self-check-agent-tools.mjs: the instance registry and the
+ * per-instance client, so hosting, reuse, expiry and the idle shutdown can be
+ * asserted on an ephemeral port — and driven in milliseconds instead of seconds.
+ */
+export const instanceRegistry = {
+  createRegistry,
+  createRegistryClient,
+  registryToken,
+  registryTokenFile,
+  REGISTRY_PORT,
+  REGISTRY_HOST,
+  REGISTRY_SERVICE,
+  REGISTRY_EXPIRE_MS,
+  REGISTRY_IDLE_MS,
+  REGISTRY_HEARTBEAT_MS
 }
 /**
  * Test seam for self-check-uiblock-directive.mjs: the pure diff/replay helpers

@@ -3000,9 +3000,24 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       '.dshub-ext-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.dshub-ext-steps{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);line-height:1.6}',
       '.dshub-ext-hint{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);line-height:1.6}',
+      '.dshub-ext-status{font:var(--dsw-font-xxs-12);line-height:1.6;color:var(--dsw-alias-label-tertiary)}',
+      '.dshub-ext-status-on{color:var(--dsw-alias-state-success-primary)}',
       '.dshub-ext-note{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-success-primary);word-break:break-all}',
       '.dshub-ext-bad{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-error-primary);word-break:break-all}'
     ].join('');
+
+    /** "12 秒前": an ISO timestamp as time since, '' when it is not one. */
+    function relativeTime(value) {
+      var at = Date.parse(String(value === undefined || value === null ? '' : value));
+      if (!isFinite(at)) return '';
+      var seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+      if (seconds < 60) return seconds + ' 秒前';
+      var minutes = Math.round(seconds / 60);
+      if (minutes < 60) return minutes + ' 分钟前';
+      var hours = Math.round(minutes / 60);
+      if (hours < 24) return hours + ' 小时前';
+      return Math.round(hours / 24) + ' 天前';
+    }
 
     /** One line of human text for an unknown thrown value. */
     function errorText(error) {
@@ -3132,7 +3147,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       if (react === null || typeof react.useState !== 'function') return null;
       var h = react.createElement;
       var infoState = react.useState({
-        phase: 'loading', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false
+        phase: 'loading', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false, agents: []
       });
       var info = infoState[0];
       var setInfo = infoState[1];
@@ -3142,32 +3157,60 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
 
       react.useEffect(function () {
         var live = true;
-        window.fetch(EXTENSION_ROUTE, { credentials: 'same-origin', cache: 'no-store' })
-          .then(function (res) {
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return res.json();
-          })
-          .then(function (body) {
-            if (!live) return;
-            setInfo({
-              phase: 'ready',
-              dir: String(body.dir || ''),
-              version: String(body.version || ''),
-              captureDir: String(body.captureDir || ''),
-              captureVersion: String(body.captureVersion || ''),
-              captureExists: body.captureExists === true
+        // The status line is about RIGHT NOW, so the same read repeats on a slow
+        // timer: an extension that starts or stops reporting shows up without
+        // anyone reopening this page, and the relative time stays honest.
+        function load() {
+          window.fetch(EXTENSION_ROUTE, { credentials: 'same-origin', cache: 'no-store' })
+            .then(function (res) {
+              if (!res.ok) throw new Error('HTTP ' + res.status);
+              return res.json();
+            })
+            .then(function (body) {
+              if (!live) return;
+              setInfo({
+                phase: 'ready',
+                dir: String(body.dir || ''),
+                version: String(body.version || ''),
+                captureDir: String(body.captureDir || ''),
+                captureVersion: String(body.captureVersion || ''),
+                captureExists: body.captureExists === true,
+                agents: Array.isArray(body.agents) ? body.agents : []
+              });
+            })
+            .catch(function (error) {
+              if (!live) return;
+              setInfo({ phase: 'error', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false, agents: [] });
+              setNote('读取扩展目录失败：' + errorText(error));
             });
-          })
-          .catch(function (error) {
-            if (!live) return;
-            setInfo({ phase: 'error', dir: '', version: '', captureDir: '', captureVersion: '', captureExists: false });
-            setNote('读取扩展目录失败：' + errorText(error));
-          });
-        return function () { live = false; };
+        }
+        load();
+        var timer = window.setInterval(load, 5000);
+        return function () {
+          live = false;
+          window.clearInterval(timer);
+        };
       }, []);
 
       var ready = info.phase === 'ready';
+      // Who is reporting in right now. The newest report wins the line; a page
+      // with several browsers says how many instead of pretending there is one.
+      var agents = ready && Array.isArray(info.agents) ? info.agents : [];
+      var newest = null;
+      for (var agentIndex = 0; agentIndex < agents.length; agentIndex += 1) {
+        var spot = Date.parse(String((agents[agentIndex] && agents[agentIndex].lastSeenAt) || ''));
+        if (!isFinite(spot)) continue;
+        if (newest === null || spot > newest.at) newest = { at: spot, agent: agents[agentIndex] };
+      }
+      var statusText = newest === null
+        ? (ready || info.phase === 'error' ? '尚未检测到扩展上报' : '正在读取扩展状态…')
+        : '已连接：' + String(newest.agent.instance || '未知实例') + '（' + relativeTime(newest.agent.lastSeenAt)
+          + (agents.length > 1 ? '，共 ' + agents.length + ' 个实例上报' : '') + '）';
       return h('div', { className: 'dshub-ext' },
+        h('div', {
+          className: 'dshub-ext-status' + (newest === null ? '' : ' dshub-ext-status-on'),
+          'data-dsh-ui-block-agents': String(agents.length)
+        }, statusText),
         h('div', { className: 'dshub-ext-grid' },
           h(ExtensionCard, {
             kind: 'picker',
