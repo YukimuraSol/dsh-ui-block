@@ -158,13 +158,51 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 
 抓取时把 `:root`/`body` 上此刻的自定义属性收成字面值表，再把每条声明里的 `var(--x)` 递归替换；解析不了就丢整条声明，绝不把 `var(--dsw-*)` 留在素材里。SVG 的呈现属性（`fill="var(--dsw-…)"`）同样处理——3080 的图标就是这个形态，漏了会留下 7 处残留。
 
+## 表单活值：值住在 property 里，抓取时写成属性
+
+序列化（`innerHTML` / `outerHTML`）只输出**属性**，表单控件的当前值在 DOM 属性（property）里，抓不到。
+真实事故：智云课堂右上角周选择器就是
+
+```html
+<input type="text" placeholder="筛选往周课程" class="el-input__inner">
+```
+
+真站显示「当前周」（property `value === "当前周"`），抓下来的块是个空框。现在抓取时把活值写回属性：
+
+| 控件 | 写什么 |
+| --- | --- |
+| `input`（文本类） | `value`，非空才写 |
+| `input[type=checkbox/radio]` | `checked`：勾上写 `checked`，没勾把过时的 `checked` 摘掉 |
+| `textarea` | 文本内容（就是它的 value） |
+| `select` | 选中项写 `selected`，没选中的摘掉 |
+
+空值一律不写——空串等于默认值，写进块只是白胖。
+
+**敏感字段一律跳过，密码不进块**：`type=password`、`type=hidden`（常放 CSRF / 一次性令牌）、`type=file`，以及 `autocomplete` 里点名了密码 / 信用卡 / 一次性验证码的字段（`current-password`、`new-password`、`cc-*`、`one-time-code`、`webauthn`）。被跳过的控件只在 `report.liveValues.sensitiveSample` 里留「哪个控件被跳过」的标识（标签 + 理由 + id/name），**值一个字符都不写**。
+
+`autocomplete="off"` **本身不是跳过条件**：上面那个周选择器就是 `autocomplete="off"`，值是「当前周」——按 `off` 跳过等于把这条 bug 原样留着。判敏感看的是 `type` 与 `autocomplete` 的令牌，不是 `off`。
+
+## shadow DOM：open shadow root 会被展开
+
+`querySelectorAll` 只看主文档这棵树，`attachShadow` 进去的东西一个都看不到——和 iframe 同级。真实事故：学在浙大五页都缺右下角那个紫色客服悬浮按钮，它就在 shadow root 里。
+
+做法（只做 **open**；closed 的 `shadowRoot` 直接是 `null`，读不到也不硬来）：
+
+1. **元素清单**里紧跟 host 收进 shadow root 的后代——它们同样要固化计算样式与活值。排在队尾会挤不进 600 个元素的固化预算，等于白收；
+2. **样式**：shadow root 里的 `<style>` / `<link rel=stylesheet>` / `adoptedStyleSheets` 走同一条 CSS 管道，选择器加 `[data-dsh-shadow="sN"]` 前缀；死选择器探针改成在那个 root 里 `querySelector`（用主文档探针会把整套 shadow 规则判成死选择器丢光）；
+3. **序列化**：把 shadow 内容拷进一个真实容器 `<div class="dsh-shadow-root" data-dsh-shadow="sN" data-dsh-shadow-host="标签名">`，挂在 host 的克隆里；host 自己的 light DOM 子节点原地不动。
+
+`report.shadowRoots` 记 `{found, inlined, rules, slots, droppedSelectors}`。
+
+**代价（已知边界）**：展平后不再是 shadow 作用域。`<slot>` 投影的内容留在 light DOM 原位置、不重复拷，投影位置还原不了（只记进 `slots`）；`:host` 映射到 wrapper 自己；`::slotted()` 与 `:host-context()` 还原不了，丢掉并记进 `droppedSelectors`。宿主选择器的权重与继承关系有细微差别，但元素的计算样式已逐条固化，外观不靠这条链路兜底。
+
 ## 自检
 
 ```
 node self-check.mjs
 ```
 
-不依赖 DSH 端点，分两段跑，一共断言 **17 条**：
+不依赖 DSH 端点，分两段跑，一共断言 **40 条**：
 
 **前半段（6 条，`hub-check.mjs`）**：把 `background.js` / `options.js` 原文装进一个假 `chrome`（storage 用内存 Map），再起**一个假登记台 + 两个假实例**（本地 http 服务，记录每个请求），手动跑 tick：
 
@@ -177,12 +215,14 @@ node self-check.mjs
 
 单独跑这一段：`node hub-check.mjs`。
 
-**后半段（11 条）**：无头 Chrome 开 `about:blank`，注入一段测试 DOM + `extractor.js` 原文，起一个本地 http 服务（**不发 CORS 头**）当跨域素材来源，跑一遍抽取：
+**后半段（34 条）**：无头 Chrome 开 `about:blank`，注入一段测试 DOM + `extractor.js` 原文，起一个本地 http 服务（**不发 CORS 头**）当跨域素材来源，跑一遍抽取：
 
 1. 结构类（8 条）：files 非空、entry 含目标元素、`--dsw-` 残留 0、无根绝对路径、体积账一致、相对引用全部命中、坏资源进 dropped、祖先链停在 body 直系子元素；
 2. 跨域 358×20870 长条图原尺寸落文件、report 与落盘 PNG 都是 358×20870、没被重编码；
 3. 带 `srcset` 的元素取到最大候选（900w），100w/300w 不出现；
-4. 跨域 URL（另一台主机 + 页面里 `fetch` 被拦的对照）经后台取字节拿到字节，dropped 里不再出现它。
+4. 跨域 URL（另一台主机 + 页面里 `fetch` 被拦的对照）经后台取字节拿到字节，dropped 里不再出现它；
+5. **活值固化**：夹具里 `input` / `select` / `textarea` / `checkbox` 的值只存在于 property（改前 outerHTML 里没有 `value`），抓完必须是属性（`value="当前周"`、`<option selected>第二周`、`<textarea>hello</textarea>`、`checked`），且 `type=password` 那个框**没被写**、值不在任何产出文件里出现；
+6. **shadow DOM**：open shadow root 里的按钮以 `<div class="dsh-shadow-root" data-dsh-shadow="s1">` 展开进 entry，它那条 `<style>` 以 `[data-dsh-shadow="s1"] .kf-fab{…}` 进 page.css。
 
 
 
@@ -195,5 +235,6 @@ node self-check.mjs
 - 抽取只固化子树前 600 个元素的关键计算属性（`computed` 段到 384KB 预算就停，`report.degrade` 里会说）；属性里含布局位置（`position/inset/top/right/bottom/left/transform/z-index/overflow`），等于默认值时一律不写——定位样式表跨域取不到时（`pure-drawer.css` 那种），抽屉的版式就靠这些规则立住；
 - 跨域 `@import` 的样式表读不到 `cssRules`，记进 dropped；
 - 只处理顶层文档：iframe 内容不抓（元素本身移除并记名）；
+- 只展开 **open** shadow root（closed 的 `shadowRoot` 是 `null`，读不到）；展平后 `<slot>` 投影位置、`:host` 的原始宿主语义还原不了，见上文「shadow DOM」一节的代价说明；
 - 自定义属性表取 `:root`+`body`，挂在更深的祖先上的局部变量解析不了 → 丢声明；
 - 不追求像素级还原。这一步只保证**结构完整、路径合法、变量已固化**。

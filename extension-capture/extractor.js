@@ -299,6 +299,92 @@
     return { uri: uri, bytes: meta.bytes, mime: meta.mime, w: cw, h: ch };
   }
 
+  // ---- 活值固化：表单控件的值住在 DOM 属性里，序列化时不带 -----------------
+  // 实测（智云课堂 E 页）：右上角周选择器是
+  //   <input type="text" placeholder="筛选往周课程" class="el-input__inner">
+  // 真站显示「当前周」，抓下来是个空框——value 是 DOM 属性（property），
+  // innerHTML / outerHTML 序列化都不带它，只有写回 value 属性才会被序列化出来。
+  // 做法：抓的那一刻把活值写回**属性**——input 写 value、checkbox/radio 写 checked、
+  // textarea 写文本内容、select 把选中项写成 selected。只写非空（空串就是默认，写了白胖）。
+  // 敏感字段一律不写（见 sensitiveReason）：type=password / hidden / file，以及
+  // autocomplete 里点名了密码、信用卡、一次性验证码的字段——密码不许进块。
+  // 注意：autocomplete="off" 本身**不是**跳过条件。周选择器就是 autocomplete="off"，
+  // 值是「当前周」；按 off 跳过等于把这条要修的 bug 原样留下。真正敏感的是上面那三类。
+  var SENSITIVE_AC = /(^|\s)(current-password|new-password|cc-name|cc-number|cc-exp|cc-exp-month|cc-exp-year|cc-csc|cc-type|one-time-code|webauthn)(\s|$)/i;
+
+  function sensitiveReason(el) {
+    var type = '';
+    try { type = String((el.getAttribute && el.getAttribute('type')) || el.type || '').toLowerCase(); } catch (e) { type = ''; }
+    if (type === 'password') return 'type=password';
+    if (type === 'hidden') return 'type=hidden';
+    if (type === 'file') return 'type=file';
+    var ac = '';
+    try { ac = String((el.getAttribute && el.getAttribute('autocomplete')) || ''); } catch (e) { ac = ''; }
+    if (SENSITIVE_AC.test(ac)) return 'autocomplete=' + ac;
+    return '';
+  }
+
+  /** 把此刻的活值写成属性。写的是活页面上的元素（克隆时属性自然带上），只写非空值。 */
+  function fixLiveValues(elements, st) {
+    for (var i = 0; i < elements.length && i < 8000; i++) {
+      var el = elements[i];
+      if (!el || el.nodeType !== 1) continue;
+      var tag = String(el.tagName || '').toLowerCase();
+      if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') continue;
+      var why = (tag === 'input' || tag === 'textarea') ? sensitiveReason(el) : '';
+      if (why) {
+        st.liveValuesSkipped++;
+        if (st.sensitiveSample.length < 8) {
+          var nm = '';
+          try { nm = String(el.getAttribute('name') || ''); } catch (e) { nm = ''; }
+          st.sensitiveSample.push(tag + '(' + why + ')' + (el.id ? '#' + el.id : '') + (nm ? '[' + nm + ']' : ''));
+        }
+        continue;
+      }
+      try {
+        if (tag === 'input') {
+          var type = String((el.getAttribute('type') || el.type || 'text')).toLowerCase();
+          if (type === 'checkbox' || type === 'radio') {
+            // 布尔状态没有「空串」：勾了就写 checked，没勾就把过时的 checked 摘掉。
+            if (el.checked) { if (!el.hasAttribute('checked')) st.liveValuesWritten++; el.setAttribute('checked', ''); }
+            else if (el.hasAttribute('checked')) { el.removeAttribute('checked'); st.liveValuesWritten++; }
+            continue;
+          }
+          var v = String(el.value == null ? '' : el.value);
+          if (v === '') continue;
+          if (el.getAttribute('value') !== v) { el.setAttribute('value', v); st.liveValuesWritten++; }
+        } else if (tag === 'textarea') {
+          var tv = String(el.value == null ? '' : el.value);
+          if (tv === '') continue;
+          el.textContent = tv;
+          st.liveValuesWritten++;
+        } else {
+          var opts = el.options || [];
+          var wrote = 0;
+          for (var k = 0; k < opts.length; k++) {
+            if (opts[k].selected) { if (!opts[k].hasAttribute('selected')) { opts[k].setAttribute('selected', ''); wrote++; } }
+            else if (opts[k].hasAttribute('selected')) { opts[k].removeAttribute('selected'); wrote++; }
+          }
+          if (wrote) st.liveValuesWritten++;
+        }
+      } catch (e) { /* 个别控件的 value 会抛（只读/跨根），跳过它一个就是 */ }
+    }
+  }
+
+  // ---- shadow DOM 盲区 ----------------------------------------------------
+  // open shadow root 里的东西不在 querySelectorAll 结果里：它不在主文档这棵树上。
+  // 实测五页都缺右下角那个客服悬浮按钮，它就是被 attachShadow 进去的。
+  // 做法（closed 的读不到，shadowRoot 直接是 null，不硬来）：
+  //   ① 元素清单里紧跟 host 收进 shadow root 的后代 → 它们也能固化计算样式与活值；
+  //   ② shadow root 里的 <style>/<link rel=stylesheet>/adoptedStyleSheets 走同一条 CSS
+  //     管道，选择器加 [data-dsh-shadow="sN"] 前缀，死选择器探针改成在那个 root 里查；
+  //   ③ 序列化时把 shadow 内容拷进一个真实容器 <div data-dsh-shadow="sN">，
+  //     挂在 host 的克隆里；<slot> 投影的 light DOM 原地保留，不重复拷。
+  // 代价说明：展平后不再是 shadow 作用域，宿主选择器的权重/继承关系有细微差别；
+  // :host 映射到 wrapper 自己，::slotted() 与 :host-context() 无法还原，直接丢并记账。
+  var SHADOW_ELEMENTS_MAX = 6000;
+  var SHADOW_NEST_MAX = 8;
+
   // ---- 主流程 -------------------------------------------------------------
   async function extract(doc, opts) {
     opts = opts || {};
@@ -309,7 +395,11 @@
       elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0,
       // 令牌固化：解析不到的名字不再静默丢声明，而是按浏览器的实际行为写成 unset 并记名
       declarationsInvalid: 0, invalidAtComputedValue: [],
-      skinSelectorRewrites: 0, skinSelectorKept: 0, skinAttrsStripped: 0
+      skinSelectorRewrites: 0, skinSelectorKept: 0, skinAttrsStripped: 0,
+      // 活值固化（input/textarea/select）与敏感字段跳过
+      liveValuesWritten: 0, liveValuesSkipped: 0, sensitiveSample: [],
+      // shadow DOM：找到的 open shadow root、真正展开进产物的、收进来的规则条数
+      shadowRules: 0, shadowSelectorsDropped: 0, shadowSlots: 0
     };
     var dropped = [];
     var drop = function (s) { if (dropped.length < 40) dropped.push(String(s).slice(0, 220)); };
@@ -451,10 +541,27 @@
     // 2) 命中样式表：规则原文，死选择器丢掉（整条列表一个都不匹配就丢这条规则）
     var STATE = /:(hover|focus-visible|focus-within|focus|active|visited|target|checked|indeterminate|disabled|enabled|read-only|read-write|placeholder-shown|default|required|optional|valid|invalid|in-range|out-of-range|user-invalid|user-valid|autofill|open|popover-open|modal|fullscreen|picture-in-picture|playing|paused|muted|seeking|buffering|stalled|defined|link|any-link|local-link|scope)\b/gi;
     var PSEUDO_EL = /::?(before|after|marker|placeholder|selection|first-line|first-letter|backdrop|file-selector-button|cue|highlight)\b/gi;
+    // 死选择器探针的作用域：主文档恒为 doc；收 shadow root 里的样式表时临时切到那个 root
+    // （doc.querySelector 看不见 shadow 里的节点，不切就等于把整套 shadow 规则判成死选择器）。
+    var probeRoot = null;
+    // 非空 = 正在收 shadow root 的规则：选择器要加 scope 前缀，展平后才找得回这些节点。
+    var shadowPrefix = '';
     var probe = function (sel) {
-      var p = String(sel).replace(PSEUDO_EL, '').replace(STATE, '').replace(/:not\(\s*\)/g, '').replace(/\s+/g, ' ').trim();
+      var p = String(sel).replace(PSEUDO_EL, '').replace(STATE, '')
+        .replace(/:host-context\([^()]*\)/gi, '')
+        .replace(/:host(?:\([^()]*\))?/gi, '')
+        .replace(/:not\(\s*\)/g, '').replace(/\s+/g, ' ').trim();
       if (!p) return true;
-      try { return doc.querySelector(p) !== null; } catch (e) { return false; }
+      try { return (probeRoot || doc).querySelector(p) !== null; } catch (e) { return false; }
+    };
+    // shadow 的选择器展平后要挂到 wrapper 上：:host 指 wrapper 自己，其余前挂 wrapper；
+    // ::slotted()（投影走 light DOM 原位置）与 :host-context()（依赖祖先，展平后没有意义）丢弃。
+    var shadowSel = function (sel, prefix) {
+      var s = String(sel).trim();
+      if (s.indexOf('::slotted') >= 0 || /:host-context\(/i.test(s)) { st.shadowSelectorsDropped++; return null; }
+      s = s.replace(/:host-context\([^()]*\)/gi, '').replace(/:host(?:\([^()]*\))?/gi, '').replace(/\s+/g, ' ').trim();
+      if (!s) return prefix;
+      return prefix + ' ' + s;
     };
     // 皮肤开关属性（body[data-dsh-columbina]）不进素材：视觉已经由字面值固定，块不该再靠
     // 「宿主有没有开着皮肤」来命中。做法是把属性条件从选择器里摘掉，规则本体照旧生效；
@@ -472,6 +579,15 @@
         .map(stripSkinSelector).filter(Boolean);
       var kept = parts.filter(probe);
       if (!kept.length) { st.rulesDead++; return null; }
+      if (shadowPrefix) {
+        var scoped = [];
+        for (var mi = 0; mi < kept.length; mi++) {
+          var one = shadowSel(kept[mi], shadowPrefix);
+          if (one) scoped.push(one);
+        }
+        if (!scoped.length) { st.rulesDead++; return null; }
+        return scoped.join(', ');
+      }
       return kept.join(', ');
     };
 
@@ -535,7 +651,61 @@
     var computedRules = [];
     var computedUsed = 0;
     var elements = [];
-    elements = [topEl].concat(Array.prototype.slice.call(topEl.querySelectorAll('*')));
+    // shadow：host 的后代紧跟在自己后面入列。它们不在 querySelectorAll 里（那是主文档
+    // 这一棵树），排在队尾就等于永远挤不进 600 个元素的固化预算——而客服按钮这种
+    // 恰恰是被 attachShadow 进去的，排在队尾等于白收。
+    var shadowHosts = [];
+    var shadowScope = new Map();
+    var scopeSeq = 0;
+    var collectElements = function (rootEl, depth) {
+      if (!rootEl || !rootEl.querySelectorAll || depth > SHADOW_NEST_MAX) return;
+      var list = Array.prototype.slice.call(rootEl.querySelectorAll('*'));
+      for (var ci = 0; ci < list.length; ci++) {
+        if (elements.length >= SHADOW_ELEMENTS_MAX) return;
+        var ce = list[ci];
+        elements.push(ce);
+        var csr = null;
+        try { csr = ce.shadowRoot; } catch (e) { csr = null; }  // closed / 跨域文档里会抛
+        if (csr) {
+          var sid = 's' + (++scopeSeq);
+          shadowHosts.push({ host: ce, root: csr, scope: sid });
+          shadowScope.set(ce, sid);
+          collectElements(csr, depth + 1);
+        }
+      }
+    };
+    var topShadow = null;
+    try { topShadow = topEl.shadowRoot; } catch (e) { topShadow = null; }
+    if (topShadow) {
+      var sidTop = 's' + (++scopeSeq);
+      shadowHosts.push({ host: topEl, root: topShadow, scope: sidTop });
+      shadowScope.set(topEl, sidTop);
+      collectElements(topShadow, 1);
+    }
+    collectElements(topEl, 0);
+    elements = [topEl].concat(elements);
+    // 3.1) 活值固化（定义见 fixLiveValues）：走同一份清单，shadow 里的控件也覆盖。
+    fixLiveValues(elements, st);
+    // 3.2) shadow root 里的样式：<style> / <link rel=stylesheet> / adoptedStyleSheets
+    //      照同一条管道收，选择器加 scope 前缀；探针切到那个 root 里去查。
+    for (var hs = 0; hs < shadowHosts.length; hs++) {
+      var sroot = shadowHosts[hs].root;
+      var sheetList = [];
+      try {
+        var stEls = Array.prototype.slice.call(sroot.querySelectorAll('style'));
+        for (var sx = 0; sx < stEls.length; sx++) { if (stEls[sx].sheet) sheetList.push(stEls[sx].sheet); }
+        var lkEls = Array.prototype.slice.call(sroot.querySelectorAll('link[rel~="stylesheet"]'));
+        for (var lx = 0; lx < lkEls.length; lx++) { if (lkEls[lx].sheet) sheetList.push(lkEls[lx].sheet); }
+        if (sroot.adoptedStyleSheets) sheetList = sheetList.concat(Array.prototype.slice.call(sroot.adoptedStyleSheets));
+      } catch (e) { drop('读不到 shadow root 的样式表：' + String((e && e.message) || e)); }
+      var keptBefore = st.rulesKept;
+      probeRoot = sroot;
+      shadowPrefix = '[data-dsh-shadow="' + shadowHosts[hs].scope + '"]';
+      for (var ssi = 0; ssi < sheetList.length; ssi++) walkSheet(sheetList[ssi]);
+      probeRoot = null;
+      shadowPrefix = '';
+      st.shadowRules += st.rulesKept - keptBefore;
+    }
     // 根元素就是 body 时，body 自己的 data-dsh-el 进不了 innerHTML（序列化的是它的
     // 子节点），那条规则就成了永不命中的孤儿——实测教务页里 16 条孤儿规则的第一条
     // 就是它。所以 body 那条直接写成 body{}，选择器与产物对得上。
@@ -580,6 +750,48 @@
 
     // 4) 拷一份 DOM 再清理（活页面只多挂几个 data-dsh-el 属性，不动结构）
     var clone = topEl.cloneNode(true);
+
+    // 4.1) shadow root 展开：cloneNode 不带 shadow 树。把每个 open shadow root 的内容
+    // 拷进一个真实容器 <div class="dsh-shadow-root" data-dsh-shadow="sN">，挂在 host 的
+    // 克隆里（host 自己的 light DOM 子节点原地保留）。<slot> 投影的内容仍在原来那棵树上，
+    // 不重复拷——代价是投影位置还原不了，记进 report.shadowRoots.slots 与 README 的边界。
+    // 这一步发生在 index 对齐之后、结构改写之前：liveTree 与 cloneTree 此刻逐项同构。
+    var shadowInlined = 0;
+    if (shadowHosts.length) {
+      var liveTree = [topEl].concat(Array.prototype.slice.call(topEl.querySelectorAll('*')));
+      var cloneTree = [clone].concat(Array.prototype.slice.call(clone.querySelectorAll('*')));
+      var expandShadow = function (liveNodes, cloneNodes) {
+        for (var xi = 0; xi < liveNodes.length; xi++) {
+          var lx1 = liveNodes[xi], cx1 = cloneNodes[xi];
+          if (!lx1 || !cx1) continue;
+          var xroot = null;
+          try { xroot = lx1.shadowRoot; } catch (e) { xroot = null; }
+          if (!xroot) continue;
+          var wrap = doc.createElement('div');
+          wrap.className = 'dsh-shadow-root';
+          wrap.setAttribute('data-dsh-shadow', shadowScope.get(lx1) || '');
+          wrap.setAttribute('data-dsh-shadow-host', String(lx1.tagName || '').toLowerCase());
+          // ShadowRoot 本身不能 cloneNode（NotSupportedError），只能逐个孩子克隆进一个片段
+          var frag = doc.createDocumentFragment();
+          for (var bi = 0; bi < xroot.childNodes.length; bi++) {
+            frag.appendChild(xroot.childNodes[bi].cloneNode(true));
+          }
+          try {
+            var slotN = xroot.querySelectorAll('slot').length;
+            if (slotN) st.shadowSlots += slotN;
+          } catch (e) { /* 数不出来就算了，不影响产物 */ }
+          try {
+            // 嵌套 shadow（shadow 里的 host）：同一个函数往下走一层
+            expandShadow(Array.prototype.slice.call(xroot.querySelectorAll('*')),
+                         Array.prototype.slice.call(frag.querySelectorAll('*')));
+          } catch (e) { /* 内层展开失败就只留外层，不连累整棵 */ }
+          wrap.appendChild(frag);
+          cx1.appendChild(wrap);
+          shadowInlined++;
+        }
+      };
+      expandShadow(liveTree, cloneTree);
+    }
 
     // 资源清单的收集器提前到这里：清属性时就要把 srcset 的最大候选记进去。
     var keyOf = function (u) { var a = absUrl(u, base); return a || String(u || ''); };
@@ -1059,6 +1271,22 @@
       varsFromElements: varsFromElements,
       elements: st.elements,
       computedRules: st.computedRules,
+      // 活值固化：写了几条属性、跳过几个敏感字段。sensitiveSample 只记「哪个控件被跳过」
+      // （选择器级别的标识），密码本身的值一个字符都不进 report。
+      liveValues: {
+        written: st.liveValuesWritten,
+        sensitiveSkipped: st.liveValuesSkipped,
+        sensitiveSample: st.sensitiveSample
+      },
+      // shadow DOM：找到几个 open shadow root、真正展开进产物的几个、收进来的规则条数。
+      // closed 的读不到（shadowRoot 直接是 null），不硬来——found 只算 open 的。
+      shadowRoots: {
+        found: shadowHosts.length,
+        inlined: shadowInlined,
+        rules: st.shadowRules,
+        slots: st.shadowSlots,
+        droppedSelectors: st.shadowSelectorsDropped
+      },
       // 序列化后对不上的 [data-dsh-el] 规则条数（正常恒为 0；非 0 就是有节点在产物里丢了）
       computedOrphansDropped: computedOrphans,
       assetsInlined: st.assetsInlined,

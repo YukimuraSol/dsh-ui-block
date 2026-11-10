@@ -148,6 +148,33 @@ function buildFixture(P) {
     '<link id="preloadx" rel="preload" as="image" imagesrcset="' + P.p400 + ' 1x, ' + P.p1200 + ' 2x">';
   document.querySelector('main').appendChild(pics);
 
+  // 活值夹具：值全都只存在于 DOM 属性（property）里，序列化 innerHTML/outerHTML 不带它。
+  // 真实事故：智云课堂右上角周选择器 <input placeholder="筛选往周课程"> 真站显示「当前周」，
+  // 抓下来是空框。这里把四种控件摆齐：text / select / textarea / checkbox + 一个密码框。
+  const forms = document.createElement('div');
+  forms.id = 'forms';
+  forms.innerHTML =
+    '<input id="liveinput" type="text" placeholder="筛选往周课程">' +
+    '<select id="liveselect"><option>第一周</option><option>第二周</option></select>' +
+    '<textarea id="livetextarea">初始文本</textarea>' +
+    '<input id="livechk" type="checkbox">' +
+    '<input id="livepwd" type="password" name="loginPwd" autocomplete="current-password">';
+  document.querySelector('main').appendChild(forms);
+  document.getElementById('liveinput').value = '当前周';
+  document.getElementById('liveselect').value = '第二周';
+  document.getElementById('livetextarea').value = 'hello';
+  document.getElementById('livechk').checked = true;
+  document.getElementById('livepwd').value = 'hunter2-should-not-leak';
+
+  // shadow 夹具：open shadow root 里的按钮 + 一条 <style>（五页都缺的那个客服悬浮按钮的形态）。
+  const host = document.createElement('x-kefu-btn');
+  host.id = 'shadowhost';
+  document.querySelector('main').appendChild(host);
+  const sr = host.attachShadow({ mode: 'open' });
+  sr.innerHTML = '<style>.kf-fab{width:52px;height:52px;border-radius:50%;background-color:#7c4dff;color:#ffffff;' +
+    'font-size:18px;border:0;position:fixed;right:24px;bottom:24px;z-index:9999;display:block}</style>' +
+    '<button class="kf-fab" id="kfbtn">客服</button>';
+
   return { rules: document.styleSheets[0] ? document.styleSheets[0].cssRules.length : 0, noiseBytes: Math.round(noise.length * 0.75) };
 }
 
@@ -370,6 +397,21 @@ async function main() {
     const pageUrl = hostA + '/blank.html';
     const fx = await cdp.evaluate(s, '(' + buildFixture.toString() + ')(' + JSON.stringify(P) + ')', { isExpression: true });
     console.log('[fixture] about:blank 注入完成：style 规则 ' + fx.rules + ' 条，噪声 PNG ≈ ' + Math.round(fx.noiseBytes / 1024) + 'KB，假 woff2 1.5MB');
+
+    // 改前原文：活页面此刻这些控件的 outerHTML（值在 property 里，序列化拿不到）。
+    const preLive = await cdp.evaluate(s, () => ({
+      input: document.getElementById('liveinput').outerHTML,
+      inputValue: document.getElementById('liveinput').value,
+      select: document.getElementById('liveselect').outerHTML,
+      selectValue: document.getElementById('liveselect').value,
+      textarea: document.getElementById('livetextarea').outerHTML,
+      textareaValue: document.getElementById('livetextarea').value,
+      checkbox: document.getElementById('livechk').outerHTML,
+      pwd: document.getElementById('livepwd').outerHTML,
+      pwdValue: document.getElementById('livepwd').value,
+      shadowHost: document.getElementById('shadowhost').outerHTML,
+      shadowInner: document.getElementById('shadowhost').shadowRoot.innerHTML,
+    }));
 
     const srcText = readFileSync(path.join(HERE, 'extractor.js'), 'utf8');
     const inj = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
@@ -627,6 +669,40 @@ async function main() {
     assert('超 16 MB 的仍然丢弃，理由写明 16MB 阈值',
       !!hugeDrop && entry.content.indexOf('hugeimg') < 0,
       hugeDrop || 'dropped 里没有超限记录');
+
+    // ---- 15g. 活值固化：表单控件的值在 DOM 属性里，序列化不带，抓取时要写回属性 ----
+    // 真实事故：智云课堂右上角周选择器 <input placeholder="筛选往周课程"> 真站显示「当前周」，
+    // 抓下来是空框。夹具里四个控件的值都只存在于 property（改前 outerHTML 里没有 value）。
+    const liveInput = tagOf(entry.content, 'liveinput');
+    const selBlock = (new RegExp('<select[^>]*id="liveselect"[\\s\\S]*?</select>')).exec(entry.content) || [''];
+    const taBlock = (new RegExp('<textarea[^>]*id="livetextarea"[^>]*>([\\s\\S]*?)</textarea>')).exec(entry.content) || ['', ''];
+    const chkTag = tagOf(entry.content, 'livechk');
+    const pwdTag = tagOf(entry.content, 'livepwd');
+    const pwdLeak = allText.indexOf('hunter2') >= 0;
+    const liveOk = /\svalue="当前周"/.test(liveInput) &&
+      /<option[^>]*\sselected[^>]*>第二周<\/option>/.test(selBlock[0]) &&
+      taBlock[1] === 'hello' &&
+      /\schecked/.test(chkTag) &&
+      pwdLeak === false && !/\svalue=/.test(pwdTag);
+    assert('活值固化：input/select/textarea/checkbox 的活值写成属性，密码框不写',
+      liveOk && report.liveValues && report.liveValues.written >= 4 && report.liveValues.sensitiveSkipped >= 1,
+      '改前（活页面 outerHTML，值只在 property 里）：' + preLive.input + '｜select ' + preLive.select + '｜textarea ' + preLive.textarea +
+        '｜pwd ' + preLive.pwd + '（活值 ' + JSON.stringify(preLive.pwdValue) + '）' +
+        '；改后：' + liveInput + '｜' + (selBlock[0] || '（缺 select）') + '｜<textarea…>' + taBlock[1] + '</textarea>｜' + chkTag + '｜' + pwdTag +
+        '；report.liveValues=' + JSON.stringify(report.liveValues) + '；密码泄漏=' + pwdLeak);
+
+    // ---- 15h. shadow DOM：open shadow root 里的按钮与 <style> 规则进产物 ----
+    // 真实事故：五页都缺右下角那个客服悬浮按钮——它在 shadow root 里，querySelectorAll 看不到。
+    const shadowWrap = (/<div class="dsh-shadow-root" data-dsh-shadow="(s\d+)" data-dsh-shadow-host="x-kefu-btn"[^>]*>/.exec(entry.content) || []);
+    const kfRule = (new RegExp('\\[data-dsh-shadow="s\\d+"\\] \\.kf-fab\\{[^}]*\\}')).exec(cssText) || [''];
+    const kfBtn = (/<button[^>]*id="kfbtn"[^>]*>客服<\/button>/.exec(entry.content) || [''])[0];
+    const srInfo = report.shadowRoots || {};
+    assert('shadow DOM：open shadow root 里的按钮与 <style> 规则被展开进产物',
+      shadowWrap.length > 1 && !!kfBtn && kfRule[0] !== '' && /background-color:rgb\(124, 77, 255\)/.test(kfRule[0]) &&
+        srInfo.found >= 1 && srInfo.inlined >= 1 && srInfo.rules >= 1,
+      '改前（shadow root 内部，主文档 querySelectorAll 看不到）：' + preLive.shadowInner.slice(0, 200) +
+        '；改后 wrapper：' + (shadowWrap[0] || '（缺 wrapper）') + '；按钮：' + (kfBtn || '（缺）') +
+        '；page.css 规则：' + (kfRule[0] || '（缺）') + '；report.shadowRoots=' + JSON.stringify(srInfo));
 
     // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
     // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是
