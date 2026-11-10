@@ -3,6 +3,7 @@
 // 把 extractor.js 原文 Runtime.evaluate 进去 → 跑抽取 → 对产出做断言 → 落盘。
 // 跑法：node self-check.mjs      （产出写在 out-selfcheck/，已 gitignore）
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -26,17 +27,19 @@ function pickCdp() {
 //   正例   --dsw-* 变量 + 真命中规则 + 2400px 宽 SVG（降采样后能内嵌）
 //   反例1  死选择器 .dead-selector... 与半个死列表 .gone-1,.card
 //   反例2  src="/abs/missing.png"（取不到 → dropped，且不许留根绝对路径）
-//   反例3  噪声 PNG > 200KB（降采样后仍超限 → 落 assets/，证明 ../../ 前缀）
-//          + 220KB 假 woff2（字体不能降采样 → 落 assets/，证明 ../ 前缀）
-function buildFixture() {
+//   反例3  噪声 PNG 超内嵌上限（落 assets/，证明 ../../ 前缀）
+//          + 1.5MB 假 woff2（字体不能降采样 → 落 assets/，证明 ../ 前缀）
+//   跨域    logo（另一台主机，必须走后台取字节）、358x20870 长条图、srcset 三档
+function buildFixture(P) {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1200">' +
     '<rect width="2400" height="1200" fill="#4a7bd0"/><circle cx="1200" cy="600" r="420" fill="#d9a441"/></svg>';
 
-  // 噪声 PNG：几乎不可压缩，保证 > 200KB 且降采样后仍超限
+  // 噪声 PNG：几乎不可压缩，800x800 约 1.8 MB——超 1.4 MB 内嵌上限、未超 2 MB 单文件上限，
+  // 因此走「原尺寸落文件」这条路，正好证明 ../../ 前缀与落文件分支都还在。
   const cv = document.createElement('canvas');
-  cv.width = 600; cv.height = 600;
+  cv.width = 800; cv.height = 800;
   const cx = cv.getContext('2d');
-  const img = cx.createImageData(600, 600);
+  const img = cx.createImageData(800, 800);
   let seed = 1234567;
   for (let i = 0; i < img.data.length; i += 4) {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -48,11 +51,11 @@ function buildFixture() {
   cx.putImageData(img, 0, 0);
   const noise = cv.toDataURL('image/png');
 
-  // 假 woff2：225000 字节（> 200KB），内容无所谓，这条只验证"超限就落文件"
+  // 假 woff2：约 1.5 MB（超 1.4 MB 内嵌上限），内容无所谓，这条只验证「超限就落文件」
   let b64 = '';
   const CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let x = 987654321;
-  while (b64.length < 300000) {
+  while (b64.length < 2000000) {
     x = (x * 1103515245 + 12345) & 0x7fffffff;
     b64 += CH[x & 63];
   }
@@ -88,7 +91,111 @@ function buildFixture() {
   dead.id = 'dead';
   dead.setAttribute('src', '/abs/missing.png');
   document.querySelector('main').appendChild(dead);
+
+  // 跨域三件套：logo 在另一台主机（localhost vs 127.0.0.1），长条图在 127.0.0.1，
+  // srcset 故意乱序（100w / 900w / 300w），最大那档在中间——按「取最大」而不是「取第一」。
+  const pics = document.createElement('div');
+  pics.id = 'pics';
+  pics.innerHTML = '<img id="xlogo" class="thumb" src="' + P.logo + '">' +
+    '<img id="sprite" class="thumb" src="' + P.sprite + '">' +
+    '<img id="srcsetimg" class="thumb" src="' + P.w100 + '" srcset="' +
+    P.w100 + ' 100w, ' + P.w900 + ' 900w, ' + P.w300 + ' 300w">';
+  document.querySelector('main').appendChild(pics);
+
   return { rules: document.styleSheets[0] ? document.styleSheets[0].cssRules.length : 0, noiseBytes: Math.round(noise.length * 0.75) };
+}
+
+// ---- 本地 http 服务：跨域素材的来源 -------------------------------------
+// 故意不发任何 CORS 头：页面里 fetch 会被浏览器拦住，只有「后台取字节」这条路能拿到，
+// 这正是 3080 上 logo / app-fold.svg / no-application.png 失败的那一类 URL。
+const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#1f6feb"/><circle cx="12" cy="12" r="7" fill="#f0f6ff"/></svg>';
+
+// 真·长条图（358x20870）：在页面里用 canvas 造，交给本地服务发出去。
+// 这张图如果被「单边超 2000px 就重编码」，会压成 34x2000，等于毁掉。
+function makeSpritePng() {
+  const cv = document.createElement('canvas');
+  cv.width = 358; cv.height = 20870;
+  const cx = cv.getContext('2d');
+  cx.fillStyle = '#123456';
+  cx.fillRect(0, 0, 358, 20870);
+  cx.fillStyle = '#e0a000';
+  for (let y = 0; y < 20870; y += 100) cx.fillRect(0, y, 358, 12);
+  return cv.toDataURL('image/png');
+}
+
+function squareSvg(n, color) {
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '"><rect width="' + n + '" height="' + n + '" fill="' + color + '"/></svg>';
+}
+
+function startServer(routes) {
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const key = decodeURIComponent(String(req.url || '').split('?')[0]);
+      const hit = routes[key];
+      if (!hit) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
+      res.writeHead(200, { 'content-type': hit.mime, 'content-length': hit.bytes.length, 'cache-control': 'no-store' });
+      res.end(hit.bytes);
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+  });
+}
+
+// background.js 的取字节就是一个带主机权限的 fetch；这里用 Node 的 fetch 演同一个动作。
+async function bgFetchBytes(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { ok: true, base64: buf.toString('base64'), mime: String(res.headers.get('content-type') || '').split(';')[0].trim(), bytes: buf.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// 把「内容脚本 → 后台 → 字节回传」这条消息链在离线环境里搭出来：
+// 页面用 Runtime.addBinding 打请求，Node 取字节，再把答复写回页面里的 Promise。
+async function installBgSeam(s, cdp) {
+  await s.send('Runtime.addBinding', { name: '__dshBgFetch' });
+  s.ws.addEventListener('message', (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (!m || m.method !== 'Runtime.bindingCalled' || !m.params || m.params.name !== '__dshBgFetch') return;
+    (async () => {
+      let req;
+      try { req = JSON.parse(m.params.payload); } catch (e) { return; }
+      const out = await bgFetchBytes(String(req.url || ''));
+      await s.send('Runtime.evaluate', {
+        expression: 'globalThis.__dshBgDeliver(' + JSON.stringify(String(req.id)) + ', ' + JSON.stringify(JSON.stringify(out)) + ')'
+      }).catch(() => {});
+    })();
+  });
+  await cdp.evaluate(s, () => {
+    const pending = new Map();
+    let seq = 0;
+    globalThis.__dshBgDeliver = (id, json) => {
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      let r;
+      try { r = JSON.parse(json); } catch (e) { r = { ok: false, error: '坏答复' }; }
+      p(r);
+    };
+    globalThis.dshPageCapture.fetchBytes = (url) => new Promise((resolve, reject) => {
+      const id = 'r' + (++seq);
+      pending.set(id, (r) => (r && r.ok ? resolve(r) : reject(new Error((r && r.error) || '后台取字节失败'))));
+      globalThis.__dshBgFetch(JSON.stringify({ id, url }));
+    });
+  });
+}
+
+function pngSize(buf) {
+  if (!buf || buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47) return null;
+  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
+
+function tagOf(html, id) {
+  const m = new RegExp('<[^>]*id="' + id + '"[^>]*>').exec(String(html || ''));
+  return m ? m[0] : '';
 }
 
 function scanAbsolutePaths(body) {
@@ -131,16 +238,31 @@ function assert(name, ok, detail) {
   results.push({ name, ok: !!ok, detail: detail === undefined ? '' : String(detail) });
 }
 
+// CDP 的 Runtime.evaluate 单次回传 payload 有上限（实测 3.7MB 能过、5MB 挂住）。
+// 素材包一次能有几个 MB，所以分两步：先拿轻量清单（report + files 的 path/bytes），
+// 再一条一条把内容取回来——单条最大 2.7MB（2MB 二进制转 base64），都在上限内。
 async function runExtract(s, opts) {
   const r = await s.send('Runtime.evaluate', {
-    expression: 'globalThis.dshPageCapture.extract(document, ' + JSON.stringify(opts) + ')',
+    expression: '(function () { globalThis.__dshOut = null; return globalThis.dshPageCapture.extract(document, ' + JSON.stringify(opts) + ')'
+      + '.then(function (o) { globalThis.__dshOut = o; return { files: o.files.map(function (f) { return { path: f.path, bytes: f.bytes, base64: !!f.base64 }; }), report: o.report }; }); })()',
     awaitPromise: true,
     returnByValue: true
   });
   if (r.exceptionDetails) {
     throw new Error('extract 抛异常：' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text));
   }
-  return r.result.value;
+  const light = r.result.value;
+  if (!light || !Array.isArray(light.files)) throw new Error('extract 没有返回 files');
+  const files = [];
+  for (const meta of light.files) {
+    const g = await s.send('Runtime.evaluate', {
+      expression: '(function () { var o = globalThis.__dshOut; for (var i = 0; i < o.files.length; i++) { if (o.files[i].path === ' + JSON.stringify(meta.path) + ') return o.files[i].content; } return null; })()',
+      returnByValue: true
+    });
+    if (g.exceptionDetails) throw new Error('取回 ' + meta.path + ' 的内容失败：' + JSON.stringify(g.exceptionDetails));
+    files.push({ path: meta.path, bytes: meta.bytes, base64: meta.base64, content: g.result.value });
+  }
+  return { files: files, report: light.report };
 }
 
 async function main() {
@@ -151,13 +273,38 @@ async function main() {
   const browser = await cdp.launch({ width: 1280, height: 800 });
   const s = browser.session;
   let failed = 0;
+  let srv = null;
   try {
-    const fx = await cdp.evaluate(s, buildFixture);
-    console.log('[fixture] about:blank 注入完成：style 规则 ' + fx.rules + ' 条，噪声 PNG ≈ ' + Math.round(fx.noiseBytes / 1024) + 'KB，假 woff2 225KB');
+    // 0) 先造素材再起服务：长条图在页面里生成，字节交给本地 http 服务发出去。
+    const spriteBytes = Buffer.from(String(await cdp.evaluate(s, makeSpritePng)).split(',')[1], 'base64');
+    const logoBytes = Buffer.from(LOGO_SVG, 'utf8');
+    const started = await startServer({
+      '/logo.svg': { mime: 'image/svg+xml', bytes: logoBytes },
+      '/sprite.png': { mime: 'image/png', bytes: spriteBytes },
+      '/q100.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(100, '#a0c4ff'), 'utf8') },
+      '/q300.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(300, '#9bf6ff'), 'utf8') },
+      '/q900.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(900, '#caffbf'), 'utf8') },
+    });
+    srv = started.server;
+    const hostA = 'http://127.0.0.1:' + started.port;
+    const hostB = 'http://localhost:' + started.port;   // 同服务、不同主机名 = 另一个源
+    const P = { logo: hostB + '/logo.svg', sprite: hostA + '/sprite.png', w100: hostA + '/q100.svg', w300: hostA + '/q300.svg', w900: hostA + '/q900.svg' };
+    console.log('[server] ' + hostA + ' 已就绪：sprite.png ' + spriteBytes.length + ' B（358x20870），logo.svg ' + logoBytes.length + ' B，srcset 三档 100w/300w/900w');
 
-    const src = readFileSync(path.join(HERE, 'extractor.js'), 'utf8');
-    const inj = await s.send('Runtime.evaluate', { expression: src, returnByValue: false });
+    const fx = await cdp.evaluate(s, '(' + buildFixture.toString() + ')(' + JSON.stringify(P) + ')', { isExpression: true });
+    console.log('[fixture] about:blank 注入完成：style 规则 ' + fx.rules + ' 条，噪声 PNG ≈ ' + Math.round(fx.noiseBytes / 1024) + 'KB，假 woff2 1.5MB');
+
+    const srcText = readFileSync(path.join(HERE, 'extractor.js'), 'utf8');
+    const inj = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
     if (inj.exceptionDetails) throw new Error('注入 extractor.js 失败：' + JSON.stringify(inj.exceptionDetails));
+
+    // 后台取字节通道（对着 extractor 的 fetchBytes 钩子，等同 background.js 的答复形状）
+    await installBgSeam(s, cdp);
+    // 对照：页面自己 fetch 这张跨域图必然被拦（服务端不发 CORS），证明上面那条不是页面取到的
+    const pageFetch = await cdp.evaluate(s,
+      'fetch(' + JSON.stringify(P.sprite) + ').then(function(){return "ok"},function(e){return String((e&&e.message)||e)})',
+      { isExpression: true });
+    console.log('[control] 页面直接 fetch sprite.png → ' + pageFetch);
 
     const out = await runExtract(s, { origin: 'about:blank' });
     if (!out || !out.files) throw new Error('extract 没有返回 files');
@@ -228,6 +375,37 @@ async function main() {
     assert('祖先链停在 body 直系子元素（不含 <html>/<body>）', chainOk,
       'selector=#target → ' + sub.report.ancestors.map((a) => a.tag + (a.id ? '#' + a.id : '')).join(' < ') + '，entry ' + subEntry.length + ' 字符');
 
+    // ---- 9. 跨域资源经后台取字节：拿到字节、dropped 里不再出现 -----------
+    const logoRow = (report.assets || []).find((a) => String(a.url).indexOf('/logo.svg') >= 0);
+    const logoDropped = report.dropped.some((d) => String(d).indexOf('logo.svg') >= 0);
+    assert('跨域资源经后台取字节拿到字节，dropped 里不再出现',
+      !!logoRow && logoRow.via === 'background' && logoRow.bytes === logoBytes.length && logoRow.kind === 'data' && !logoDropped && pageFetch !== 'ok',
+      logoRow
+        ? (logoRow.url + ' → ' + logoRow.bytes + ' B（服务端 ' + logoBytes.length + ' B），通道 ' + logoRow.via + '，落点 ' + logoRow.kind + '；页面直连：' + pageFetch)
+        : '资源清单里没有 logo.svg（dropped ' + report.dropped.length + ' 条）');
+
+    // ---- 10. 358x20870 长条图：原尺寸落文件，不降采样 ---------------------
+    const sprRow = (report.assets || []).find((a) => String(a.url).indexOf('/sprite.png') >= 0);
+    const sprFile = sprRow && sprRow.path ? byPath.get(sprRow.path) : null;
+    const sprOut = sprFile ? Buffer.from(String(sprFile.content), 'base64') : null;
+    const sprPng = sprOut ? pngSize(sprOut) : null;
+    const sprDown = report.dropped.some((d) => String(d).indexOf('sprite.png') >= 0 && String(d).indexOf('重编码') >= 0);
+    assert('358x20870 长条图原尺寸落文件、不参与 2000px 降采样',
+      !!sprRow && sprRow.kind === 'file' && sprRow.downsampled === false && sprRow.w === 358 && sprRow.h === 20870 &&
+        !!sprPng && sprPng.w === 358 && sprPng.h === 20870 && !!sprOut && sprOut.length === spriteBytes.length && !sprDown,
+      sprRow
+        ? (sprRow.path + '：report ' + sprRow.w + 'x' + sprRow.h + '，落盘 PNG ' + (sprPng ? sprPng.w + 'x' + sprPng.h : '解析失败') + '，' + (sprOut ? sprOut.length : 0) + ' B（原图 ' + spriteBytes.length + ' B）')
+        : '资源清单里没有 sprite.png');
+
+    // ---- 11. srcset 取最大候选（900w），小档不进清单 ----------------------
+    const pickTag = tagOf(entry.content, 'srcsetimg');
+    const picked = report.srcsetPicked || [];
+    const got900 = picked.some((u) => String(u).indexOf('/q900.svg') >= 0);
+    const gotSmall = (report.assets || []).some((a) => /\/q(100|300)\.svg/.test(String(a.url)));
+    assert('带 srcset 的元素取最大候选（900w），100w/300w 不进资源清单',
+      got900 && !gotSmall && /src="data:image\/svg\+xml/.test(pickTag) && pickTag.indexOf('srcset=') < 0,
+      'srcsetPicked=' + JSON.stringify(picked) + '；img 标签：' + (pickTag || '没找到'));
+
     // ---- 落盘 ------------------------------------------------------------
     if (existsSync(OUT)) rmSync(OUT, { recursive: true, force: true });
     mkdirSync(OUT, { recursive: true });
@@ -271,6 +449,7 @@ async function main() {
     console.log(failed === 0 ? '[self-check] 全部通过（' + results.length + '/' + results.length + '）' : '[self-check] 失败 ' + failed + ' 条');
     process.exitCode = failed === 0 ? 0 : 1;
   } finally {
+    if (srv) { try { srv.close() } catch (e) {} }
     await browser.close();
   }
 }

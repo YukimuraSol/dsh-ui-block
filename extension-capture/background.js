@@ -12,6 +12,76 @@ const POLL_MS = 2000
 const ACTIVATE_WAIT_MS = 300
 const GONE = '目标已消失，请重新 list_pages'
 
+// ---- 取字节（fetch 代理）---------------------------------------------------
+// 内容脚本跑在页面里，取跨域图片/字体受页面的 CORS 限制（logo、app-fold.svg、
+// no-application.png 就是这么 Failed to fetch 的）。service worker 带 all_urls 主机
+// 权限，同样的 URL 在这里 fetch 是 200，所以字节一律走这条路取。
+const FETCH_MAX_BYTES = 12 * 1024 * 1024
+const FETCH_TIMEOUT_MS = 25000
+const FETCH_CONCURRENCY = 4
+let fetchActive = 0
+const fetchPending = []
+
+// SW 空闲 30 秒就被回收；取字节期间（以及整轮抓取期间）每 20 秒摸一次扩展 API
+// 把空闲计时器重置，别让一条慢请求把 worker 送到半路截断。
+let aliveTimer = null
+let aliveDepth = 0
+function keepAlive(on) {
+  aliveDepth = Math.max(0, aliveDepth + (on ? 1 : -1))
+  if (aliveDepth > 0 && !aliveTimer) {
+    aliveTimer = setInterval(function () {
+      try { chrome.runtime.getPlatformInfo(function () {}) } catch (e) {}
+    }, 20000)
+  } else if (aliveDepth === 0 && aliveTimer) {
+    clearInterval(aliveTimer)
+    aliveTimer = null
+  }
+}
+
+function bytesToBase64(u8) {
+  let s = ''
+  const CH = 0x8000
+  for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH))
+  return btoa(s)
+}
+
+async function fetchBytesOnce(url) {
+  const ctl = new AbortController()
+  const limit = setTimeout(function () { try { ctl.abort() } catch (e) {} }, FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow', signal: ctl.signal })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const declared = Number(res.headers.get('content-length') || 0)
+    if (declared > FETCH_MAX_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(FETCH_MAX_BYTES / 1048576) + 'MB（' + Math.round(declared / 104857.6) / 10 + 'MB）')
+    const buf = new Uint8Array(await res.arrayBuffer())
+    if (buf.length > FETCH_MAX_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(FETCH_MAX_BYTES / 1048576) + 'MB')
+    const mime = String(res.headers.get('content-type') || '').split(';')[0].trim()
+    return { ok: true, base64: bytesToBase64(buf), mime: mime, bytes: buf.length, via: 'background' }
+  } finally {
+    clearTimeout(limit)
+  }
+}
+
+function queueFetch(url) {
+  return new Promise(function (resolve, reject) {
+    fetchPending.push({ url: url, resolve: resolve, reject: reject })
+    pumpFetch()
+  })
+}
+
+function pumpFetch() {
+  while (fetchActive < FETCH_CONCURRENCY && fetchPending.length) {
+    const job = fetchPending.shift()
+    fetchActive++
+    keepAlive(true)
+    fetchBytesOnce(job.url).then(job.resolve, function (e) { job.reject(e) }).finally(function () {
+      fetchActive--
+      keepAlive(false)
+      pumpFetch()
+    })
+  }
+}
+
 let cfg = Object.assign({}, DEFAULTS)
 let timer = null
 let busy = false
@@ -111,6 +181,11 @@ async function sendResult(taskId, payload) {
 }
 
 async function runTask(task) {
+  keepAlive(true)
+  try { return await runTaskBody(task) } finally { keepAlive(false) }
+}
+
+async function runTaskBody(task) {
   const tabId = task && task.tabId
   if (typeof tabId !== 'number') return sendResult(task && task.id, { ok: false, error: '任务缺 tabId' })
 
@@ -196,6 +271,21 @@ chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
   if (msg && msg.type === 'dsh-capture-status') {
     reply({ enabled: !!cfg.enabled, baseUrl: cfg.baseUrl, instance: cfg.instance, busy: busy })
     return false
+  }
+  // 内容脚本要一个资源的字节：这里 fetch，字节(base64) + mime 回传；失败原因原样回传，
+  // 由 extractor 写进 report.dropped。返回 true = 答复是异步的。
+  if (msg && msg.type === 'dsh-capture-fetch') {
+    const url = String(msg.url || '')
+    if (!/^https?:/i.test(url) && !/^file:/i.test(url)) {
+      reply({ ok: false, error: '不支持的协议：' + (url.split(':')[0] || '未知') })
+      return false
+    }
+    keepAlive(true)
+    queueFetch(url).then(
+      function (r) { reply(r); keepAlive(false) },
+      function (e) { reply({ ok: false, error: String((e && e.message) || e) }); keepAlive(false) }
+    )
+    return true
   }
   return false
 })

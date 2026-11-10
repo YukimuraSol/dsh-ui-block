@@ -11,9 +11,17 @@
     'padding', 'margin', 'border-radius', 'box-shadow', 'display', 'grid-template-columns', 'gap'];
   var INHERITED = { color: 1, 'font-size': 1, 'font-family': 1, 'line-height': 1 };
 
-  var MAX_ASSET_BYTES = 200 * 1024;   // 单文件 200KB
-  var MAX_IMAGE_DIM = 2000;           // 单边 2000px
-  var SECTION_MAX_BYTES = 256 * 1024; // 块格式单段上限
+  // 单文件上限与块格式对齐（2 MB）。data: 内嵌另有更紧的一条：base64 会胀 4/3，
+  // 1.4 MB 的字节内嵌后约 1.87 MB，仍在一段 2 MB 之内。
+  var MAX_ASSET_BYTES = 2 * 1024 * 1024;
+  var MAX_INLINE_BYTES = 1400 * 1024;
+  // 单边 2000px 的降采样只对长宽比正常的图用；长宽比 ≥ 8 判为雪碧图/长条图，
+  // 原尺寸落文件（358x20870 压成 34x2000 等于毁掉）。
+  var MAX_IMAGE_DIM = 2000;
+  var SPRITE_RATIO = 8;
+  /** 单次取字节上限：后台同值，超了当场报原因，不把 40 MB 的图灌进消息通道。 */
+  var MAX_FETCH_BYTES = 12 * 1024 * 1024;
+  var SECTION_MAX_BYTES = 2 * 1024 * 1024; // 块格式单段上限（DSH 侧默认值）
 
   var ENTRY = 'entry.html';
   var APP_CSS = 'shared/app.css';
@@ -157,6 +165,72 @@
     return { mime: mime, bytes: bytes, base64: isB64 ? body : null };
   }
 
+  function fromBase64(b64) {
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  /** 长宽比极端的图（雪碧图、长条图）：降采样会把它压成一条线，只能原尺寸保留。 */
+  function spriteLike(w, h) {
+    if (!w || !h) return false;
+    return Math.max(w, h) / Math.min(w, h) >= SPRITE_RATIO;
+  }
+
+  function extOf(url, mime) {
+    var m = /\.([a-z0-9]{2,5})(?:[?#]|$)/i.exec(String(url || '')) || [];
+    var ext = String(m[1] || '').toLowerCase();
+    if (ext && ext !== 'php' && ext !== 'aspx' && ext !== 'cgi') return ext === 'jpeg' ? 'jpg' : ext;
+    var mm = /^image\/([a-z0-9+.-]+)/i.exec(String(mime || '')) || [];
+    var out = String(mm[1] || '').toLowerCase();
+    if (out === 'svg+xml') return 'svg';
+    if (out === 'jpeg') return 'jpg';
+    if (out) return out;
+    var fm = /^font\/([a-z0-9+.-]+)/i.exec(String(mime || '')) || [];
+    return String(fm[1] || '').toLowerCase() || 'bin';
+  }
+
+  /**
+   * srcset / imagesrcset 取最大候选。描述符里 w（固有宽度）优先于 x（像素密度）：
+   * 混着写时按 w 挑，因为块的画布宽按 CSS 像素算，密度描述符换不出更大的源。
+   * 返回候选 URL 原文（可能是相对地址），调用方负责绝对化。
+   */
+  function pickSrcsetMax(value) {
+    var s = String(value || '');
+    var bestUrl = '', bestW = 0, bestX = 0, sawW = false;
+    var i = 0, guard = 0;
+    while (i < s.length && guard++ < 400) {
+      while (i < s.length && /[\s,]/.test(s[i])) i++;
+      if (i >= s.length) break;
+      var start = i;
+      while (i < s.length && !/[\s,]/.test(s[i])) i++;
+      var url = s.slice(start, i);
+      // 描述符可能带括号（较新语法）：按顶层逗号收尾
+      var dstart = i, depth = 0;
+      while (i < s.length) {
+        var ch = s[i];
+        if (ch === '(') depth++;
+        else if (ch === ')') depth = depth > 0 ? depth - 1 : 0;
+        else if (ch === ',' && depth === 0) break;
+        i++;
+      }
+      var desc = s.slice(dstart, i).trim();
+      i++;
+      if (!url || /^data:/i.test(url)) continue;
+      var mw = /([\d.]+)\s*w(?![\w-])/.exec(desc);
+      var mx = /([\d.]+)\s*x(?![\w-])/.exec(desc);
+      if (mw) {
+        var w = Number(mw[1]);
+        if (w >= bestW) { bestW = w; bestUrl = url; sawW = true; }
+      } else if (!sawW) {
+        var x = mx ? Number(mx[1]) : 1;
+        if (x >= bestX) { bestX = x; bestUrl = url; }
+      }
+    }
+    return bestUrl;
+  }
+
   async function imageSize(doc, bytes, mime) {
     var win = doc.defaultView || {};
     try {
@@ -212,9 +286,10 @@
     var want = function (n) { return !include.length || include.indexOf('all') >= 0 || include.indexOf(n) >= 0; };
 
     var maxBytes = Number(opts.maxBytes) > 0 ? Number(opts.maxBytes) : 0;
-    // 预算：整块默认 256KB 一节上限，撞上就按顺序降级并在 report.degrade 里记名
-    var inlineBudget = Math.min(180 * 1024, maxBytes ? Math.floor(maxBytes * 0.5) : 180 * 1024);
-    var computedBudget = Math.min(60 * 1024, maxBytes ? Math.floor(maxBytes * 0.2) : 60 * 1024);
+    // 预算：单段 2 MB。内嵌只花其中约七成（base64 会胀），剩下留给规则原文与元素固化；
+    // 撞上就按顺序降级并在 report.degrade 里记名。
+    var inlineBudget = Math.min(MAX_INLINE_BYTES, maxBytes ? Math.floor(maxBytes * 0.7) : MAX_INLINE_BYTES);
+    var computedBudget = Math.min(384 * 1024, maxBytes ? Math.floor(maxBytes * 0.2) : 384 * 1024);
     var degrade = [];
 
     var win = doc.defaultView || {};
@@ -397,13 +472,33 @@
 
     // 4) 拷一份 DOM 再清理（活页面只多挂几个 data-dsh-el 属性，不动结构）
     var clone = topEl.cloneNode(true);
+
+    // 资源清单的收集器提前到这里：清属性时就要把 srcset 的最大候选记进去。
+    var keyOf = function (u) { var a = absUrl(u, base); return a || String(u || ''); };
+    var urls = [];
+    var addUrl = function (u) {
+      var t = String(u || '').trim();
+      if (!t || t.slice(0, 1) === '#' || /^(about|javascript|blob):/i.test(t)) return;
+      var k = keyOf(t);
+      if (urls.indexOf(k) < 0) urls.push(k);
+    };
+    // link[rel=preload][imagesrcset]：link 是死标签、元素会被删，但它预载的最大那张图
+    // 也是这份素材的一部分，先记进清单，别让「删死标签」顺手吃掉它。
+    Array.prototype.slice.call(clone.querySelectorAll('link[imagesrcset], link[srcset]')).forEach(function (n) {
+      addUrl(pickSrcsetMax(n.getAttribute('imagesrcset') || n.getAttribute('srcset') || ''));
+    });
+    var srcsetPick = new Map();
+    var srcsetPickedUrls = [];
+
     var isBody = (topEl === doc.body);
     var deadTags = ['script', 'noscript', 'template', 'iframe', 'object', 'embed', 'link', 'meta', 'style', 'canvas'];
     var removedNodes = 0;
     Array.prototype.slice.call(clone.querySelectorAll(deadTags.join(','))).forEach(function (n) {
       if (n.parentNode) { n.parentNode.removeChild(n); removedNodes++; }
     });
-    var BAD_ATTR = { srcset: 1, imagesrcset: 1, integrity: 1, nonce: 1, crossorigin: 1, loading: 1, decoding: 1, referrerpolicy: 1 };
+    // srcset / imagesrcset 不在这里删：它们是响应式图的档位表，删了等于主动丢掉最大一档，
+    // 交给下面 pickSrcsetMax 取最大候选（见「nm === 'srcset'」分支与第 6 步回写）。
+    var BAD_ATTR = { integrity: 1, nonce: 1, crossorigin: 1, loading: 1, decoding: 1, referrerpolicy: 1 };
     var ROOT_ABS_ATTR = { href: 1, src: 1, action: 1, formaction: 1, poster: 1 };
     var resolveStyleAttr = function (raw) {
       return cleanDecls(raw, vars, st);
@@ -416,6 +511,12 @@
         var v = String(a.value || '');
         if (nm === 'data-dsh-columbina') { n.removeAttribute(a.name); st.skinAttrsStripped++; return; }
         if (nm.slice(0, 2) === 'on') { n.removeAttribute(a.name); return; }
+        if (nm === 'srcset' || nm === 'imagesrcset') {
+          var picked = pickSrcsetMax(v);
+          if (picked) { addUrl(picked); srcsetPick.set(n, { attr: nm, url: picked }); srcsetPickedUrls.push(keyOf(picked)); }
+          else { n.removeAttribute(a.name); drop('srcset 解析不出候选，已去掉 ' + nm + '=' + v.slice(0, 60)); }
+          return;
+        }
         if (BAD_ATTR[nm]) { n.removeAttribute(a.name); return; }
         if (nm === 'href' && /^\s*(javascript|data):/i.test(v)) { n.removeAttribute(a.name); return; }
         // 根绝对引用（href="/x"、src="/x"）进块就是非法路径：先绝对化成原站地址，
@@ -445,24 +546,19 @@
       });
     });
 
-    // 5) 资源：页面自身 fetch 取字节 → data:；超 200KB 或超 2000px 的图先重编码/降采样，
-    //    还是超标就写进 assets/ 落文件；取不到就丢掉并在 dropped 里记名。
-    var keyOf = function (u) { var a = absUrl(u, base); return a || String(u || ''); };
+    // 5) 资源：字节交给扩展后台的 service worker 取（它带 all_urls 主机权限，不受页面跨域限制）；
+    //    长宽比正常的大图先重编码/降采样，还是超标就写进 assets/ 落文件；雪碧图原尺寸落文件；
+    //    取不到就丢掉并在 dropped 里写清原因。
     var assetMap = new Map();
     var assetFiles = [];
     var assetSeq = { img: 0, font: 0, bin: 0 };
+    var assetLog = [];
     var pageCssText = (want('css') ? pageRules.join(NL) : '');
-
-    var urls = [];
-    var addUrl = function (u) {
-      var t = String(u || '').trim();
-      if (!t || t.slice(0, 1) === '#' || /^(about|javascript|blob):/i.test(t)) return;
-      var k = keyOf(t);
-      if (urls.indexOf(k) < 0) urls.push(k);
-    };
     pageCssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) { addUrl(u); return m; });
     Array.prototype.slice.call(clone.querySelectorAll('[src], [poster]')).forEach(function (n) {
-      addUrl(n.getAttribute('src') || '');
+      // 带 srcset 的元素只取最大候选（第 4 步已进清单），它的 src 是同一张图的小档，
+      // 再取一遍只是白跑一次请求。
+      if (!srcsetPick.has(n)) addUrl(n.getAttribute('src') || '');
       addUrl(n.getAttribute('poster') || '');
     });
     allNodes.forEach(function (n) {
@@ -471,89 +567,176 @@
       String(stv).replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) { addUrl(u); return m; });
     });
 
+    /**
+     * 取字节：交给扩展后台的 service worker（background.js 的 'dsh-capture-fetch'），它带
+     * all_urls 主机权限，跨域资源不受页面 CORS 限制——页面里 fetch 拿不到的 logo/svg/png
+     * 就是死在这一步。没有后台可用时（离线自检的宿主页面）退回页面自身的 fetch。
+     */
+    var bgFetch = function (absu) {
+      var capture = globalThis.dshPageCapture;
+      if (capture && typeof capture.fetchBytes === 'function') return Promise.resolve(capture.fetchBytes(absu));
+      if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        return new Promise(function (res, rej) {
+          try {
+            chrome.runtime.sendMessage({ type: 'dsh-capture-fetch', url: absu }, function (r) {
+              var err = chrome.runtime.lastError;
+              if (err) { rej(new Error('后台没有应答：' + err.message)); return; }
+              if (!r) { rej(new Error('后台没有应答')); return; }
+              if (r.ok === false) { rej(new Error(String(r.error || '后台取字节失败'))); return; }
+              res(r);
+            });
+          } catch (e) { rej(new Error('调后台失败：' + String(e && e.message || e))); }
+        });
+      }
+      return null;
+    };
+
     var fetchOne = async function (absu) {
       if (absu.slice(0, 5).toLowerCase() === 'data:') {
         var meta = splitDataUri(absu);
         if (!meta) throw new Error('坏 data: URI');
-        var bytes = null;
-        if (meta.base64 !== null) {
-          var bin = atob(meta.base64);
-          bytes = new Uint8Array(bin.length);
-          for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        } else {
-          bytes = new TextEncoder().encode(decodeURIComponent(absu.slice(absu.indexOf(',') + 1)));
-        }
-        return { bytes: bytes, mime: meta.mime, rawLen: meta.bytes };
+        var bytes;
+        if (meta.base64 !== null) bytes = fromBase64(meta.base64);
+        else bytes = new TextEncoder().encode(decodeURIComponent(absu.slice(absu.indexOf(',') + 1)));
+        return { bytes: bytes, mime: meta.mime, rawLen: meta.bytes, via: 'data' };
+      }
+      var fromBg = bgFetch(absu);
+      if (fromBg) {
+        var r = await fromBg;
+        var u8 = (r && r.bytes instanceof Uint8Array) ? r.bytes : fromBase64(String((r && r.base64) || ''));
+        if (!u8 || !u8.length) throw new Error('后台回的是空字节');
+        if (u8.length > MAX_FETCH_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(MAX_FETCH_BYTES / 1048576) + 'MB');
+        return { bytes: u8, mime: String((r && r.mime) || '').split(';')[0].trim() || guessMime(absu), rawLen: u8.length, via: 'background' };
       }
       var f = (win.fetch ? win.fetch.bind(win) : fetch);
       var res = await f(absu, { credentials: 'include' });
       if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
       var buf = new Uint8Array(await res.arrayBuffer());
       var ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
-      return { bytes: buf, mime: ct || guessMime(absu), rawLen: buf.length };
+      return { bytes: buf, mime: ct || guessMime(absu), rawLen: buf.length, via: 'page' };
+    };
+
+    var kbOf = function (n) { return Math.round(n / 1024) + 'KB'; };
+
+    /** 落 assets/：原字节进块，不改尺寸。返回段内相对路径。 */
+    var spool = function (kind, absu, mime, base64, bytes) {
+      assetSeq[kind] = (assetSeq[kind] || 0) + 1;
+      var name = kind === 'font' ? 'font' : (kind === 'img' ? 'img' : 'asset');
+      var path = 'assets/' + name + '-' + assetSeq[kind] + '.' + extOf(absu, mime);
+      assetFiles.push({ path: path, content: base64, base64: true, bytes: bytes });
+      st.assetsSpilled++;
+      return path;
+    };
+
+    // report 里的 URL 只留可读标识：data: 内联资源的原串本身就有几 MB，整条塞进 report
+    // 会让「回传结果」比素材还大。
+    var shortUrl = function (u) {
+      var s = String(u || '');
+      if (s.slice(0, 5).toLowerCase() === 'data:') return s.slice(0, 48) + '…（内联 ' + s.length + ' 字符）';
+      return s.length > 400 ? s.slice(0, 400) + '…' : s;
+    };
+
+    var logAsset = function (absu, out, got) {
+      var row = { url: shortUrl(absu), kind: out.kind, via: (got && got.via) || '?', bytes: out.bytes || 0 };
+      if (out.path) row.path = out.path;
+      if (out.mime) row.mime = out.mime;
+      if (out.w) { row.w = out.w; row.h = out.h; }
+      if (out.downsampled !== undefined) row.downsampled = !!out.downsampled;
+      if (out.reason) row.reason = out.reason;
+      assetLog.push(row);
+      return row;
     };
 
     var resolveAsset = async function (absu) {
       if (assetMap.has(absu)) return assetMap.get(absu);
       var out = { kind: 'drop' };
+      var got = null;
       try {
-        var got = await fetchOne(absu);
+        got = await fetchOne(absu);
         var mime = got.mime || guessMime(absu);
         var isImg = /^image\//i.test(mime);
         var isFont = /^font\//i.test(mime) || /font-(woff2?|ttf|otf|eot)|vnd\.ms-fontobject/i.test(mime) || /\.(woff2?|ttf|otf|eot)([?#]|$)/i.test(absu);
-        if (!isImg && !isFont) { out = { kind: 'drop' }; drop('非图片/字体，丢弃：' + absu); }
+        if (!isImg && !isFont) { out = { kind: 'drop', reason: '非图片/字体' }; drop('非图片/字体，丢弃：' + absu); }
         else if (isFont) {
-          if (got.rawLen <= MAX_ASSET_BYTES) {
-            out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen };
+          if (got.rawLen <= MAX_INLINE_BYTES) {
+            out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime };
             st.assetsInlined++;
+          } else if (got.rawLen <= MAX_ASSET_BYTES) {
+            var fpath = spool('font', absu, mime, toBase64(got.bytes), got.rawLen);
+            out = { kind: 'file', path: fpath, bytes: got.rawLen, mime: mime };
+            drop('字体 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，改存 ' + fpath + '：' + absu);
           } else {
-            assetSeq.font++;
-            var fpath = 'assets/font-' + assetSeq.font + '.' + ((/\.(woff2?|ttf|otf|eot)/i.exec(absu) || [])[1] || 'woff2').toLowerCase();
-            assetFiles.push({ path: fpath, content: toBase64(got.bytes), base64: true, bytes: got.rawLen });
-            out = { kind: 'file', path: fpath, bytes: got.rawLen };
-            st.assetsSpilled++;
-            drop('字体 ' + Math.round(got.rawLen / 1024) + 'KB 超 200KB，改存 ' + fpath + '：' + absu);
+            out = { kind: 'drop', reason: '超单文件上限 2MB' };
+            drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
           }
         } else {
           var info = await imageSize(doc, got.bytes, mime);
-          var tooBig = got.rawLen > MAX_ASSET_BYTES || (info && Math.max(info.w, info.h) > MAX_IMAGE_DIM);
-          if (!tooBig) {
-            out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen };
+          var iw = info ? info.w : 0, ih = info ? info.h : 0;
+          var dimTooBig = iw > MAX_IMAGE_DIM || ih > MAX_IMAGE_DIM;
+          if (info && spriteLike(iw, ih)) {
+            // 雪碧图 / 长条图：降采样会把 358x20870 压成 34x2000，等于毁掉——原尺寸落文件。
+            if (got.rawLen <= MAX_ASSET_BYTES) {
+              var spath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen);
+              out = { kind: 'file', path: spath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
+              drop('雪碧图 ' + iw + 'x' + ih + ' 原尺寸落 ' + spath + '（不降采样）：' + absu);
+            } else {
+              out = { kind: 'drop', reason: '雪碧图原图超单文件上限 2MB' };
+              drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
+            }
+          } else if (got.rawLen <= MAX_INLINE_BYTES && !dimTooBig) {
+            out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
             st.assetsInlined++;
           } else {
-            var shrink = await reencode(doc, got.bytes, mime, MAX_IMAGE_DIM);
-            if (shrink && shrink.bytes <= MAX_ASSET_BYTES) {
-              out = { kind: 'data', uri: shrink.uri, bytes: shrink.bytes };
+            var shrink = dimTooBig ? await reencode(doc, got.bytes, mime, MAX_IMAGE_DIM) : null;
+            if (shrink && shrink.bytes <= MAX_INLINE_BYTES) {
+              out = { kind: 'data', uri: shrink.uri, bytes: shrink.bytes, mime: shrink.mime, w: shrink.w, h: shrink.h, downsampled: true };
               st.assetsInlined++;
-              drop('图片重编码 ' + (info ? info.w + 'x' + info.h : '?') + ' → ' + shrink.w + 'x' + shrink.h + ' webp ' + Math.round(shrink.bytes / 1024) + 'KB：' + absu);
+              drop('图片重编码 ' + (iw ? iw + 'x' + ih : '?') + ' → ' + shrink.w + 'x' + shrink.h + ' webp ' + kbOf(shrink.bytes) + '：' + absu);
             } else if (shrink) {
-              assetSeq.img++;
-              var ipath = 'assets/img-' + assetSeq.img + '.' + (shrink.mime.indexOf('webp') > 0 ? 'webp' : 'png');
-              assetFiles.push({ path: ipath, content: splitDataUri(shrink.uri).base64, base64: true, bytes: shrink.bytes });
-              out = { kind: 'file', path: ipath, bytes: shrink.bytes };
-              st.assetsSpilled++;
-              drop('图片降采样后仍 ' + Math.round(shrink.bytes / 1024) + 'KB 超 200KB，改存 ' + ipath + '：' + absu);
+              var ipath = spool('img', absu, shrink.mime, splitDataUri(shrink.uri).base64, shrink.bytes);
+              out = { kind: 'file', path: ipath, bytes: shrink.bytes, mime: shrink.mime, w: shrink.w, h: shrink.h, downsampled: true };
+              drop('图片降采样后仍 ' + kbOf(shrink.bytes) + '，改存 ' + ipath + '：' + absu);
+            } else if (got.rawLen <= MAX_ASSET_BYTES) {
+              // 解不开、或长宽比正常只是文件大：原字节落文件，不在体积上赌质量。
+              var opath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen);
+              out = { kind: 'file', path: opath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
+              drop('图片 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，原尺寸改存 ' + opath + '：' + absu);
             } else {
-              out = { kind: 'drop' };
-              drop('图片解码失败，丢弃：' + absu);
+              out = { kind: 'drop', reason: '超单文件上限 2MB' };
+              drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
             }
           }
         }
       } catch (e) {
-        out = { kind: 'drop' };
-        drop('取不到字节，丢弃：' + absu + ' （' + String(e && e.message || e).slice(0, 60) + '）');
+        out = { kind: 'drop', reason: String(e && e.message || e) };
+        drop('取不到字节，丢弃：' + absu + ' （' + String(e && e.message || e).slice(0, 80) + '）');
       }
       assetMap.set(absu, out);
+      logAsset(absu, out, got);
       return out;
     };
 
     if (want('assets')) {
-      for (var ui = 0; ui < urls.length; ui++) await resolveAsset(urls[ui]);
+      // 并发 3：一条一条取，一百多个资源的页面能等成几分钟。压在 3 是因为解码与重编码
+      // 都在页面主线程里跑，贪多反而抖。
+      var POOL = 3;
+      var cursorIdx = 0;
+      var sameWorkers = [];
+      var workerCount = Math.min(POOL, urls.length);
+      for (var wk = 0; wk < workerCount; wk++) {
+        sameWorkers.push((async function () {
+          while (cursorIdx < urls.length) {
+            var idx = cursorIdx++;
+            await resolveAsset(urls[idx]);
+          }
+        })());
+      }
+      await Promise.all(sameWorkers);
     } else {
       for (var uj = 0; uj < urls.length; uj++) assetMap.set(urls[uj], { kind: 'keep' });
     }
 
-    // 内嵌总量超预算：把大的改判成落文件（data: 塞爆 CSS 会过 256KB 单段上限）
+    // 内嵌总量超预算：把大的改判成落文件（data: 塞爆 CSS 会过单段上限）
     var inlineBytes = 0;
     assetMap.forEach(function (v, k) {
       if (v.kind === 'data') inlineBytes += v.bytes;
@@ -566,10 +749,11 @@
         var item = big[bi];
         var meta2 = splitDataUri(item.v.uri);
         if (!meta2 || !meta2.base64) continue;
-        assetSeq.img++;
-        var p2 = 'assets/asset-' + assetSeq.img + '.' + ((/([a-z0-9]+)$/i.exec(meta2.mime) || [])[1] || 'bin');
-        assetFiles.push({ path: p2, content: meta2.base64, base64: true, bytes: item.v.bytes });
-        assetMap.set(item.k, { kind: 'file', path: p2, bytes: item.v.bytes });
+        var p2 = spool('bin', item.k, meta2.mime, meta2.base64, item.v.bytes);
+        assetMap.set(item.k, { kind: 'file', path: p2, bytes: item.v.bytes, mime: meta2.mime });
+        for (var ai = 0; ai < assetLog.length; ai++) {
+          if (assetLog[ai].url === item.k) { assetLog[ai].kind = 'file'; assetLog[ai].path = p2; break; }
+        }
         inlineBytes -= item.v.bytes;
         st.assetsSpilled++;
         drop('内嵌总量超预算，改存 ' + p2);
@@ -603,6 +787,24 @@
         if (rep === 'none') { if (n.parentNode) n.parentNode.removeChild(n); return; }
         if (rep !== undefined) n.setAttribute(attr, rep);
       });
+      // srcset 的最大候选：img 用 src 承载，source 没有 src，把 srcset 收成一条。
+      // 落点拿不到就整条删掉，绝不留原站绝对地址。
+      var pick = srcsetPick.get(n);
+      if (pick) {
+        var prep = srcFor('./', assetMap.get(keyOf(pick.url)));
+        var tg = String(n.tagName || '').toLowerCase();
+        if (prep === 'none' || prep === undefined) {
+          n.removeAttribute('srcset');
+          n.removeAttribute('imagesrcset');
+        } else if (tg === 'source') {
+          n.setAttribute('srcset', prep);
+          n.removeAttribute('imagesrcset');
+        } else {
+          n.setAttribute('src', prep);
+          n.removeAttribute('srcset');
+          n.removeAttribute('imagesrcset');
+        }
+      }
       var stv = n.getAttribute('style');
       if (!stv) return;
       var stv2 = stv.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) {
@@ -641,8 +843,8 @@
       var appCssText = '/* includes 未包含 css */' + NL;
       var pageCssText2 = '/* includes 未包含 css */' + NL;
     }
-    if (utf8Len(appCssText) > SECTION_MAX_BYTES) { degrade.push('shared/app.css 超 256KB（' + utf8Len(appCssText) + '）'); }
-    if (utf8Len(pageCssText2) > SECTION_MAX_BYTES) { degrade.push('pages/current/page.css 超 256KB（' + utf8Len(pageCssText2) + '）'); }
+    if (utf8Len(appCssText) > SECTION_MAX_BYTES) { degrade.push('shared/app.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(appCssText) + '）'); }
+    if (utf8Len(pageCssText2) > SECTION_MAX_BYTES) { degrade.push('pages/current/page.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(pageCssText2) + '）'); }
 
     var title = doc.title || opts.title || '';
     var entryHtml = [
@@ -704,6 +906,10 @@
       computedRules: st.computedRules,
       assetsInlined: st.assetsInlined,
       assetsSpilled: st.assetsSpilled,
+      // 资源总账：每条 URL 的落点、字节、取字节通道（background=扩展后台 / page=页面兜底）、
+      // 原尺寸与是否降采样。素材库索引与验收都读这一份，不用再猜。
+      assets: assetLog,
+      srcsetPicked: srcsetPickedUrls,
       removedNodes: removedNodes,
       ancestors: ancestors,
       degrade: degrade
