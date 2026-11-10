@@ -63,6 +63,8 @@ function buildFixture(P) {
     x = (x * 1103515245 + 12345) & 0x7fffffff;
     b64 += CH[x & 63];
   }
+  // 超 16 MB 单文件上限的图：走 data: 内联（绕开 fetch 的 12 MB 上限，直奔落盘上限那条分支）
+  const hugeB64 = 'A'.repeat(23 * 1024 * 1024);    // 约 17 MB 字节
 
   document.head.innerHTML = '<title>self-check fixture</title><style>' + [
     ':root{--dsw-accent:#4a7bd0;--dsw-fg:rgb(24,24,27);--dsw-radius:12px;--dsw-gap:16px;--dsw-shadow:0 2px 8px rgba(0,0,0,.2);}',
@@ -83,6 +85,15 @@ function buildFixture(P) {
     // 抽屉形态：定位规则只写在样式表里（真实事故里那份表跨域取不到）。这些必须被固化成
     // 元素规则，否则抓下来抽屉落回文档流、整页往下压。
     '.drawerlike{position:fixed;top:0;left:0;transform:translateY(-100%);z-index:30;overflow:auto;width:200px;height:40px;}',
+    // 3 MB woff 与 5 MB ttf：旧上限 2 MB 会在浏览器侧就把它们截掉（真实事故：教务页
+    // 2.3 MB 的 woff 与 4.2 MB 的 ttf 根本没落盘）。上限抬到 16 MB 后两条都必须留下。
+    '@font-face{font-family:BigWoff;src:url(/big-3mb.woff) format("woff");}',
+    '@font-face{font-family:BigTtf;src:url(/big-5mb.ttf) format("truetype");}',
+    // 头像形态：Angular 的 <avatar src> 指令，图片 404 之后退回内联 SVG 兜底图标。
+    // 旧代码取不到 src 的字节就把整个 <avatar> 摘掉，这块 SVG 跟着没了。
+    '.avatar{width:40px;height:40px;border-radius:50%;overflow:hidden;display:flex;color:#20bec8}',
+    '.avatar-svg{display:flex;width:100%;height:100%;overflow:hidden}',
+    '.avatar-svg svg{display:block;width:100%;height:100%;overflow:hidden}',
     // 单位矩阵 = 视觉上没动，和 transform:none 一样不许写进块。
     '.noopmove{position:relative;transform:translateX(0);top:auto;left:auto;}'
   ].join('') + '</style>';
@@ -100,6 +111,14 @@ function buildFixture(P) {
     '<a id="plainlink" href="/y">普通链接</a>' +
     '<a id="vuelink" :href="\'/z\'">vue 链接</a></p>' +
     '<svg width="20" height="20"><use id="svguse" xlink:href="#icon"></use></svg>' +
+    // 头像：<avatar src> 指向一个 404 的地址，里面的内联 SVG 是唯一可见内容。
+    '<div class="avatar" id="avatarbox"><avatar id="avatarels" src="/user/avatarSmallUrl">' +
+    '<span class="avatar-svg svg-icon"><svg id="avatarsvg" viewBox="0 0 40 40" fill="currentColor" xmlns="http://www.w3.org/2000/svg">' +
+    '<circle id="avatarcircle" cx="20" cy="20" r="19" fill="white" stroke="currentColor" stroke-width="2"></circle>' +
+    '<path id="avatarpath" fill-rule="evenodd" d="M20 9C16.5 9 13.8 12 13.8 15.4V16.5Z" fill="currentColor"></path>' +
+    '</svg></span></avatar></div>' +
+    // 单文件超 16 MB：必须仍然丢掉，且理由写清阈值
+    '<img id="hugeimg" src="data:image/png;base64,' + hugeB64 + '">' +
     '<div id="bigbox"></div>' +
     '</main>';
   const big = document.createElement('img');
@@ -281,13 +300,23 @@ async function runExtract(s, opts) {
   const light = r.result.value;
   if (!light || !Array.isArray(light.files)) throw new Error('extract 没有返回 files');
   const files = [];
+  // 分片取回：单个 5 MB 字体的 base64 有 6.7 MB，一次 returnByValue 装不下（实测 3.7MB 能过、
+  // 5MB 挂住），所以按 1 MB 字符切片取。
+  const CHUNK = 1024 * 1024;
+  const sliceExpr = (p, off, len) => '(function () { var o = globalThis.__dshOut; for (var i = 0; i < o.files.length; i++) {'
+    + ' if (o.files[i].path === ' + JSON.stringify(p) + ') return o.files[i].content.slice(' + off + ', ' + (off + len) + '); } return null; })()';
   for (const meta of light.files) {
-    const g = await s.send('Runtime.evaluate', {
-      expression: '(function () { var o = globalThis.__dshOut; for (var i = 0; i < o.files.length; i++) { if (o.files[i].path === ' + JSON.stringify(meta.path) + ') return o.files[i].content; } return null; })()',
-      returnByValue: true
-    });
-    if (g.exceptionDetails) throw new Error('取回 ' + meta.path + ' 的内容失败：' + JSON.stringify(g.exceptionDetails));
-    files.push({ path: meta.path, bytes: meta.bytes, base64: meta.base64, content: g.result.value });
+    let content = '', off = 0;
+    for (;;) {
+      const g = await s.send('Runtime.evaluate', { expression: sliceExpr(meta.path, off, CHUNK), returnByValue: true });
+      if (g.exceptionDetails) throw new Error('取回 ' + meta.path + ' 的内容失败：' + JSON.stringify(g.exceptionDetails));
+      const part = g.result.value;
+      if (part === null || part === undefined) throw new Error('取回 ' + meta.path + ' 的内容失败：null');
+      content += part;
+      if (part.length < CHUNK) break;
+      off += CHUNK;
+    }
+    files.push({ path: meta.path, bytes: meta.bytes, base64: meta.base64, content: content });
   }
   return { files: files, report: light.report };
 }
@@ -326,6 +355,9 @@ async function main() {
       // 反例：普通页面，正文就在顶层文档里，没有任何 frame —— 不许喊 FRAME SHELL。
       '/normal.html': { mime: 'text/html', bytes: Buffer.from('<!doctype html><html><head><meta charset="utf-8"><title>normal page</title><style>body{margin:0;font-family:system-ui}main{padding:24px}h1{margin:0 0 12px}p{margin:0 0 8px}</style></head><body><main><h1>普通页面</h1><p>这一页的正文就在顶层文档里，没有任何 frame。</p><p>第二段用来凑够可见元素数。</p><ul><li>一</li><li>二</li><li>三</li></ul></main></body></html>', 'utf8') },
       '/static/probe.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(16, '#3355ff'), 'utf8') },
+      // 两个「旧的 2 MB 上限会截掉」的字体：3 MB woff 与 5 MB ttf（真实事故的同类）。
+      '/big-3mb.woff': { mime: 'font/woff', bytes: Buffer.alloc(3 * 1024 * 1024, 0x41) },
+      '/big-5mb.ttf': { mime: 'font/ttf', bytes: Buffer.alloc(5 * 1024 * 1024, 0x42) },
     });
     srv = started.server;
     const hostA = 'http://127.0.0.1:' + started.port;
@@ -539,6 +571,62 @@ async function main() {
       'ng-href=' + JSON.stringify(ngHref) + '，href=' + JSON.stringify(plainHref) +
         '，:href=' + JSON.stringify(vueHref) + '，xlink:href=' + JSON.stringify(svgHref) +
         '（期望 ' + JSON.stringify(hostA + '/x') + '、' + JSON.stringify(hostA + '/y') + '、' + JSON.stringify(vueWant) + '、"#icon"）');
+
+    // ---- 15b. 取不到字节的 src 不许连子树一起删（真实事故：头像的内联 SVG 被摘掉）----
+    // 教务页三处头像都是 <avatar src="/user/avatarSmallUrl">，网址 404 后 Angular 已经退回
+    // 内联 SVG 兜底图标；旧代码把整个 <avatar> 删掉，块里头像全空白、CSS 里留下 3×5 条孤儿规则。
+    const circleTags = entry.content.match(/<circle[^>]*>/g) || [];
+    const circleTag = circleTags[0] || '';
+    const avatarTag = (/<avatar[^>]*>/.exec(entry.content) || [''])[0];
+    const circleAttrs = ['cx="20"', 'cy="20"', 'r="19"', 'fill="white"', 'stroke="currentColor"', 'stroke-width="2"']
+      .every((a) => circleTag.indexOf(a) >= 0);
+    const svgKept = entry.content.indexOf('viewBox="0 0 40 40"') >= 0 && /<path[^>]*fill="currentColor"/.test(entry.content);
+    const avatarKept = avatarTag !== '' && avatarTag.indexOf('avatarSmallUrl') < 0;
+    const keptLine = report.dropped.some((d) => d.indexOf('只摘属性、保留子树') >= 0 && d.indexOf('avatarSmallUrl') >= 0);
+    assert('404 的 src 只摘属性：<avatar> 里的内联 SVG 与 circle 属性完整留下',
+      circleTags.length === 1 && circleAttrs && svgKept && avatarKept && keptLine,
+      'entry 里 <circle> ' + circleTags.length + ' 处：' + (circleTag || '（缺）') + '；<avatar> ：' + (avatarTag || '（缺）') +
+        '；svg viewBox=' + (entry.content.indexOf('viewBox="0 0 40 40"') >= 0) + '；dropped 记了「只摘属性」=' + keptLine);
+
+    // ---- 15c. 计算样式规则必须挂得上元素：page.css 里的 [data-dsh-el] 在 entry.html 里 100% 命中 ----
+    const idOf = (s) => ((/"(e\d+)"/.exec(s) || [])[1] || '');
+    const ruleIds = [...new Set((cssText.match(/\[data-dsh-el="e\d+"\]/g) || []).map(idOf))];
+    const entryIds = new Set((entry.content.match(/data-dsh-el="e\d+"/g) || []).map(idOf));
+    const orphanIds = ruleIds.filter((id) => !entryIds.has(id));
+    // computedOrphansDropped > 0 是**正常**的：被 404 删掉的 <img>（#dead、#hugeimg）本来就没有
+    // 产物里的元素，它们那条计算样式规则会被摘掉。断言只要求产出这一侧 100% 对得上。
+    assert('page.css 的每条 [data-dsh-el] 规则都能在 entry.html 里找到对应元素（孤儿规则 = 0）',
+      orphanIds.length === 0 && ruleIds.length > 0 && typeof report.computedOrphansDropped === 'number',
+      '规则 ' + ruleIds.length + ' 条 / entry 里 ' + entryIds.size + ' 个 id / 孤儿 ' + orphanIds.length +
+        (orphanIds.length ? '：' + orphanIds.slice(0, 8).join(',') : '') + '；report.computedOrphansDropped=' + report.computedOrphansDropped);
+
+    // ---- 15d. 单文件上限：常量在源码里必须是 16 MB，内联上限仍是 1.4 MB ----
+    const srcText16 = readFileSync(path.join(HERE, 'extractor.js'), 'utf8');
+    assert('阈值常量：MAX_ASSET_BYTES=16MB，MAX_INLINE_BYTES 仍是 1400KB',
+      /var MAX_ASSET_BYTES = 16 \* 1024 \* 1024;/.test(srcText16) && /var MAX_INLINE_BYTES = 1400 \* 1024;/.test(srcText16),
+      (/var MAX_ASSET_BYTES[^\n]*/.exec(srcText16) || [''])[0] + ' | ' + (/var MAX_INLINE_BYTES[^\n]*/.exec(srcText16) || [''])[0]);
+
+    // ---- 15e. 3 MB woff 与 5 MB ttf 必须落 assets/（旧上限 2 MB 在浏览器侧就截掉了）----
+    const rowOf = (u) => (report.assets || []).find((a) => String(a.url).indexOf(u) >= 0);
+    const w3 = rowOf('/big-3mb.woff');
+    const t5 = rowOf('/big-5mb.ttf');
+    const w3File = w3 && w3.path ? byPath.get(w3.path) : null;
+    const t5File = t5 && t5.path ? byPath.get(t5.path) : null;
+    // 「超内嵌上限 1.4MB，改存 assets/…」是正常的信息行；只有「丢弃 / 超单文件上限」才算真丢。
+    const fontMention = report.dropped.filter((d) => d.indexOf('big-3mb') >= 0 || d.indexOf('big-5mb') >= 0);
+    const fontDropped = fontMention.filter((d) => d.indexOf('丢弃') >= 0 || d.indexOf('超单文件上限') >= 0);
+    assert('3 MB woff 与 5 MB ttf 都落 assets/，dropped 里没有它们',
+      !!w3 && w3.kind === 'file' && w3.bytes === 3145728 && /^assets\/font-\d+\.woff$/.test(String(w3.path)) && !!w3File && bytesOf(w3File) === 3145728 &&
+        !!t5 && t5.kind === 'file' && t5.bytes === 5242880 && /^assets\/font-\d+\.ttf$/.test(String(t5.path)) && !!t5File && bytesOf(t5File) === 5242880 &&
+        fontDropped.length === 0 && !report.dropped.some((d) => d.indexOf('超单文件上限') >= 0 && d.indexOf('字体') >= 0),
+      'woff ' + (w3 ? w3.path + ' ' + bytesOf(w3File) + ' B' : '缺失') + '；ttf ' + (t5 ? t5.path + ' ' + bytesOf(t5File) + ' B' : '缺失') +
+        '；dropped 里提到它们的 ' + fontMention.length + ' 条全是「改存」信息行、真丢 ' + fontDropped.length + ' 条' + (fontDropped.length ? '：' + fontDropped.join(' | ') : ''));
+
+    // ---- 15f. 超 16 MB 的仍然丢掉，理由里写清阈值 ----
+    const hugeDrop = report.dropped.find((d) => d.indexOf('超单文件上限 16MB') >= 0);
+    assert('超 16 MB 的仍然丢弃，理由写明 16MB 阈值',
+      !!hugeDrop && entry.content.indexOf('hugeimg') < 0,
+      hugeDrop || 'dropped 里没有超限记录');
 
     // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
     // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是

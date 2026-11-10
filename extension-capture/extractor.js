@@ -25,9 +25,12 @@
     return s === 'matrix(1,0,0,1,0,0)' || s === 'matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)';
   }
 
-  // 单文件上限与块格式对齐（2 MB）。data: 内嵌另有更紧的一条：base64 会胀 4/3，
-  // 1.4 MB 的字节内嵌后约 1.87 MB，仍在一段 2 MB 之内。
-  var MAX_ASSET_BYTES = 2 * 1024 * 1024;
+  // 单文件上限 16 MB：这是**抓取时**的落盘上限，不是建块时的上限（index.js 的
+  // limits.sectionBytes 是另一条，默认 8 MB）。实测教务页有 2.3 MB 的 woff 与
+  // 4.2 MB 的 ttf，旧值 2 MB 在浏览器侧就把它们截断了——插件侧抬到 8 MB 也管不到这里。
+  var MAX_ASSET_BYTES = 16 * 1024 * 1024;
+  var MAX_ASSET_MB = Math.round(MAX_ASSET_BYTES / 1048576) + 'MB';
+  // 内嵌那条不动：base64 会胀 4/3，1.4 MB 的字节内嵌后约 1.87 MB，仍在一段之内。
   var MAX_INLINE_BYTES = 1400 * 1024;
   // 单边 2000px 的降采样只对长宽比正常的图用；长宽比 ≥ 8 判为雪碧图/长条图，
   // 原尺寸落文件（358x20870 压成 34x2000 等于毁掉）。
@@ -533,6 +536,10 @@
     var computedUsed = 0;
     var elements = [];
     elements = [topEl].concat(Array.prototype.slice.call(topEl.querySelectorAll('*')));
+    // 根元素就是 body 时，body 自己的 data-dsh-el 进不了 innerHTML（序列化的是它的
+    // 子节点），那条规则就成了永不命中的孤儿——实测教务页里 16 条孤儿规则的第一条
+    // 就是它。所以 body 那条直接写成 body{}，选择器与产物对得上。
+    var isBody = (topEl === doc.body);
     var capEls = Math.min(elements.length, 600);
     for (var ei = 0; ei < capEls; ei++) {
       var el = elements[ei];
@@ -561,12 +568,12 @@
         decls.push(prop + ':' + val);
       }
       if (!decls.length) continue;
-      var key = 'e' + (ei + 1);
-      var ruleText = '[data-dsh-el="' + key + '"]{' + decls.join(';') + '}';
+      var key = (isBody && ei === 0) ? '' : 'e' + (ei + 1);
+      var ruleText = (key ? '[data-dsh-el="' + key + '"]' : 'body') + '{' + decls.join(';') + '}';
       if (computedUsed + ruleText.length > computedBudget) { degrade.push('computed 段到预算上限，剩 ' + (capEls - ei) + ' 个元素没固化'); break; }
       computedUsed += ruleText.length;
       computedRules.push(ruleText);
-      try { el.setAttribute('data-dsh-el', key); } catch (e) {}
+      if (key) { try { el.setAttribute('data-dsh-el', key); } catch (e) {} }
       st.computedRules++;
     }
     st.elements = elements.length;
@@ -596,8 +603,10 @@
       srcsetPickedUrls.push(keyOf(best));
     });
 
-    var isBody = (topEl === doc.body);
     var deadTags = ['script', 'noscript', 'template', 'iframe', 'object', 'embed', 'link', 'meta', 'style', 'canvas'];
+    // 「删掉它等于一张空图、不影响版式」的替换元素。src 取不到字节时只有这些可以整
+    // 个摘掉；其余元素（含 <avatar src> 这类指令元素）必须留下——它们的内容是可见的。
+    var REPLACED_TAG = { img: 1, source: 1, track: 1, input: 1, video: 1, audio: 1, embed: 1, object: 1, iframe: 1, frame: 1 };
     var removedNodes = 0;
     Array.prototype.slice.call(clone.querySelectorAll(deadTags.join(','))).forEach(function (n) {
       if (n.parentNode) { n.parentNode.removeChild(n); removedNodes++; }
@@ -790,8 +799,8 @@
             out = { kind: 'file', path: fpath, bytes: got.rawLen, mime: mime };
             drop('字体 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，改存 ' + fpath + '：' + absu);
           } else {
-            out = { kind: 'drop', reason: '超单文件上限 2MB' };
-            drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
+            out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
+            drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
           }
         } else {
           var info = await imageSize(doc, got.bytes, mime);
@@ -804,8 +813,8 @@
               out = { kind: 'file', path: spath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
               drop('雪碧图 ' + iw + 'x' + ih + ' 原尺寸落 ' + spath + '（不降采样）：' + absu);
             } else {
-              out = { kind: 'drop', reason: '雪碧图原图超单文件上限 2MB' };
-              drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
+              out = { kind: 'drop', reason: '雪碧图原图超单文件上限 ' + MAX_ASSET_MB };
+              drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
             }
           } else if (got.rawLen <= MAX_INLINE_BYTES && !dimTooBig) {
             out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
@@ -826,8 +835,8 @@
               out = { kind: 'file', path: opath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
               drop('图片 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，原尺寸改存 ' + opath + '：' + absu);
             } else {
-              out = { kind: 'drop', reason: '超单文件上限 2MB' };
-              drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 2MB，丢弃：' + absu);
+              out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
+              drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
             }
           }
         }
@@ -900,13 +909,27 @@
     var cloneNodes = [clone].concat(Array.prototype.slice.call(clone.querySelectorAll('*')));
     cloneNodes.forEach(function (n) {
       if (!n.getAttribute) return;
+      var ntag = String(n.tagName || '').toLowerCase();
       ['src', 'poster'].forEach(function (attr) {
         if (!n.hasAttribute(attr)) return;
         var raw = n.getAttribute(attr) || '';
         var hit = assetMap.get(keyOf(raw));
         if (!hit) return;
         var rep = srcFor('./', hit);
-        if (rep === 'none') { if (n.parentNode) n.parentNode.removeChild(n); return; }
+        if (rep === 'none') {
+          // 字节取不到（404 / 跨域 / 超限）不能连元素一起删。真实事故：教务页三处头像
+          // 都是 <avatar src="/user/avatarSmallUrl">，网址 404 后 Angular 早已退回内联
+          // SVG 兜底图标，而这里把整棵子树摘掉——块里头像全变空白，page.css 里还留下
+          // 3×5 条永不命中的 [data-dsh-el] 规则。只有「替换元素且没有子元素」才删
+          // （等于一张空图，不动版式）；其余只摘属性，把可见内容留下。
+          if (REPLACED_TAG[ntag] && !n.firstElementChild) {
+            if (n.parentNode) n.parentNode.removeChild(n);
+          } else {
+            n.removeAttribute(attr);
+            drop('取不到 ' + attr + ' 的字节，只摘属性、保留子树：' + raw.slice(0, 120));
+          }
+          return;
+        }
         if (rep !== undefined) n.setAttribute(attr, rep);
       });
       // srcset 的最大候选：img 用 src 承载，source 没有 src，把 srcset 收成一条。
@@ -946,6 +969,21 @@
 
     // 7) 三份文件：entry / shared / pages
     var bodyHtml = isBody ? clone.innerHTML : clone.outerHTML;
+
+    // 7.5) 序列化后对账：计算样式规则必须挂在真实存在的元素上。序列化或清理弄丢了节点
+    // （历史事故：404 的 src 把整棵子树删掉），page.css 里就会留下永不命中的
+    // [data-dsh-el] 规则——读块的人分不清是「元素丢了」还是「样式没写」。挂不上的规则
+    // 丢掉并记账（body{} 那条不是按 id 命中的，照旧保留）。
+    var computedOrphans = 0;
+    computedRules = computedRules.filter(function (r) {
+      if (r.indexOf('body{') === 0) return true;
+      var idm = /^\[data-dsh-el="(e\d+)"\]/.exec(r);
+      if (!idm) return true;
+      if (bodyHtml.indexOf('data-dsh-el="' + idm[1] + '"') >= 0) return true;
+      computedOrphans++;
+      return false;
+    });
+    st.computedRules = computedRules.length;
     var appCss = [];
     var fontFaces = pageRules.filter(function (r) { return r.indexOf('@font-face') === 0; });
     var keyframes = pageRules.filter(function (r) { return r.indexOf('@keyframes') === 0; });
@@ -1021,6 +1059,8 @@
       varsFromElements: varsFromElements,
       elements: st.elements,
       computedRules: st.computedRules,
+      // 序列化后对不上的 [data-dsh-el] 规则条数（正常恒为 0；非 0 就是有节点在产物里丢了）
+      computedOrphansDropped: computedOrphans,
       assetsInlined: st.assetsInlined,
       assetsSpilled: st.assetsSpilled,
       // 资源总账：每条 URL 的落点、字节、取字节通道（background=扩展后台 / page=页面兜底）、
