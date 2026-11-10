@@ -57,6 +57,10 @@ async function fetchBytesOnce(url) {
     if (buf.length > FETCH_MAX_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(FETCH_MAX_BYTES / 1048576) + 'MB')
     const mime = String(res.headers.get('content-type') || '').split(';')[0].trim()
     return { ok: true, base64: bytesToBase64(buf), mime: mime, bytes: buf.length, via: 'background' }
+  } catch (e) {
+    // 超时被中止时报的是 AbortError，写进 report.dropped 没人看得懂，换成一句人话
+    if (ctl.signal.aborted) throw new Error('取字节超时 ' + Math.round(FETCH_TIMEOUT_MS / 1000) + 's')
+    throw e
   } finally {
     clearTimeout(limit)
   }
