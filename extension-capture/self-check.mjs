@@ -65,6 +65,15 @@ async function buildFixture(P) {
   }
   // 超 16 MB 单文件上限的图：走 data: 内联（绕开 fetch 的 12 MB 上限，直奔落盘上限那条分支）
   const hugeB64 = 'A'.repeat(23 * 1024 * 1024);    // 约 17 MB 字节
+  // 去重夹具用的两小份「字体字节」：内容无所谓，只要两份不同、且各自可重复。
+  const mkB64 = (seed, n) => {
+    let s = '';
+    let y = seed;
+    while (s.length < n) { y = (y * 1103515245 + 12345) & 0x7fffffff; s += CH[y & 63]; }
+    return s;
+  };
+  const dupFontB64 = mkB64(424242, 240);
+  const altFontB64 = mkB64(777777, 240);
 
   document.head.innerHTML = '<title>self-check fixture</title><style>' + [
     ':root{--dsw-accent:#4a7bd0;--dsw-fg:rgb(24,24,27);--dsw-radius:12px;--dsw-gap:16px;--dsw-shadow:0 2px 8px rgba(0,0,0,.2);}',
@@ -78,6 +87,19 @@ async function buildFixture(P) {
     '.hero{background-image:url(' + noise + ');background-size:cover;height:120px;}',
     '@font-face{font-family:CapTest;src:url(data:font/woff2;base64,' + b64 + ') format("woff2");}',
     '@keyframes pulse{0%{opacity:.5}100%{opacity:1}}',
+    // 去重夹具（见 extractor 的 dedupeAtRules）：
+    //   同 family/style/weight 同字节的两条，第一条故意不带 font-display、第二条带 ——
+    //   必须合成一条，且留下带 font-display 的那条；
+    //   同 family/style/weight 但字节不同（子集不同）的 —— 两条都得留；
+    //   同名同 body 的两条动画 —— 合成一条；同名不同 body 的两条 —— 都留。
+    '@font-face{font-family:DupFaceNoDisplay;src:url(data:font/woff2;base64,' + dupFontB64 + ') format("woff2");}',
+    '@font-face{font-family:DupFaceNoDisplay;src:url(data:font/woff2;base64,' + dupFontB64 + ') format("woff2");font-display:swap;}',
+    '@font-face{font-family:SubsetFace;src:url(data:font/woff2;base64,' + dupFontB64 + ') format("woff2");}',
+    '@font-face{font-family:SubsetFace;src:url(data:font/woff2;base64,' + altFontB64 + ') format("woff2");}',
+    '@keyframes dupkf{0%{opacity:.1}100%{opacity:.9}}',
+    '@keyframes dupkf{0%{opacity:.1}100%{opacity:.9}}',
+    '@keyframes sameNameDiffBody{0%{opacity:.2}100%{opacity:.8}}',
+    '@keyframes sameNameDiffBody{0%{opacity:.3}100%{opacity:.7}}',
     '.thumb{width:240px;height:120px;object-fit:cover;border-radius:8px;}',
     // 根绝对引用（真实事故形态）：CSS 里写 url(/static/…)。它必须被改写成本地段，
     // 不能因为调用方传了 includes 就原样留在产物里。
@@ -774,6 +796,28 @@ async function main() {
         '；改后 wrapper：' + (shadowWrap[0] || '（缺 wrapper）') + '；按钮：' + (kfBtn || '（缺）') +
         '；page.css 规则：' + (kfRule[0] || '（缺）') + '；report.shadowRoots=' + JSON.stringify(srInfo));
 
+    // ---- 15i. at-rule 去重：字体按「字节」认、动画按「name+body」认 --------------
+    // 真实事故：客服组件的 shadow 样式表把同一批 KaTeX 字形又 push 一遍，app.css 的
+    // @font-face 69→89、@keyframes 87→266，块涨 873,584 B。去重只许动这两类 at-rule，
+    // 且宁可不合也别合错：同 family/style/weight 但字节不同（子集不同）的两条必须都留。
+    const appText = byPath.get('shared/app.css') ? String(byPath.get('shared/app.css').content) : '';
+    const faceOf = (fam) => (appText.match(new RegExp('@font-face\\{[^}]*font-family:\\s*"?\\s*' + fam + '[^}]*\\}', 'g')) || []);
+    const kfOf = (name) => (appText.match(new RegExp('@keyframes ' + name + '\\{(?:[^{}]*\\{[^}]*\\})*\\}', 'g')) || []);
+    const dupFace = faceOf('DupFaceNoDisplay');
+    const subsetFace = faceOf('SubsetFace');
+    const dupKf = kfOf('dupkf');
+    const diffKf = kfOf('sameNameDiffBody');
+    assert('at-rule 去重：同字同字节合一且留 font-display、字节不同两条都留、同名同 body 合一、同名不同 body 留两条',
+      dupFace.length === 1 && /font-display:swap/.test(dupFace[0]) &&
+        subsetFace.length === 2 && subsetFace[0] !== subsetFace[1] &&
+        dupKf.length === 1 &&
+        diffKf.length === 2 && diffKf[0] !== diffKf[1] &&
+        report.fontFacesDeduped >= 1 && report.keyframesDeduped >= 1,
+      'DupFaceNoDisplay ' + dupFace.length + ' 条（' + (dupFace[0] || '（缺）') + '）；SubsetFace ' + subsetFace.length +
+        ' 条（字节不同必须 2 条）；dupkf ' + dupKf.length + ' 条；sameNameDiffBody ' + diffKf.length + ' 条' +
+        '；report 去重计数 @font-face ' + report.fontFacesDeduped + ' / @keyframes ' + report.keyframesDeduped +
+        '；app.css 里 @font-face ' + (appText.match(/@font-face/g) || []).length + ' 条 / @keyframes ' + (appText.match(/@keyframes/g) || []).length + ' 条');
+
     // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
     // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是
     // 自己猜三轮、再问用户三选一，白等 1 分 54 秒。这里证明两件事：report.frames 点名了
@@ -872,7 +916,7 @@ async function main() {
     console.log('== report 摘要 ==');
     console.log('  origin / title    ' + report.origin + ' / ' + report.title);
     console.log('  规则              总 ' + report.rulesTotal + ' · 命中 ' + report.rulesKept + ' · 死选择器丢 ' + report.rulesDead + ' · 空规则丢 ' + report.rulesEmpty);
-    console.log('  样式表 / 动画       ' + report.sheets + ' 张 / @keyframes ' + report.keyframes + ' / @font-face ' + report.fontFaces);
+    console.log('  样式表 / 动画       ' + report.sheets + ' 张 / @keyframes ' + report.keyframes + '（去重掉 ' + report.keyframesDeduped + '）/ @font-face ' + report.fontFaces + '（去重掉 ' + report.fontFacesDeduped + '）');
   console.log('  跨域样式表       后台取回 ' + (report.sheetsFetchedViaBackground ? report.sheetsFetchedViaBackground.count : 0) +
     ' 张，读不到 ' + report.sheetsFailed + ' 张' +
     (report.sheetsFetchedViaBackground ? '：' + report.sheetsFetchedViaBackground.items.map((i) => i.href + ' ' + i.bytes + 'B').join(' | ') : ''));

@@ -385,6 +385,59 @@
   var SHADOW_ELEMENTS_MAX = 6000;
   var SHADOW_NEST_MAX = 8;
 
+  // ---- @font-face / @keyframes 去重 ---------------------------------------
+  // shadow root 展开后，同一批字体与动画会被再 push 进 pageRules 一遍（客服组件 AirChatbot
+  // 的 8 张 shadow 样式表），而第 7 步又把这两类 at-rule 无条件全部提到 shared/app.css。
+  // 真实事故：@font-face 69→89、@keyframes 87→266，块涨 873,584 B，其中 96.6% 是同一批
+  // KaTeX 字形的又一/第三份拷贝。
+  // 键（保守优先，宁可不合也别合错）：
+  //   @font-face = (font-family, font-style, font-weight, src 里每个字体文件的字节)
+  //                字节相同才算同一份字；family/style/weight 相同但字节不同（子集不同）的是
+  //                两条不同的字，必须都留。键相同时优先留带 font-display 的那条。
+  //   @keyframes = name + body 文本（首尾去空白、空白折叠）——同名不同 body 全留。
+  // 只作用于这两类 at-rule：元素规则与死选择器逻辑一律不碰。
+  var SRC_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
+  /** 取 @font-face 里的属性值。值里不会有 ';'（src 里的 data: 只有 ";base64,"），按 ; 与 } 截。 */
+  var ffProp = function (rule, name) {
+    var m = new RegExp('(?:^|[;{])\\s*' + name + '\\s*:\\s*([^;}]+)', 'i').exec(rule);
+    return m ? m[1].trim() : '';
+  };
+  /**
+   * byteIdOfUrl(url) => 该字体的字节身份（同字节必得同串，不同字节必不同串）。
+   * 抓取时由 assetMap 给：data: 取 base64 正文，落文件的取落盘 base64 —— 两条路都是
+   * toBase64(原始字节)，所以内联与落文件两种形态的同一份字认得出是同一份。
+   */
+  function dedupeAtRules(fontFaceRules, keyframeRules, byteIdOfUrl) {
+    var outFaces = [], faceDisplay = [], faceAt = new Map(), outKf = [], kfSeen = new Set();
+    var lostFaces = 0, lostKf = 0, i, j, m;
+    for (i = 0; i < fontFaceRules.length; i++) {
+      var rule = fontFaceRules[i];
+      var ids = [];
+      SRC_URL_RE.lastIndex = 0;
+      while ((m = SRC_URL_RE.exec(rule))) ids.push(byteIdOfUrl(m[2]));
+      var key = ffProp(rule, 'font-family') + '|' + (ffProp(rule, 'font-style') || 'normal') + '|' +
+        (ffProp(rule, 'font-weight') || '400') + '|' + ids.join(',');
+      var hasDisplay = /(?:^|[;{])\s*font-display\s*:/i.test(rule);
+      var at = faceAt.get(key);
+      if (at === undefined) {
+        faceAt.set(key, outFaces.length); outFaces.push(rule); faceDisplay.push(hasDisplay);
+        continue;
+      }
+      lostFaces++;
+      if (hasDisplay && !faceDisplay[at]) { outFaces[at] = rule; faceDisplay[at] = true; }
+    }
+    for (j = 0; j < keyframeRules.length; j++) {
+      var t = keyframeRules[j];
+      var b = t.indexOf('{');
+      // ponytail: 空白折叠对引号里的内容也生效；两条 body 必须先逐字相同才可能撞键，
+      // 失真场景只有 content:"a  b" 这类串内空格，撞上也只是少留一条等价动画。
+      var kk = b < 0 ? t : t.slice(0, b) + '{' + t.slice(b + 1).replace(/\s+/g, ' ').trim();
+      if (kfSeen.has(kk)) { lostKf++; continue; }
+      kfSeen.add(kk); outKf.push(t);
+    }
+    return { fontFaces: outFaces, keyframes: outKf, fontFacesDeduped: lostFaces, keyframesDeduped: lostKf };
+  }
+
   // ---- 主流程 -------------------------------------------------------------
   async function extract(doc, opts) {
     opts = opts || {};
@@ -392,6 +445,8 @@
       rulesTotal: 0, rulesKept: 0, rulesDead: 0, rulesEmpty: 0,
       declarationsDropped: 0, customPropsDropped: 0,
       fontFaces: 0, keyframes: 0, sheets: 0, sheetsFailed: 0,
+      // 去重掉的重复 at-rule 条数（见 dedupeAtRules；只算这两类，别的一律不碰）
+      fontFacesDeduped: 0, keyframesDeduped: 0,
       elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0,
       // 令牌固化：解析不到的名字不再静默丢声明，而是按浏览器的实际行为写成 unset 并记名
       declarationsInvalid: 0, invalidAtComputedValue: [],
@@ -1340,12 +1395,34 @@
     var fontFaces = pageRules.filter(function (r) { return r.indexOf('@font-face') === 0; });
     var keyframes = pageRules.filter(function (r) { return r.indexOf('@keyframes') === 0; });
     var rest = pageRules.filter(function (r) { return r.indexOf('@font-face') !== 0 && r.indexOf('@keyframes') !== 0; });
+    // 字体字节的身份：assetMap 的落点已经定了（第 5 步跑完、内嵌预算也改判过了），
+    // data: 取 base64 正文，落文件的取落盘的那份 base64。两条路都是 toBase64(原始字节)，
+    // 所以同一份字不管被内联还是落成 assets/，认出来的是同一个串。
+    var spoolBytes = new Map();
+    assetFiles.forEach(function (f) { if (f.base64) spoolBytes.set(f.path, f.content); });
+    var byteIds = new Map();
+    var byteIdOfUrl = function (u) {
+      var k = keyOf(u);
+      if (byteIds.has(k)) return byteIds.get(k);
+      var hit = assetMap.get(k), id = 'none';
+      if (hit && hit.kind === 'data') {
+        var bi = hit.uri.indexOf('base64,');
+        id = bi >= 0 ? hit.uri.slice(bi + 7) : hit.uri;
+      } else if (hit && hit.kind === 'file') {
+        id = spoolBytes.get(hit.path) || ('file:' + hit.path);
+      }
+      byteIds.set(k, id);
+      return id;
+    };
+    var deduped = dedupeAtRules(fontFaces, keyframes, byteIdOfUrl);
+    st.fontFacesDeduped = deduped.fontFacesDeduped;
+    st.keyframesDeduped = deduped.keyframesDeduped;
     appCss = [
       '/* dsh-page-capture: 基线（重置 + 字体 + 动画）——跨页可复用 */',
       '*,*::before,*::after{box-sizing:border-box}',
       'html,body{margin:0}',
       'img,svg,video,canvas{max-width:100%;height:auto}'
-    ].concat(fontFaces).concat(keyframes);
+    ].concat(deduped.fontFaces).concat(deduped.keyframes);
     var pageCssBody = rest.length ? rest : ['/* 本页没有命中任何样式表规则 */'];
     var pageCss = ['/* dsh-page-capture: 本页样式表命中规则 + 元素计算样式固化 */'].concat(pageCssBody).concat(computedRules);
     var appCssText = subCss(appCss.join(NL), '../') + NL;
@@ -1397,6 +1474,11 @@
       sheetsFailed: st.sheetsFailed,
       fontFaces: st.fontFaces,
       keyframes: st.keyframes,
+      // 去重掉的重复条数：实测 zju-r2-a 那份材料 @font-face 89→32、@keyframes 266→169，
+      // 重建块 17,774,100 → 15,491,282 B（同宽渲染逐像素相同）。别只看 fontFaces 那条——
+      // 那是「碰到的条数」，写进 app.css 的是去重之后的那份。
+      fontFacesDeduped: st.fontFacesDeduped,
+      keyframesDeduped: st.keyframesDeduped,
       customPropsDropped: st.customPropsDropped,
       declarationsDropped: st.declarationsDropped,
       declarationsInvalid: st.declarationsInvalid,
@@ -1476,5 +1558,7 @@
     return { files: files, report: report };
   }
 
-  globalThis.dshPageCapture = { extract: extract, version: '0.1.0' };
+  // dedupeAtRules 也挂出去：离线拿现成材料的 app.css 重跑同一份去重逻辑（验收脚本用），
+  // 不给它就没有第二条路能在不重抓页面的前提下量出「改后」的计数与字节。
+  globalThis.dshPageCapture = { extract: extract, dedupeAtRules: dedupeAtRules, version: '0.1.0' };
 })();
