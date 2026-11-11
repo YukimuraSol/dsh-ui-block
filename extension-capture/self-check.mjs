@@ -238,6 +238,30 @@ const REMOTE_CSS = [
 ].join('\n');
 const REMOTE_IMPORTED_CSS = '#tagline{opacity:.99;letter-spacing:.02em}';
 
+// ---- 缺陷 A 夹具：两个跨域 <link>（同一台「另一个端口」的服务）-----------
+// 一张 200（必须取回、规则进产物），一张 404（必须出现在 report.sheetsFailedItems
+// 与 capture_page 文本里，带 href + HTTP 码 + 可照做的指引）。页面自己还带一条
+// @layer 语句：认不出的 at-rule 只许进 atRulesUnsupported，绝不许混进 sheetsFailed。
+const SHEETS_OK_CSS = [
+  '#savebtn{background-color:rgb(62,126,234);color:#ffffff;border:0;padding:8px 16px}',
+  '.dead-in-port2{color:#0f0}'
+].join(NL);
+function sheetsPage(port2) {
+  return '<!doctype html><html><head><meta charset="utf-8"><title>two cross-origin links</title>' +
+    '<style>@layer reset, theme;' +
+    'html,body{margin:0;font-family:system-ui}' +
+    'main{padding:24px}' +
+    '.fallback-btn{background-color:hsl(0,0%,25%);color:#fff;border:0;padding:8px 16px}</style>' +
+    '<link rel="stylesheet" href="http://127.0.0.1:' + port2 + '/styles/ok.css">' +
+    '<link rel="stylesheet" href="http://127.0.0.1:' + port2 + '/styles/gone.css">' +
+    '</head><body><main><h1>两张跨域样式表</h1>' +
+    '<button class="fallback-btn" id="savebtn">保存</button><p id="note">一张能取，一张 404</p></main></body></html>';
+}
+// ---- 缺陷 B 夹具：一页多张大图，把内嵌总量顶过预算 → 必须有条目从 data: 改判成文件 ----
+const SPILL_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>inline budget spill</title>' +
+  '<style>html,body{margin:0}main{padding:24px}.shot{display:block;width:180px;height:180px;margin:8px 0}</style>' +
+  '</head><body><main><h1>内嵌预算溢出</h1><div id="shots"></div></main></body></html>';
+
 // 真·长条图（358x20870）：在页面里用 canvas 造，交给本地服务发出去。
 // 这张图如果被「单边超 2000px 就重编码」，会压成 34x2000，等于毁掉。
 function makeSpritePng() {
@@ -272,7 +296,8 @@ function startServer(routes) {
 async function bgFetchBytes(url) {
   try {
     const res = await fetch(url);
-    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+    // 与 background.js 同一口径：非 2xx 时把 HTTP 码带回去（report.sheetsFailedItems.httpStatus）
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : ''), httpStatus: res.status };
     const buf = Buffer.from(await res.arrayBuffer());
     return { ok: true, base64: buf.toString('base64'), mime: String(res.headers.get('content-type') || '').split(';')[0].trim(), bytes: buf.length };
   } catch (e) {
@@ -282,21 +307,26 @@ async function bgFetchBytes(url) {
 
 // 把「内容脚本 → 后台 → 字节回传」这条消息链在离线环境里搭出来：
 // 页面用 Runtime.addBinding 打请求，Node 取字节，再把答复写回页面里的 Promise。
+// 绑定与监听只装一次；页面侧的 __dshBgDeliver / fetchBytes 每次导航后都要重装。
+let bgSeamBound = false
 async function installBgSeam(s, cdp) {
-  await s.send('Runtime.addBinding', { name: '__dshBgFetch' });
-  s.ws.addEventListener('message', (ev) => {
-    let m;
-    try { m = JSON.parse(ev.data); } catch (e) { return; }
-    if (!m || m.method !== 'Runtime.bindingCalled' || !m.params || m.params.name !== '__dshBgFetch') return;
-    (async () => {
-      let req;
-      try { req = JSON.parse(m.params.payload); } catch (e) { return; }
-      const out = await bgFetchBytes(String(req.url || ''));
-      await s.send('Runtime.evaluate', {
-        expression: 'globalThis.__dshBgDeliver(' + JSON.stringify(String(req.id)) + ', ' + JSON.stringify(JSON.stringify(out)) + ')'
-      }).catch(() => {});
-    })();
-  });
+  if (!bgSeamBound) {
+    bgSeamBound = true
+    await s.send('Runtime.addBinding', { name: '__dshBgFetch' });
+    s.ws.addEventListener('message', (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (!m || m.method !== 'Runtime.bindingCalled' || !m.params || m.params.name !== '__dshBgFetch') return;
+      (async () => {
+        let req;
+        try { req = JSON.parse(m.params.payload); } catch (e) { return; }
+        const out = await bgFetchBytes(String(req.url || ''));
+        await s.send('Runtime.evaluate', {
+          expression: 'globalThis.__dshBgDeliver(' + JSON.stringify(String(req.id)) + ', ' + JSON.stringify(JSON.stringify(out)) + ')'
+        }).catch(() => {});
+      })();
+    });
+  }
   await cdp.evaluate(s, () => {
     const pending = new Map();
     let seq = 0;
@@ -310,7 +340,12 @@ async function installBgSeam(s, cdp) {
     };
     globalThis.dshPageCapture.fetchBytes = (url) => new Promise((resolve, reject) => {
       const id = 'r' + (++seq);
-      pending.set(id, (r) => (r && r.ok ? resolve(r) : reject(new Error((r && r.error) || '后台取字节失败'))));
+      pending.set(id, (r) => {
+        if (r && r.ok) { resolve(r); return; }
+        const err = new Error((r && r.error) || '后台取字节失败');
+        if (r && r.httpStatus !== undefined) err.httpStatus = r.httpStatus;
+        reject(err);
+      });
       globalThis.__dshBgFetch(JSON.stringify({ id, url }));
     });
   });
@@ -415,10 +450,18 @@ async function main() {
   const s = browser.session;
   let failed = 0;
   let srv = null;
+  let srv2 = null;
   try {
     // 0) 先造素材再起服务：长条图在页面里生成，字节交给本地 http 服务发出去。
     const spriteBytes = Buffer.from(String(await cdp.evaluate(s, makeSpritePng)).split(',')[1], 'base64');
     const logoBytes = Buffer.from(LOGO_SVG, 'utf8');
+    // 缺陷 A：跨域样式表要真的在**另一个端口**上。这台小服务只发两张表，一张 200 一张 404
+    // （没有的路径一律 404，和真站那种「链接失效」一模一样）。
+    const started2 = await startServer({
+      '/styles/ok.css': { mime: 'text/css', bytes: Buffer.from(SHEETS_OK_CSS, 'utf8') },
+    });
+    srv2 = started2.server;
+    const port2 = started2.port;
     const started = await startServer({
       '/logo.svg': { mime: 'image/svg+xml', bytes: logoBytes },
       '/styles/drawer.css': { mime: 'text/css', bytes: Buffer.from(REMOTE_CSS, 'utf8') },
@@ -442,6 +485,9 @@ async function main() {
       // 两个「旧的 2 MB 上限会截掉」的字体：3 MB woff 与 5 MB ttf（真实事故的同类）。
       '/big-3mb.woff': { mime: 'font/woff', bytes: Buffer.alloc(3 * 1024 * 1024, 0x41) },
       '/big-5mb.ttf': { mime: 'font/ttf', bytes: Buffer.alloc(5 * 1024 * 1024, 0x42) },
+      // 缺陷 A / B 的两张夹具页（A 的跨域表在另一台服务、另一个端口上）
+      '/sheets.html': { mime: 'text/html', bytes: Buffer.from(sheetsPage(port2), 'utf8') },
+      '/spill.html': { mime: 'text/html', bytes: Buffer.from(SPILL_PAGE, 'utf8') },
     });
     srv = started.server;
     const hostA = 'http://127.0.0.1:' + started.port;
@@ -594,10 +640,15 @@ async function main() {
 
     // ---- 9c. 取回失败：退回现状（dropped），抓取照旧完成 --------------------
     const badDrop = (report.dropped || []).find((d) => d.indexOf('读不到样式表（跨域）') >= 0 && d.indexOf('nope.css') >= 0);
-    assert('跨域样式表取回失败：退回 dropped 那条，整次抓取仍 ok（files 完整、字节账对得上）',
-      !!badDrop && !bgHrefs.some((h) => h.indexOf('nope.css') >= 0) &&
+    // 缺陷 A：失败的这张表必须结构化记账（href + reason + via + HTTP 码），不再只有一句「1 张失败」。
+    const badRow = (report.sheetsFailedItems || []).find((it) => String(it.href).indexOf('nope.css') >= 0);
+    assert('跨域样式表取回失败：dropped 那条 + report.sheetsFailedItems 都点名 href 与 HTTP 码，整次抓取仍 ok',
+      !!badDrop && !!badRow && badRow.via === 'background' && badRow.httpStatus === 404 && /404/.test(String(badRow.reason)) &&
+        report.sheetsFailed === 1 && (report.sheetsFailedItems || []).length === 1 &&
+        !bgHrefs.some((h) => h.indexOf('nope.css') >= 0) &&
         files.length > 0 && report.bytes === sum,
-      'dropped 那条=' + JSON.stringify(badDrop) + '；files ' + files.length + ' 个 / report.bytes ' + report.bytes + ' / 实测 ' + sum + ' B');
+      'sheetsFailedItems=' + JSON.stringify(report.sheetsFailedItems) +
+        '；dropped 那条=' + JSON.stringify(badDrop) + '；files ' + files.length + ' 个 / report.bytes ' + report.bytes + ' / 实测 ' + sum + ' B');
 
     // ---- 10. 358x20870 长条图：原尺寸落文件，不降采样 ---------------------
     const sprRow = (report.assets || []).find((a) => String(a.url).indexOf('/sprite.png') >= 0);
@@ -716,7 +767,9 @@ async function main() {
       .every((a) => circleTag.indexOf(a) >= 0);
     const svgKept = entry.content.indexOf('viewBox="0 0 40 40"') >= 0 && /<path[^>]*fill="currentColor"/.test(entry.content);
     const avatarKept = avatarTag !== '' && avatarTag.indexOf('avatarSmallUrl') < 0;
-    const keptLine = report.dropped.some((d) => d.indexOf('只摘属性、保留子树') >= 0 && d.indexOf('avatarSmallUrl') >= 0);
+    // 「只摘属性、保留子树」是一条信息行（元素保住了、只掉了一个属性），归 notices，不归 dropped：
+    // dropped 只放真丢，混进去就等于虚报损失。
+    const keptLine = (report.notices || []).some((d) => d.indexOf('只摘属性、保留子树') >= 0 && d.indexOf('avatarSmallUrl') >= 0);
     assert('404 的 src 只摘属性：<avatar> 里的内联 SVG 与 circle 属性完整留下',
       circleTags.length === 1 && circleAttrs && svgKept && avatarKept && keptLine,
       'entry 里 <circle> ' + circleTags.length + ' 处：' + (circleTag || '（缺）') + '；<avatar> ：' + (avatarTag || '（缺）') +
@@ -746,15 +799,19 @@ async function main() {
     const t5 = rowOf('/big-5mb.ttf');
     const w3File = w3 && w3.path ? byPath.get(w3.path) : null;
     const t5File = t5 && t5.path ? byPath.get(t5.path) : null;
-    // 「超内嵌上限 1.4MB，改存 assets/…」是正常的信息行；只有「丢弃 / 超单文件上限」才算真丢。
+    // 「超内嵌上限 1.4MB，改存 assets/…」现在是 report.spilled 里的一条，不再是 dropped。
     const fontMention = report.dropped.filter((d) => d.indexOf('big-3mb') >= 0 || d.indexOf('big-5mb') >= 0);
     const fontDropped = fontMention.filter((d) => d.indexOf('丢弃') >= 0 || d.indexOf('超单文件上限') >= 0);
-    assert('3 MB woff 与 5 MB ttf 都落 assets/，dropped 里没有它们',
+    const fontSpilled = (report.spilled || []).filter((row) => String(row.url).indexOf('big-3mb') >= 0 || String(row.url).indexOf('big-5mb') >= 0);
+    assert('3 MB woff 与 5 MB ttf 都落 assets/，dropped 里没有它们（改存条目进 report.spilled）',
       !!w3 && w3.kind === 'file' && w3.bytes === 3145728 && /^assets\/font-\d+\.woff$/.test(String(w3.path)) && !!w3File && bytesOf(w3File) === 3145728 &&
         !!t5 && t5.kind === 'file' && t5.bytes === 5242880 && /^assets\/font-\d+\.ttf$/.test(String(t5.path)) && !!t5File && bytesOf(t5File) === 5242880 &&
-        fontDropped.length === 0 && !report.dropped.some((d) => d.indexOf('超单文件上限') >= 0 && d.indexOf('字体') >= 0),
+        fontDropped.length === 0 && fontMention.length === 0 && fontSpilled.length === 2 &&
+        fontSpilled.every((row) => String(row.path).indexOf('assets/') === 0 && row.bytes > 0) &&
+        !report.dropped.some((d) => /改存|moved to assets|spilled/i.test(String(d))),
       'woff ' + (w3 ? w3.path + ' ' + bytesOf(w3File) + ' B' : '缺失') + '；ttf ' + (t5 ? t5.path + ' ' + bytesOf(t5File) + ' B' : '缺失') +
-        '；dropped 里提到它们的 ' + fontMention.length + ' 条全是「改存」信息行、真丢 ' + fontDropped.length + ' 条' + (fontDropped.length ? '：' + fontDropped.join(' | ') : ''));
+        '；dropped 里提到它们的 ' + fontMention.length + ' 条（真丢 ' + fontDropped.length + ' 条）；spilled 里 ' + fontSpilled.length + ' 条：' +
+        JSON.stringify(fontSpilled));
 
     // ---- 15f. 超 16 MB 的仍然丢掉，理由里写清阈值 ----
     const hugeDrop = report.dropped.find((d) => d.indexOf('超单文件上限 16MB') >= 0);
@@ -817,6 +874,122 @@ async function main() {
         ' 条（字节不同必须 2 条）；dupkf ' + dupKf.length + ' 条；sameNameDiffBody ' + diffKf.length + ' 条' +
         '；report 去重计数 @font-face ' + report.fontFacesDeduped + ' / @keyframes ' + report.keyframesDeduped +
         '；app.css 里 @font-face ' + (appText.match(/@font-face/g) || []).length + ' 条 / @keyframes ' + (appText.match(/@keyframes/g) || []).length + ' 条');
+
+    // ---- 15j. 缺陷 A 夹具：两个跨域 <link>（另一台服务、另一个端口），一个 200 一个 404 ----
+    // 真实事故（pintia 考试页）：report 只有 sheetsFailed=1，没有 href；capture_page 文本只有
+    // 一句「1 stylesheet(s) could NOT be captured (cross-origin)」。模型翻了五步、grep
+    // fail|could not 都问不出是哪一张，最后靠采样截图颜色手补 <style> 兜底。
+    // 这里要求：失败表逐条结构化（href + 原因 + via + HTTP 码），文本里逐条打印，并给一句
+    // 能照做的指引。页面里那条 @layer 语句只许进 atRulesUnsupported，不许冒充「表失败」。
+    await cdp.navigate(s, hostA + '/sheets.html');
+    const injSheets = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injSheets.exceptionDetails) throw new Error('sheets 页注入 extractor 失败：' + JSON.stringify(injSheets.exceptionDetails));
+    await installBgSeam(s, cdp);
+    const sheetsRun = await runExtract(s, { origin: hostA + '/sheets.html' });
+    const sr = sheetsRun.report;
+    const srCss = sheetsRun.files.filter((f) => /\.css$/.test(f.path)).map((f) => String(f.content)).join(NL);
+    const okHref = 'http://127.0.0.1:' + port2 + '/styles/ok.css';
+    const goneHref = 'http://127.0.0.1:' + port2 + '/styles/gone.css';
+    const bgOkHrefs = ((sr.sheetsFetchedViaBackground || {}).items || []).map((it) => String(it.href));
+    const failRows = sr.sheetsFailedItems || [];
+    assert('A 夹具：跨域 200 那张取回且规则进产物；404 那张进 report.sheetsFailedItems（href+reason+via+httpStatus）',
+      bgOkHrefs.indexOf(okHref) >= 0 && /#savebtn\{[^}]*background-color:rgb\(62, 126, 234\)/.test(srCss) &&
+        failRows.length === 1 && String(failRows[0].href) === goneHref && failRows[0].via === 'background' &&
+        failRows[0].httpStatus === 404 && /404/.test(String(failRows[0].reason)) && sr.sheetsFailed === 1,
+      'sheetsFetchedViaBackground=' + JSON.stringify(sr.sheetsFetchedViaBackground) +
+        '；#savebtn 规则=' + ((/#savebtn\{[^}]*\}/.exec(srCss) || ['（缺）'])[0]) +
+        '；report.sheetsFailedItems=' + JSON.stringify(failRows) + '；report.sheetsFailed=' + sr.sheetsFailed);
+    const failLine = (sr.dropped || []).find((d) => String(d).indexOf(goneHref) >= 0);
+    assert('A 夹具：dropped 里那条点名 href，并给出「接受并说明 / 让用户在该域再抓一次」的指引',
+      !!failLine && /读不到样式表/.test(String(failLine)) && String(failLine).indexOf('再抓一次') >= 0,
+      '那一行=' + JSON.stringify(failLine));
+    const atu = sr.atRulesUnsupported || { count: 0, items: [] };
+    assert('A 夹具：@layer 语句进 atRulesUnsupported，不算「样式表失败」（sheetsFailed 仍为 1）',
+      atu.count >= 1 && (atu.items || []).some((it) => it.type === 'CSSLayerStatementRule') && sr.sheetsFailed === 1,
+      'report.atRulesUnsupported=' + JSON.stringify(atu) + '；report.sheetsFailed=' + sr.sheetsFailed +
+        '；dropped 里有没有 @layer 冒充=' + String((sr.dropped || []).some((d) => String(d).indexOf('@layer') >= 0)));
+
+    // capture_page 文本：用 index.js 自己的 reporting.captureText 渲染（不是这里另写一份）。
+    const { reporting } = await import(pathToFileURL(path.join(HERE, '..', 'index.js')).href);
+    const textOf = (run, dir, name) => {
+      const split = reporting.splitDropped(run.report);
+      const index = {
+        dir, count: run.files.length, totalBytes: run.report.bytes,
+        groups: { html: [], css: [], images: [], fonts: [], other: [] },
+        dropped: split.dropped, movedToAssets: split.movedToAssets,
+        sheetsFailed: run.report.sheetsFailed, dangling: [], fromDir: dir, suggestedName: name
+      };
+      const summary = reporting.captureSummary(run.files, run.report);
+      const files = run.files.map((f) => ({ path: f.path, bytes: f.bytes, from: path.join(dir, f.path) }));
+      return { summary: summary, text: reporting.captureText({ dir: dir, summary: summary, index: index, files: files, report: run.report }) };
+    };
+    const aText = textOf(sheetsRun, path.join(HERE, 'out-selfcheck-A'), 'fixture-a');
+    assert('A 夹具：capture_page 文本逐条打印失败表（href + 原因 + 指引），不再只有一句「1 张失败」',
+      aText.text.indexOf(goneHref) >= 0 && /stylesheet\(s\) could NOT be captured \(cross-origin\)/.test(aText.text) &&
+        /再抓一次/.test(aText.text),
+      '文本里的失败行=' + JSON.stringify((aText.text.split(NL).filter((l) => l.indexOf(goneHref) >= 0))));
+
+    // ---- 15k. 缺陷 B 夹具：一页多张大图 → 内嵌总量超预算 → 改存只进 report.spilled ----
+    // 真实事故（同一次 pintia 抓取）：report.dropped 40 条全是「内嵌总量超预算，改存
+    // assets/asset-N.woff2」，模型读成「丢了 40 个资源」；assetsInlined/assetsSpilled 又和
+    // dropped 对不上。这里要求 dropped 里一条「改存」都不剩，spilled 每条都有 path 与 bytes，
+    // 四个数自洽。
+    await cdp.navigate(s, hostA + '/spill.html');
+    const shotCount = await cdp.evaluate(s, () => {
+      const box = document.getElementById('shots');
+      for (let k = 0; k < 3; k++) {
+        const cv = document.createElement('canvas');
+        cv.width = 560; cv.height = 560;
+        const cx = cv.getContext('2d');
+        const img = cx.createImageData(560, 560);
+        let seed = 1000 + k;
+        for (let i = 0; i < img.data.length; i += 4) {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          img.data[i] = seed & 255;
+          img.data[i + 1] = (seed >> 8) & 255;
+          img.data[i + 2] = (seed >> 16) & 255;
+          img.data[i + 3] = 255;
+        }
+        cx.putImageData(img, 0, 0);
+        const el = document.createElement('img');
+        el.className = 'shot';
+        el.id = 'bigshot' + k;
+        const uri = cv.toDataURL('image/png');
+        el.setAttribute('src', uri);
+        if (box) box.appendChild(el);
+      }
+      return document.querySelectorAll('img.shot').length;
+    });
+    const injSpill = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injSpill.exceptionDetails) throw new Error('spill 页注入 extractor 失败：' + JSON.stringify(injSpill.exceptionDetails));
+    await installBgSeam(s, cdp);
+    const spillRun = await runExtract(s, { origin: hostA + '/spill.html' });
+    const br = spillRun.report;
+    const spilledRows = br.spilled || [];
+    const spillByPath = new Map(spillRun.files.map((f) => [f.path, f]));
+    const lostWording = (br.dropped || []).filter((d) => /改存|moved to assets|spilled|落 assets\//i.test(String(d)));
+    const ledgerOk = br.assetsInlined + br.assetsSpilled + br.assetsDropped === br.assetsTotal &&
+      br.assetsTotal === (br.assets || []).length && spilledRows.length === br.assetsSpilled &&
+      br.assetsSpilled >= 1;
+    assert('B 夹具：内嵌超预算的条目只进 report.spilled（每条有 path 与 bytes），dropped 里没有「改存」字样',
+      spilledRows.length >= 1 &&
+        spilledRows.every((row) => String(row.path).indexOf('assets/') === 0 && Number(row.bytes) > 0 && !!spillByPath.has(String(row.path)) &&
+          spillByPath.get(String(row.path)).bytes === Number(row.bytes)) &&
+        lostWording.length === 0,
+      'spilled ' + spilledRows.length + ' 条：' + JSON.stringify(spilledRows.map((row) => ({ path: row.path, bytes: row.bytes, reason: row.reason }))) +
+        '；dropped ' + (br.dropped || []).length + ' 条' + ((br.dropped || []).length ? '：' + JSON.stringify(br.dropped) : '') +
+        '；dropped 里带「改存/落 assets」的 ' + lostWording.length + ' 条' + (lostWording.length ? '：' + JSON.stringify(lostWording) : '') +
+        '；本页 ' + shotCount + ' 张大图');
+    assert('B 夹具：assetsInlined + assetsSpilled + assetsDropped = assetsTotal，且 spilled.length = assetsSpilled',
+      ledgerOk,
+      '内嵌 ' + br.assetsInlined + ' + 落文件 ' + br.assetsSpilled + ' + 真丢 ' + br.assetsDropped + ' = ' + (br.assetsInlined + br.assetsSpilled + br.assetsDropped) +
+        '；assetsTotal ' + br.assetsTotal + '（assets[] ' + (br.assets || []).length + ' 条）；spilled.length ' + spilledRows.length);
+    const bText = textOf(spillRun, path.join(HERE, 'out-selfcheck-B'), 'fixture-b');
+    assert('B 夹具：capture_page 文本仍是「nothing lost, N moved into assets/」，且 dropped 段不列改存条目',
+      /moved into assets\/ \(kept, not lost\)/.test(bText.summary) && /report\.dropped: nothing lost/.test(bText.text) &&
+        /report\.movedToAssets: \d+ resource\(s\) KEPT/.test(bText.text),
+      'summary=' + JSON.stringify(bText.summary) + '；文本里的账=' +
+        JSON.stringify(bText.text.split(NL).filter((l) => /report\.(dropped|movedToAssets)/.test(l))));
 
     // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
     // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是
@@ -926,13 +1099,18 @@ async function main() {
     console.log('  祖先链            ' + report.ancestors.map((a) => a.tag + (a.id ? '#' + a.id : '')).join(' < '));
     console.log('  frames            ' + JSON.stringify(report.frames));
     if (report.degrade.length) console.log('  降级              ' + report.degrade.join(' | '));
-    console.log('  dropped ' + report.dropped.length + ' 条：');
+    console.log('  dropped（真丢）  ' + report.dropped.length + ' 条：');
     for (const d of report.dropped.slice(0, 8)) console.log('    - ' + d);
+    console.log('  spilled（改存）  ' + (report.spilled || []).length + ' 条');
+    for (const row of (report.spilled || []).slice(0, 8)) console.log('    - ' + row.path + '  ' + row.bytes + ' B  ' + row.reason);
+    console.log('  资源四本账        内嵌 ' + report.assetsInlined + ' + 落文件 ' + report.assetsSpilled + ' + 真丢 ' + report.assetsDropped + ' = ' + (report.assetsInlined + report.assetsSpilled + report.assetsDropped) + '（assetsTotal ' + report.assetsTotal + '）');
+    console.log('  sheetsFailedItems ' + JSON.stringify(report.sheetsFailedItems || []) + '  atRulesUnsupported=' + JSON.stringify(report.atRulesUnsupported || { count: 0 }));
     console.log('');
     console.log(failed === 0 ? '[self-check] 全部通过（' + results.length + '/' + results.length + '）' : '[self-check] 失败 ' + failed + ' 条');
     process.exitCode = failed === 0 ? 0 : 1;
   } finally {
     if (srv) { try { srv.close() } catch (e) {} }
+    if (srv2) { try { srv2.close() } catch (e) {} }
     await browser.close();
   }
 }

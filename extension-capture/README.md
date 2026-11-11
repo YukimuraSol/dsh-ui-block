@@ -124,7 +124,7 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 
 路径一律**段内相对**（`./`、`../`、`../../`），不出现根绝对路径。元素属性里的根绝对 URL 会被改写成原站绝对地址（含 `ng-href`/`:href`/`v-bind:href`/`xlink:href` 这些同一个 URL 的别名；`#片段`、`data:`、`javascript:`、`mailto:`、`tel:` 不动）。单段 2MB、单文件 2MB，与 DSH 侧默认对齐；`data:` 内嵌另有一条更紧的 1.4MB 线（base64 会胀 4/3）。调用方给 `maxBytes` 时，内嵌与计算样式两份预算跟着它缩放。
 
-`report` 记：origin、title、bytes、files[]（每段字节）、dropped[]（丢了什么/降级成什么）、规则数与丢弃数、变量解析数、元素数、ancestors（祖先链），以及两份素材账：`assets[]`（每条 URL 的落点 kind/path、字节、取字节通道 `via`、原尺寸 w/h、是否 `downsampled`，`data:` 的 URL 只留前 48 字符）与 `srcsetPicked[]`（响应式图实际取的那档）。`report.bytes` 与 `sum(files[].bytes)` 恒等。
+`report` 记：origin、title、bytes、files[]（每段字节）、dropped[]（**只放真丢**：取不到字节 / 超单文件上限 / 读不到样式表）、spilled[]（改存 `assets/` 的，每条 {url, bytes, path, reason}，搬走不是丢）、notices[]（重编码、摘属性这类既没丢也没落文件的信息行）、规则数与丢弃数、变量解析数、元素数、ancestors（祖先链），以及两份素材账：`assets[]`（每条 URL 的落点 kind/path、字节、取字节通道 `via`、原尺寸 w/h、是否 `downsampled`，`data:` 的 URL 只留前 48 字符）与 `srcsetPicked[]`（响应式图实际取的那档）。`report.bytes` 与 `sum(files[].bytes)` 恒等。
 
 ## 资源字节从后台取
 
@@ -159,6 +159,12 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 正文先摘掉注释再扫 `@import`：注释里写着 `@import url(...)` 的一句说明，曾经被当成真的 import 去取（多一次 fetch、多一条 404、多一行 `dropped`，实测于真实浏览器的跨域夹具）。
 
 `report.sheetsFetchedViaBackground = { count, items: [{ href, bytes }] }`——没有这个字段 = 这一页没有跨域样式表，或一张都没取回来（那就还是 `dropped` 里那条）。
+
+`report.sheetsFailedItems = [{ href, reason, via: 'background'|'cssom', httpStatus?, bytes? }]`——**每张读不到的表一条**，href 是它的唯一身份：文本里那条 `dropped` 行也点名 href，并直接给一句能照做的指引（接受并在差异里说明，或让用户在该表所在的域上再抓一次）。`report.sheetsFailed` 恒等于这个数组的长度。
+
+`report.atRulesUnsupported = { count, items: [{ type, count, sample }] }`——认不出的 at-rule（`@layer` 语句、`@page`、`@namespace`…）。它**不是**「样式表失败」：没有 href、也不是一张表，绝不计入 `sheetsFailed`（过去计进去过，于是报告喊「1 张表没取到」，模型只能去猜）。
+
+资源四本账按**最终落点**数，自洽：`assetsInlined + assetsSpilled + assetsDropped = assetsTotal = assets.length`，且 `spilled.length === assetsSpilled`。
 
 ## 雪碧图与 srcset
 

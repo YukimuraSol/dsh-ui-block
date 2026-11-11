@@ -444,7 +444,7 @@
     var st = {
       rulesTotal: 0, rulesKept: 0, rulesDead: 0, rulesEmpty: 0,
       declarationsDropped: 0, customPropsDropped: 0,
-      fontFaces: 0, keyframes: 0, sheets: 0, sheetsFailed: 0,
+      fontFaces: 0, keyframes: 0, sheets: 0, sheetsFailed: 0, rulesUnsupported: 0,
       // 去重掉的重复 at-rule 条数（见 dedupeAtRules；只算这两类，别的一律不碰）
       fontFacesDeduped: 0, keyframesDeduped: 0,
       elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0,
@@ -456,8 +456,22 @@
       // shadow DOM：找到的 open shadow root、真正展开进产物的、收进来的规则条数
       shadowRules: 0, shadowSelectorsDropped: 0, shadowSlots: 0
     };
+    // 三本账，口径分开（缺陷 B：dropped 里混进「改存 assets」，summary 与数组打架）：
+    //   dropped  只放真丢：取不到字节 / 超单文件上限 / 读不到样式表。一条 = 一个真的没了的东西。
+    //   spilled  只放「字节保住了、只是落成文件」：{url, bytes, path, reason}。改存不是丢。
+    //   notices  既没丢也没落文件的信息行（重编码、摘属性、@import 成环），读块的人看情况。
     var dropped = [];
-    var drop = function (s) { if (dropped.length < 40) dropped.push(String(s).slice(0, 220)); };
+    var droppedTruncated = 0;
+    var drop = function (s) {
+      if (dropped.length < 40) dropped.push(String(s).slice(0, 220));
+      else droppedTruncated++;
+    };
+    var notices = [];
+    var note = function (s) { if (notices.length < 60) notices.push(String(s).slice(0, 220)); };
+    var spilled = [];                       // report.spilled：每一条落成 assets/ 的资源
+    var spillInfo = new Map();              // absu -> 为什么落文件（写进 spilled[].reason）
+    var sheetFails = [];                    // report.sheetsFailedItems：每张读不到的表
+    var unsupportedKinds = {};              // 不认识的 at-rule 类型（不是「样式表失败」）
 
     // includes 已废：它原本是三处开关（computed / css / assets），三处都会改变产物形态——
     // 特别是 assets 那一处，一关就整段跳过资源解析，CSS 里的 url(/static/…) 原样留在块里，
@@ -613,7 +627,13 @@
               var err = chrome.runtime.lastError;
               if (err) { rej(new Error('后台没有应答：' + err.message)); return; }
               if (!r) { rej(new Error('后台没有应答')); return; }
-              if (r.ok === false) { rej(new Error(String(r.error || '后台取字节失败'))); return; }
+              if (r.ok === false) {
+                // HTTP 码要跟着走：只留一句人话，报告里就查不出是 404 还是 403（缺陷 A）
+                var bad = new Error(String(r.error || '后台取字节失败'));
+                if (r.httpStatus !== undefined) bad.httpStatus = Number(r.httpStatus);
+                rej(bad);
+                return;
+              }
               res(r);
             });
           } catch (e) { rej(new Error('调后台失败：' + String(e && e.message || e))); }
@@ -642,7 +662,11 @@
       }
       var f = (win.fetch ? win.fetch.bind(win) : fetch);
       var res = await f(absu, { credentials: 'include' });
-      if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+      if (!res || !res.ok) {
+        var bad = new Error('HTTP ' + (res ? res.status : '?') + (res && res.statusText ? ' ' + res.statusText : ''));
+        if (res) bad.httpStatus = Number(res.status);
+        throw bad;
+      }
       var buf = new Uint8Array(await res.arrayBuffer());
       var ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
       return { bytes: buf, mime: ct || guessMime(absu), rawLen: buf.length, via: 'page' };
@@ -739,7 +763,13 @@
         } else if (kind === 'CSSImportRule') {
           try { if (rule.styleSheet) walkSheet(rule.styleSheet); } catch (e) {}
         } else {
-          st.sheetsFailed++;
+          // 认不出的 at-rule（@layer 语句、@page、@namespace…）**不是**「样式表失败」。
+          // 缺陷 A 的真实事故：这里曾经 st.sheetsFailed++，于是报告喊「1 张样式表没取到」，
+          // 而它连一张表都不是、也没有 href——模型只能去猜、去手补 CSS。分开记。
+          var kk2 = kind || 'unknown';
+          st.rulesUnsupported++;
+          if (!unsupportedKinds[kk2]) unsupportedKinds[kk2] = { type: kk2, count: 0, sample: String(rule.cssText || '').slice(0, 120) };
+          unsupportedKinds[kk2].count++;
         }
       }
     };
@@ -752,6 +782,28 @@
     var MAX_IMPORT_DEPTH = 3;
     var bgSheets = new Map();   // 原 sheet → { sheets: [CSSStyleSheet…] }（按层叠顺序排好）
     var bgSheetLog = [];        // report.sheetsFetchedViaBackground.items
+
+    /**
+     * 记一张「读不到」的样式表：结构化一条（report.sheetsFailedItems）+ 一条能直接读的
+     * dropped 行。缺陷 A 真实事故：报告只说「1 stylesheet could NOT be captured」，没有 href，
+     * 模型翻了五步、grep 了 fail|could not，最后靠采样截图颜色手补 <style>。
+     * href 是这张表唯一的身份，一定要进文本。
+     */
+    var failSheet = function (href, reason, via, extra) {
+      var h = String(href || '');
+      for (var i = 0; i < sheetFails.length; i++) {
+        if (sheetFails[i].href === h) return sheetFails[i];   // 同一张表只记一条
+      }
+      var row = { href: h, reason: String(reason || ''), via: via === 'background' ? 'background' : 'cssom' };
+      if (extra && extra.httpStatus !== undefined && Number.isFinite(Number(extra.httpStatus))) row.httpStatus = Number(extra.httpStatus);
+      if (extra && extra.bytes !== undefined) row.bytes = Number(extra.bytes);
+      sheetFails.push(row);
+      // href 后面**必须留空格**：index.js 的 droppedItemOf 用 /https?:\/\/[^\s]+/ 抠 URL，
+      // 紧贴着写括号会把「（后台取字节失败：HTTP」一起吞进 URL，文本那行就断成两截。
+      drop('读不到样式表（跨域）：' + h + ' —— ' + row.reason +
+        '；这张表里的样式整份缺失：要么接受并在差异里说明，要么让用户在该表所在的域上再抓一次。');
+      return row;
+    };
 
     /**
      * 摘掉 CSS 注释再做 @import / url() 扫描。实测（真·跨域夹具）：注释里写着「@import url(...)」
@@ -818,11 +870,12 @@
      */
     var loadRemoteSheet = async function (href, depth, chain) {
       chain = chain || [];
-      if (chain.indexOf(href) >= 0) { drop('@import 成环，不再取：' + href); return []; }
-      if (depth > MAX_IMPORT_DEPTH) { drop('@import 超过 ' + MAX_IMPORT_DEPTH + ' 层，不再取：' + href); return []; }
+      if (chain.indexOf(href) >= 0) { note('@import 成环，不再取：' + href); return []; }
+      if (depth > MAX_IMPORT_DEPTH) { note('@import 超过 ' + MAX_IMPORT_DEPTH + ' 层，不再取：' + href); return []; }
       var got;
       try { got = await fetchSheetText(href); } catch (e) {
-        drop('读不到样式表（跨域）：' + href + '（后台取字节失败：' + String((e && e.message) || e).slice(0, 90) + '）');
+        failSheet(href, '后台取字节失败：' + String((e && e.message) || e).slice(0, 120), 'background',
+          { httpStatus: e && e.httpStatus });
         return [];
       }
       bgSheetLog.push({ href: href, bytes: got.bytes });
@@ -842,7 +895,7 @@
       }
       var own = parseCssText(text);
       if (own) out.push(own);
-      else drop('跨域样式表取回后解析不了，已退回：' + href);
+      else failSheet(href, '取回后解析不了（CSSStyleSheet 不可用）', 'background', { bytes: got.bytes });
       return out;
     };
 
@@ -869,10 +922,9 @@
         // 跨域：后台取回的那份已经解析好放在 bgSheets 里，按这条样式表原来的位置接进管道。
         var bg = bgSheets.get(sheet);
         if (!bg) {
-          st.sheetsFailed++;
-          // 取字节时已经记过一条（同一条 href），别让 report 里同一张表出现两行
-          var plain = '读不到样式表（跨域）：' + (sheet.href || 'inline');
-          if (!dropped.some(function (d) { return d.indexOf(plain) === 0; })) drop(plain);
+          // 取字节时已经记过一条（同一条 href，failSheet 里按 href 去重），这里只补
+          // 「压根没走到取字节」的那种：href 不是 http(s)（inline / blob: / extension:）。
+          failSheet(sheet.href || 'inline', '读不到 cssRules（跨域），字节也没取回', 'cssom');
           return;
         }
         for (var b = 0; b < bg.sheets.length; b++) { st.sheets++; walkRules(bg.sheets[b].cssRules); }
@@ -1099,7 +1151,7 @@
         if (ROOT_ABS_ATTR[nm] && /^\/(?!\/)/.test(v)) {
           var absolutized = absUrl(v, base);
           if (absolutized && /^https?:|^file:/i.test(absolutized)) n.setAttribute(a.name, absolutized);
-          else { n.removeAttribute(a.name); drop('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
+          else { n.removeAttribute(a.name); note('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
           return;
         }
         if (BIND_ABS_ATTR[nm]) {
@@ -1109,7 +1161,7 @@
           if (/^\/(?!\/)/.test(inner)) {
             var absBind = absUrl(inner, base);
             if (absBind && /^https?:|^file:/i.test(absBind)) n.setAttribute(a.name, lit ? lit[1] + absBind + lit[1] : absBind);
-            else { n.removeAttribute(a.name); drop('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
+            else { n.removeAttribute(a.name); note('根绝对引用无法绝对化，已去掉 ' + nm + '=' + v); }
           }
           return;
         }
@@ -1126,7 +1178,7 @@
           else {
             st.invalidAtComputedValue.push((rv.name || '?') + ' -> @' + nm);
             n.removeAttribute(a.name);
-            drop('属性里的变量解析不了，已去掉 ' + nm + '=' + v.slice(0, 60));
+            note('属性里的变量解析不了，已去掉 ' + nm + '=' + v.slice(0, 60));
           }
         }
       });
@@ -1139,6 +1191,7 @@
     var assetFiles = [];
     var assetSeq = { img: 0, font: 0, bin: 0 };
     var assetLog = [];
+    var assetRowByUrl = new Map();   // absu -> assetLog 行（预算改判时要就地改这一行）
     // 引用一律从"要输出的那份 CSS 原文"里收：CSS 总是输出，所以 CSS 里的 url() 一条都不会漏。
     var pageCssText = pageRules.join(NL);
     pageCssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) { addUrl(u); return m; });
@@ -1158,13 +1211,13 @@
 
     var kbOf = function (n) { return Math.round(n / 1024) + 'KB'; };
 
-    /** 落 assets/：原字节进块，不改尺寸。返回段内相对路径。 */
-    var spool = function (kind, absu, mime, base64, bytes) {
+    /** 落 assets/：原字节进块，不改尺寸。返回段内相对路径。reason 只进 report.spilled。 */
+    var spool = function (kind, absu, mime, base64, bytes, reason) {
       assetSeq[kind] = (assetSeq[kind] || 0) + 1;
       var name = kind === 'font' ? 'font' : (kind === 'img' ? 'img' : 'asset');
       var path = 'assets/' + name + '-' + assetSeq[kind] + '.' + extOf(absu, mime);
       assetFiles.push({ path: path, content: base64, base64: true, bytes: bytes });
-      st.assetsSpilled++;
+      spillInfo.set(absu, String(reason || ''));
       return path;
     };
 
@@ -1183,7 +1236,11 @@
       if (out.w) { row.w = out.w; row.h = out.h; }
       if (out.downsampled !== undefined) row.downsampled = !!out.downsampled;
       if (out.reason) row.reason = out.reason;
+      // 原始 URL 只在内存里留着（不枚举 → 不进 report）：spilled[].reason、字体去重用得上，
+      // 而 report 里的 url 还是截断后的可读标识。
+      Object.defineProperty(row, 'key', { value: absu, enumerable: false });
       assetLog.push(row);
+      assetRowByUrl.set(absu, row);
       return row;
     };
 
@@ -1200,11 +1257,9 @@
         else if (isFont) {
           if (got.rawLen <= MAX_INLINE_BYTES) {
             out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime };
-            st.assetsInlined++;
           } else if (got.rawLen <= MAX_ASSET_BYTES) {
-            var fpath = spool('font', absu, mime, toBase64(got.bytes), got.rawLen);
+            var fpath = spool('font', absu, mime, toBase64(got.bytes), got.rawLen, '字体 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB');
             out = { kind: 'file', path: fpath, bytes: got.rawLen, mime: mime };
-            drop('字体 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，改存 ' + fpath + '：' + absu);
           } else {
             out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
             drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
@@ -1216,31 +1271,26 @@
           if (info && spriteLike(iw, ih)) {
             // 雪碧图 / 长条图：降采样会把 358x20870 压成 34x2000，等于毁掉——原尺寸落文件。
             if (got.rawLen <= MAX_ASSET_BYTES) {
-              var spath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen);
+              var spath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen, '雪碧图 ' + iw + 'x' + ih + ' 原尺寸落文件（不降采样会毁图）');
               out = { kind: 'file', path: spath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
-              drop('雪碧图 ' + iw + 'x' + ih + ' 原尺寸落 ' + spath + '（不降采样）：' + absu);
             } else {
               out = { kind: 'drop', reason: '雪碧图原图超单文件上限 ' + MAX_ASSET_MB };
               drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
             }
           } else if (got.rawLen <= MAX_INLINE_BYTES && !dimTooBig) {
             out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
-            st.assetsInlined++;
           } else {
             var shrink = dimTooBig ? await reencode(doc, got.bytes, mime, MAX_IMAGE_DIM) : null;
             if (shrink && shrink.bytes <= MAX_INLINE_BYTES) {
               out = { kind: 'data', uri: shrink.uri, bytes: shrink.bytes, mime: shrink.mime, w: shrink.w, h: shrink.h, downsampled: true };
-              st.assetsInlined++;
-              drop('图片重编码 ' + (iw ? iw + 'x' + ih : '?') + ' → ' + shrink.w + 'x' + shrink.h + ' webp ' + kbOf(shrink.bytes) + '：' + absu);
+              note('图片重编码 ' + (iw ? iw + 'x' + ih : '?') + ' → ' + shrink.w + 'x' + shrink.h + ' webp ' + kbOf(shrink.bytes) + '：' + absu);
             } else if (shrink) {
-              var ipath = spool('img', absu, shrink.mime, splitDataUri(shrink.uri).base64, shrink.bytes);
+              var ipath = spool('img', absu, shrink.mime, splitDataUri(shrink.uri).base64, shrink.bytes, '降采样后仍 ' + kbOf(shrink.bytes) + ' 超内嵌上限');
               out = { kind: 'file', path: ipath, bytes: shrink.bytes, mime: shrink.mime, w: shrink.w, h: shrink.h, downsampled: true };
-              drop('图片降采样后仍 ' + kbOf(shrink.bytes) + '，改存 ' + ipath + '：' + absu);
             } else if (got.rawLen <= MAX_ASSET_BYTES) {
               // 解不开、或长宽比正常只是文件大：原字节落文件，不在体积上赌质量。
-              var opath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen);
+              var opath = spool('img', absu, mime, toBase64(got.bytes), got.rawLen, '图片 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，原尺寸落文件');
               out = { kind: 'file', path: opath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
-              drop('图片 ' + kbOf(got.rawLen) + ' 超内嵌上限 1.4MB，原尺寸改存 ' + opath + '：' + absu);
             } else {
               out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
               drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
@@ -1288,16 +1338,35 @@
         var item = big[bi];
         var meta2 = splitDataUri(item.v.uri);
         if (!meta2 || !meta2.base64) continue;
-        var p2 = spool('bin', item.k, meta2.mime, meta2.base64, item.v.bytes);
+        var p2 = spool('bin', item.k, meta2.mime, meta2.base64, item.v.bytes, '内嵌总量超预算，改存文件');
         assetMap.set(item.k, { kind: 'file', path: p2, bytes: item.v.bytes, mime: meta2.mime });
-        for (var ai = 0; ai < assetLog.length; ai++) {
-          if (assetLog[ai].url === item.k) { assetLog[ai].kind = 'file'; assetLog[ai].path = p2; break; }
-        }
+        // 就地改这一行：assets 总账与 spilled / assetsInlined / assetsSpilled 必须同一口径。
+        // 旧代码按 shortUrl 后的字符串比对，data: 那条永远对不上（url 里是截断后的说明文字），
+        // 于是账上是 data、磁盘上是文件——三个数互相打架的一半原因在这。
+        var brow = assetRowByUrl.get(item.k);
+        if (brow) { brow.kind = 'file'; brow.path = p2; }
         inlineBytes -= item.v.bytes;
-        st.assetsSpilled++;
-        drop('内嵌总量超预算，改存 ' + p2);
       }
     }
+
+    // 资源四本账，一次性按**最终落点**数出来（不靠过程中的加加减减，那样同一份资源
+    // 先内联再改判落文件会被算两次）：
+    //   assetsInlined + assetsSpilled + assetsDropped = assets.length（资源总数）
+    //   spilled.length === assetsSpilled
+    //   dropped 里的资源条目 = assetsDropped；dropped 还会多出「读不到样式表」那几条，
+    //   它们不是 assets 里的资源，单独由 sheetsFailedItems / sheetsFailed 记账。
+    spilled.length = 0;
+    var assetsInlinedN = 0, assetsSpilledN = 0, assetsDroppedN = 0;
+    for (var li = 0; li < assetLog.length; li++) {
+      var lrow = assetLog[li];
+      if (lrow.kind === 'data') assetsInlinedN++;
+      else if (lrow.kind === 'file') {
+        assetsSpilledN++;
+        spilled.push({ url: lrow.url, bytes: Number(lrow.bytes) || 0, path: String(lrow.path || ''), reason: spillInfo.get(String(lrow.key || '')) || '' });
+      } else assetsDroppedN++;
+    }
+    st.assetsInlined = assetsInlinedN;
+    st.assetsSpilled = assetsSpilledN;
 
     var refFor = function (prefix, hit) {
       if (!hit) return null;
@@ -1333,7 +1402,7 @@
             if (n.parentNode) n.parentNode.removeChild(n);
           } else {
             n.removeAttribute(attr);
-            drop('取不到 ' + attr + ' 的字节，只摘属性、保留子树：' + raw.slice(0, 120));
+            note('取不到 ' + attr + ' 的字节，只摘属性、保留子树：' + raw.slice(0, 120));
           }
           return;
         }
@@ -1464,14 +1533,21 @@
       origin: (doc.location && doc.location.href) || opts.origin || base,
       title: title,
       bytes: total,
+      // 只有真丢。口径（缺陷 B）：取不到字节 / 超单文件上限 / 读不到样式表。
+      // 「改存 assets/」一条都不在这里——它是搬走了，不是丢了，见 spilled。
       dropped: dropped,
+      // 落成 assets/ 的那些（字节保住了）：每条都带 url / bytes / path / reason。
+      spilled: spilled,
+      // 既没丢也没落文件的信息行（重编码、摘属性、@import 成环），读块时按需看。
+      notices: notices,
       files: files.map(function (f) { return { path: f.path, bytes: f.bytes }; }),
       rulesTotal: st.rulesTotal,
       rulesKept: st.rulesKept,
       rulesDead: st.rulesDead,
       rulesEmpty: st.rulesEmpty,
       sheets: st.sheets,
-      sheetsFailed: st.sheetsFailed,
+      // 只数真正的样式表（读不到 cssRules 的那几张）。认不出的 at-rule 走 atRulesUnsupported。
+      sheetsFailed: sheetFails.length,
       fontFaces: st.fontFaces,
       keyframes: st.keyframes,
       // 去重掉的重复条数：实测 zju-r2-a 那份材料 @font-face 89→32、@keyframes 266→169，
@@ -1511,8 +1587,13 @@
       },
       // 序列化后对不上的 [data-dsh-el] 规则条数（正常恒为 0；非 0 就是有节点在产物里丢了）
       computedOrphansDropped: computedOrphans,
+      // 四本账（按最终落点数，见第 5 步末尾）：
+      //   assetsInlined + assetsSpilled + assetsDropped = assetsTotal = assets.length
+      //   spilled.length === assetsSpilled
       assetsInlined: st.assetsInlined,
       assetsSpilled: st.assetsSpilled,
+      assetsDropped: assetsDroppedN,
+      assetsTotal: assetLog.length,
       // 资源总账：每条 URL 的落点、字节、取字节通道（background=扩展后台 / page=页面兜底）、
       // 原尺寸与是否降采样。素材库索引与验收都读这一份，不用再猜。
       assets: assetLog,
@@ -1552,6 +1633,13 @@
     // 跨域样式表：页面读不到 cssRules 的那几张，字节是从扩展后台取回来的（每张一条账）。
     // 没有这个字段 = 这一页没有跨域样式表，或一张都没取回来（那就还是 dropped 里那条）。
     if (bgSheetLog.length) report.sheetsFetchedViaBackground = { count: bgSheetLog.length, items: bgSheetLog };
+    // 读不到的那几张：一条失败一条（href + reason + via + HTTP 码）。没有这个字段 = 一张都没失败。
+    if (sheetFails.length) report.sheetsFailedItems = sheetFails;
+    // 认不出的 at-rule：单独记，绝不计入 sheetsFailed（它不是样式表，也没有 href）。
+    if (st.rulesUnsupported > 0) {
+      report.atRulesUnsupported = { count: st.rulesUnsupported, items: Object.keys(unsupportedKinds).map(function (k) { return unsupportedKinds[k]; }) };
+    }
+    if (droppedTruncated > 0) report.droppedTruncated = droppedTruncated;
     // includes 已废：传了就记一个布尔 true（口径与其它布尔字段一致——没有这个字段 = 没传），
     // 具体传了什么写在 degrade 那条说明里。产物恒定是 entry + 两份 CSS + 资源落点。
     if (includesIgnored.length) report.includesIgnored = true;

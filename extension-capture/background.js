@@ -86,7 +86,13 @@ async function fetchBytesOnce(url, maxBytes) {
   const limit = setTimeout(function () { try { ctl.abort() } catch (e) {} }, FETCH_TIMEOUT_MS)
   try {
     const res = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow', signal: ctl.signal })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
+    if (!res.ok) {
+      // 码和状态文本一起带上：extractor 的 report.sheetsFailedItems 要 httpStatus，
+      // 只留一句「HTTP 404」在文本里，模型分不清是 404 还是 403 / 超时（缺陷 A）。
+      const err = new Error('HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : ''))
+      err.httpStatus = res.status
+      throw err
+    }
     const declared = Number(res.headers.get('content-length') || 0)
     if (declared > cap) throw new Error('超过单次取字节上限 ' + Math.round(cap / 1048576) + 'MB（' + Math.round(declared / 104857.6) / 10 + 'MB）')
     const buf = new Uint8Array(await res.arrayBuffer())
@@ -624,7 +630,11 @@ chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
     keepAlive(true)
     queueFetch(url, msg.maxBytes).then(
       function (r) { reply(r); keepAlive(false) },
-      function (e) { reply({ ok: false, error: String((e && e.message) || e) }); keepAlive(false) }
+      function (e) {
+        const out = { ok: false, error: String((e && e.message) || e) }
+        if (e && e.httpStatus !== undefined) out.httpStatus = e.httpStatus
+        reply(out); keepAlive(false)
+      }
     )
     return true
   }

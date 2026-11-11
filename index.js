@@ -2578,12 +2578,25 @@ function droppedItemOf(item) {
 function splitDropped(report) {
   const raw = report !== null && typeof report === 'object' ? report.dropped : undefined
   if (typeof raw === 'number') return { dropped: { count: raw, items: [] }, movedToAssets: { count: 0, sample: [] } }
+  // The extension writes moved-to-assets work into report.spilled (one row per resource,
+  // with its path and bytes) and keeps report.dropped for real losses only. When that
+  // field exists it IS the moved count; the word-matching below stays for older captures
+  // whose report has no spilled array at all.
+  const spilled = report !== null && typeof report === 'object' && Array.isArray(report.spilled) ? report.spilled : null
   const lost = []
   const moved = []
   for (const item of Array.isArray(raw) ? raw : []) {
     const parsed = droppedItemOf(item)
-    if (MOVED_REASON_RE.test(parsed.line)) moved.push({ url: parsed.url, reason: parsed.reason })
+    if (spilled === null && MOVED_REASON_RE.test(parsed.line)) moved.push({ url: parsed.url, reason: parsed.reason })
     else lost.push({ url: parsed.url, reason: parsed.reason })
+  }
+  if (spilled !== null) {
+    for (const row of spilled) {
+      const url = String(row !== null && typeof row === 'object' && row.url !== undefined ? row.url : '')
+      const path = String(row !== null && typeof row === 'object' && row.path !== undefined ? row.path : '')
+      const reason = String(row !== null && typeof row === 'object' && row.reason !== undefined ? row.reason : '')
+      moved.push({ url, reason: (reason === '' ? 'moved into assets/' : reason) + (path === '' ? '' : ' -> ' + path) })
+    }
   }
   return { dropped: { count: lost.length, items: lost }, movedToAssets: { count: moved.length, sample: moved.slice(0, 1) } }
 }
