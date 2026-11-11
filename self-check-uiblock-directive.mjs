@@ -1061,7 +1061,14 @@ t('icon only: no visible word, no title tooltip, the name lives in aria-label', 
   assert.doesNotMatch(controlsBody, /replayButton\.title/, 'a title tooltip would print 重播 on hover')
   assert.doesNotMatch(controlsBody, /replayButton\.textContent/, 'visible text on the replay button')
   assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
-  assert.match(source, /\.dshpb-pick,\.dshpb-replay\{padding:1px 5px/)
+  // 用户定稿（2026-11-11 晚，真机看过后）：块头那四个控件同高、无边框、透明底，
+  // 照最右边「复制路径」那个 24×24 的样子做。分辨率 / 重放 / 选取元素共用同一条
+  // 24px 规则；图标 14×14、stroke 1.5。行距 2px 只给这一行，演示块的传输条
+  // （播放/暂停/重新开始）在标题里另起一行，仍保持旧的小胶囊形状。
+  assert.match(source, /\.dshpb-ctl>\.dshpb-btn:not\(\[data-dshpb-demo\]\)\{display:inline-flex/)
+  assert.match(source, /height:24px;min-width:24px;padding:0 5px;border:0;border-radius:6px;background:transparent/)
+  assert.match(source, /\.dshpb-replay svg\{display:block;width:14px;height:14px;/)
+  assert.match(source, /\.dshpb-ctl:not\(\[data-dshpb-demo-bar\]\)\{gap:2px\}/)
   assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
 })
 t('the test seam calls the same function the button does', () => {

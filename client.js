@@ -1129,6 +1129,18 @@ window.__ModuleLoader__.load({
       'border-radius:2px;background:var(--dsw-alias-border-l1);opacity:0;transition:opacity .15s}',
       '.dshpb-shell:hover .dshpb-handle::after{opacity:.85}',
       '.dshpb-ctl{display:inline-flex;align-items:center;gap:6px;margin-left:8px;flex:none}',
+      // Banner row, unified (user call, 2026-11-11): 分辨率 / 重放 / 选取元素 are
+      // measured against the shell's own copy-path button that sits right of them —
+      // 24px high, 24px wide for the two icons, text-sized with 5px side padding for
+      // the readout, no border at all, transparent until hover, 6px radius, 2px apart.
+      // The transport row (播放/暂停/重新开始) is a different .dshpb-ctl inside the
+      // heading and keeps the old pill shape — its buttons are tagged data-dshpb-demo.
+      '.dshpb-ctl:not([data-dshpb-demo-bar]){gap:2px}',
+      '.dshpb-ctl>.dshpb-btn:not([data-dshpb-demo]){display:inline-flex;align-items:center;justify-content:center;',
+      'box-sizing:border-box;height:24px;min-width:24px;padding:0 5px;border:0;border-radius:6px;background:transparent;',
+      'line-height:1;cursor:pointer;white-space:nowrap}',
+      '.dshpb-ctl>.dshpb-btn:not([data-dshpb-demo]):hover{background:var(--dsw-alias-interactive-bg-hover);',
+      'color:var(--dsw-alias-label-primary)}',
       '.dshpb-btn{font:inherit;font-size:11px;line-height:18px;color:var(--dsw-alias-label-secondary);background:transparent;',
       'border:.5px solid var(--dsw-alias-border-l1);border-radius:6px;padding:1px 7px;cursor:pointer;white-space:nowrap}',
       '.dshpb-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
@@ -1147,18 +1159,18 @@ window.__ModuleLoader__.load({
       '.dshpb-toast{position:fixed;z-index:10000;bottom:28px;left:50%;transform:translateX(-50%);padding:8px 14px;border-radius:10px;',
       'background:var(--dsw-alias-bg-layer-1);border:.5px solid var(--dsw-alias-border-l1);box-shadow:var(--dsw-shadow-lv3);',
       'color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}',
-      // Canvas picker (2026-10-10). The lit state paints the ROUNDED BORDER and the
-      // ICON STROKE in #22d3ee and nothing else — no fill. #22d3ee is written as a
-      // literal on purpose: --dsw-alias-brand-primary resolves to a neutral-bluish
-      // token that reads near-white on the dark theme.
-      '.dshpb-pick,.dshpb-replay{padding:1px 5px;line-height:0;border-color:var(--dsw-alias-border-l2)}',
-      '.dshpb-pick svg,.dshpb-replay svg{display:block;width:13px;height:13px;overflow:visible}',
-      '.dshpb-pick path,.dshpb-replay path{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.3;',
+      // Canvas picker (2026-10-10). The lit state paints the ICON STROKE in #22d3ee
+      // and nothing else — no fill and, since the banner row went borderless, no
+      // border either. #22d3ee is written as a literal on purpose:
+      // --dsw-alias-brand-primary resolves to a neutral-bluish token that reads
+      // near-white on the dark theme.
+      '.dshpb-pick svg,.dshpb-replay svg{display:block;width:14px;height:14px;overflow:visible}',
+      '.dshpb-pick path,.dshpb-replay path{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.5;',
       'stroke-linecap:round;stroke-linejoin:round}',
       // The replay glyph is a broken circle with an arrowhead and a play triangle
       // in the middle: "play this again", not "reload the page".
       '.dshpb-replay path.dshpb-tri{fill:var(--dsw-alias-label-secondary);stroke:none}',
-      '.dshpb-pick-on{border-color:#22d3ee;background:transparent}',
+      '.dshpb-pick-on{background:transparent}',
       '.dshpb-pick-on path{stroke:#22d3ee;stroke-width:1.5}',
       '.dshpb-pickbox{position:fixed;z-index:2147483000;pointer-events:none;display:none;',
       'border:2px solid #4d6bfe;background:rgba(77,107,254,.12)}',
@@ -2170,8 +2182,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         resButton.className = 'dshpb-btn';
         resButton.title = '画布分辨率（点开可改，含自定义 W×H）';
         resButton.addEventListener('click', function (event) { event.preventDefault(); event.stopPropagation(); openResMenu(state); });
-        // Canvas picker toggle. Icon only (13x13), sitting to the RIGHT of the
-        // resolution button; the lit state is the border + stroke in #22d3ee.
+        // Canvas picker toggle. Icon only (14x14), sitting to the RIGHT of the
+        // resolution button; the lit state is the cyan stroke alone — the banner row
+        // went borderless on 2026-11-11, so there is no border left to colour.
         var pickButton = document.createElement('button');
         pickButton.type = 'button';
         pickButton.className = 'dshpb-btn dshpb-pick';
