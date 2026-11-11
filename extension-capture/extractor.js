@@ -421,6 +421,66 @@
   var SHADOW_ELEMENTS_MAX = 6000;
   var SHADOW_NEST_MAX = 8;
 
+  // ---- 模板占位名 ---------------------------------------------------------
+  /**
+   * 是不是「没插值的模板名」——不是资源，浏览器同样拿不到。
+   *
+   * 真实事故（93.6 s 返工）：Angular 模板渲染前残留的地址形如 /user/avatarSmallUrl、
+   * /course/99569/instructor.avatar_small_url，服务器一律回 200 + SPA 兜底 HTML。
+   * 浏览器拿到的是那张 HTML，画面从来不缺东西——模型却逐个 web_fetch 复核了 10 条。
+   *
+   * 判据宁窄勿宽，只认两种形状：
+   *   ① 地址里带 {{ 或 }}；
+   *   ② 末段是「无扩展名、无查询串」的驼峰/下划线标识符，并以 Url / _url 结尾。
+   * 带已知扩展名或带查询串的一律不算：classroom 的 iconfont.woff?t=1595385243010 是真资源
+   * （那份材料里它是 HTTP 404，但仍然不是占位）。
+   * ponytail: 「路径 + 标识符」那条更宽的形状没有单独实现——它在取到字节之前和真资源分不开，
+   * 而这里必须在取字节之前就下结论（省下的正是那些无谓的 fetch）。漏判的代价只是一次取字节。
+   */
+  var PLACEHOLDER_ASSET_EXT = {
+    png: 1, jpg: 1, jpeg: 1, webp: 1, svg: 1, gif: 1, ico: 1, avif: 1, bmp: 1,
+    woff: 1, woff2: 1, ttf: 1, otf: 1, eot: 1, css: 1, js: 1, mjs: 1, json: 1, map: 1, html: 1, htm: 1
+  };
+  /** 末段：标识符 + 点分标识符（instructor.avatar_small_url 也算一段）。 */
+  var PLACEHOLDER_TAIL_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/;
+  function isTemplatePlaceholder(url) {
+    var s = String(url || '');
+    if (s === '') return false;
+    if (s.indexOf('{{') >= 0 || s.indexOf('}}') >= 0) return true;
+    if (!/^https?:\/\//i.test(s)) return false;
+    var cut = s.length;
+    var q = s.indexOf('?');
+    if (q >= 0 && q < cut) cut = q;
+    var h = s.indexOf('#');
+    if (h >= 0 && h < cut) cut = h;
+    if (cut < s.length) return false;
+    var tail = s.slice(s.lastIndexOf('/') + 1);
+    if (!PLACEHOLDER_TAIL_RE.test(tail)) return false;
+    var dot = tail.lastIndexOf('.');
+    if (dot >= 0 && PLACEHOLDER_ASSET_EXT[tail.slice(dot + 1).toLowerCase()]) return false;
+    return /(?:Url|_url)$/.test(tail);
+  }
+
+  // ---- @keyframes / animation 的账 ----------------------------------------
+  /**
+   * 一份 CSS 原文里有几条 @keyframes、几条 animation 声明、其中几条带 infinite。
+   *
+   * 真实事故（57.5 s）：模型在 pages/current/page.css 里找 @keyframes 找不到——第 7 步把
+   * @font-face 与 @keyframes 统一提到 shared/app.css，page.css 里一条都没有。它 grep/read
+   * 三轮，最后靠 web_fetch 原站 HTML 才对上。数的是落盘后的原文，所以和块里的字节同一口径。
+   */
+  function countAnimations(text) {
+    var s = String(text || '');
+    var keyframes = (s.match(/@keyframes[\s{]/g) || []).length;
+    var declarations = 0, infinite = 0;
+    var re = /(?:^|[;{])\s*animation(?:-[a-z]+)*\s*:([^;}]*)/g, m;
+    while ((m = re.exec(s)) !== null) {
+      declarations++;
+      if (/\binfinite\b/.test(m[1])) infinite++;
+    }
+    return { keyframes: keyframes, animations: declarations, infinite: infinite };
+  }
+
   // ---- @font-face / @keyframes 去重 ---------------------------------------
   // shadow root 展开后，同一批字体与动画会被再 push 进 pageRules 一遍（客服组件 AirChatbot
   // 的 8 张 shadow 样式表），而第 7 步又把这两类 at-rule 无条件全部提到 shared/app.css。
@@ -498,10 +558,16 @@
     //   spilled  只放「字节保住了、只是落成文件」：{url, bytes, path, reason}。改存不是丢。
     //   notices  既没丢也没落文件的信息行（重编码、摘属性、@import 成环），读块的人看情况。
     var dropped = [];
+    // 与 dropped 同序、同文：每一项的 kind。字符串数组是给「直接读 dropped」的老读者留的，
+    // kind 是给要分类的人（模板占位 / HTTP 码 / 超限 / 跨域表）留的——两条账必须一一对应。
+    var droppedItems = [];
     var droppedTruncated = 0;
-    var drop = function (s) {
-      if (dropped.length < 40) dropped.push(String(s).slice(0, 220));
-      else droppedTruncated++;
+    var drop = function (s, kind) {
+      if (dropped.length < 40) {
+        var text = String(s).slice(0, 220);
+        dropped.push(text);
+        droppedItems.push({ kind: kind || 'other', text: text });
+      } else droppedTruncated++;
     };
     var notices = [];
     var note = function (s) { if (notices.length < 60) notices.push(String(s).slice(0, 220)); };
@@ -868,7 +934,7 @@
       // href 后面**必须留空格**：index.js 的 droppedItemOf 用 /https?:\/\/[^\s]+/ 抠 URL，
       // 紧贴着写括号会把「（后台取字节失败：HTTP」一起吞进 URL，文本那行就断成两截。
       drop('读不到样式表（跨域）：' + h + ' —— ' + row.reason +
-        '；这张表里的样式整份缺失：要么接受并在差异里说明，要么让用户在该表所在的域上再抓一次。');
+        '；这张表里的样式整份缺失：要么接受并在差异里说明，要么让用户在该表所在的域上再抓一次。', 'crossOriginSheet');
       return row;
     };
 
@@ -1315,6 +1381,15 @@
       if (assetMap.has(absu)) return assetMap.get(absu);
       var out = { kind: 'drop' };
       var got = null;
+      // 模板占位名不是资源：一次都不去取。取也是 200 + SPA 兜底 HTML，再落到「非图片/字体」
+      // 那条 drop——真实事故里这一串白跑就是 93.6 s。落点照旧 none，画面与现在一字不差。
+      if (isTemplatePlaceholder(absu)) {
+        out = { kind: 'drop', reason: '未插值的模板占位名（不是资源）' };
+        drop('未插值的模板占位（浏览器也拿不到）：' + absu, 'templatePlaceholder');
+        assetMap.set(absu, out);
+        logAsset(absu, out, null);
+        return out;
+      }
       try {
         got = await fetchOne(absu);
         var mime = got.mime || guessMime(absu);
@@ -1329,7 +1404,7 @@
             out = { kind: 'file', path: fpath, bytes: got.rawLen, mime: mime };
           } else {
             out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
-            drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
+            drop('字体 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu, 'overLimit');
           }
         } else {
           var info = await imageSize(doc, got.bytes, mime);
@@ -1342,7 +1417,7 @@
               out = { kind: 'file', path: spath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
             } else {
               out = { kind: 'drop', reason: '雪碧图原图超单文件上限 ' + MAX_ASSET_MB };
-              drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
+              drop('雪碧图 ' + iw + 'x' + ih + ' 原图 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu, 'overLimit');
             }
           } else if (got.rawLen <= MAX_INLINE_BYTES && !dimTooBig) {
             out = { kind: 'data', uri: 'data:' + mime + ';base64,' + toBase64(got.bytes), bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
@@ -1360,13 +1435,14 @@
               out = { kind: 'file', path: opath, bytes: got.rawLen, mime: mime, w: iw, h: ih, downsampled: false };
             } else {
               out = { kind: 'drop', reason: '超单文件上限 ' + MAX_ASSET_MB };
-              drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu);
+              drop('图片 ' + kbOf(got.rawLen) + ' 超单文件上限 ' + MAX_ASSET_MB + '，丢弃：' + absu, 'overLimit');
             }
           }
         }
       } catch (e) {
         out = { kind: 'drop', reason: String(e && e.message || e) };
-        drop('取不到字节，丢弃：' + absu + ' （' + String(e && e.message || e).slice(0, 80) + '）');
+        // 有 HTTP 码就是 httpStatus（404 / 403 / 500 是三种不同的麻烦），没有就是网络/别的。
+        drop('取不到字节，丢弃：' + absu + ' （' + String(e && e.message || e).slice(0, 80) + '）', e && e.httpStatus ? 'httpStatus' : 'other');
       }
       assetMap.set(absu, out);
       logAsset(absu, out, got);
@@ -1580,6 +1656,14 @@
     var pageCssText2 = subCss(pageCss.join(NL), '../../') + NL;
     if (utf8Len(appCssText) > SECTION_MAX_BYTES) { degrade.push('shared/app.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(appCssText) + '）'); }
     if (utf8Len(pageCssText2) > SECTION_MAX_BYTES) { degrade.push('pages/current/page.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(pageCssText2) + '）'); }
+    // 动画的账：数落盘的那两份原文（不是 pageRules 的条数——去向在第 7 步已经定了）。
+    var appAnim = countAnimations(appCssText);
+    var pageAnim = countAnimations(pageCssText2);
+    var keyframesByFile = {}, animationsByFile = {};
+    keyframesByFile[APP_CSS] = appAnim.keyframes;
+    keyframesByFile[PAGE_CSS] = pageAnim.keyframes;
+    animationsByFile[APP_CSS] = appAnim.animations;
+    animationsByFile[PAGE_CSS] = pageAnim.animations;
 
     var title = doc.title || opts.title || '';
     var entryHtml = [
@@ -1618,6 +1702,10 @@
       // 只有真丢。口径（缺陷 B）：取不到字节 / 超单文件上限 / 读不到样式表。
       // 「改存 assets/」一条都不在这里——它是搬走了，不是丢了，见 spilled。
       dropped: dropped,
+      // 与 dropped 同序同文，每条带 kind：templatePlaceholder（未插值的模板名，不是资源）/
+      // httpStatus（取字节回了 404/403/500）/ overLimit（超单文件上限）/ crossOriginSheet
+      // （跨域表读不到）/ other。字符串数组留给直接读 dropped 的人，分类看这里。
+      droppedItems: droppedItems,
       // 落成 assets/ 的那些（字节保住了）：每条都带 url / bytes / path / reason。
       spilled: spilled,
       // 既没丢也没落文件的信息行（重编码、摘属性、@import 成环），读块时按需看。
@@ -1637,6 +1725,12 @@
       // 那是「碰到的条数」，写进 app.css 的是去重之后的那份。
       fontFacesDeduped: st.fontFacesDeduped,
       keyframesDeduped: st.keyframesDeduped,
+      // 动画在哪份文件里：键就是产物里的相对路径。@keyframes 全在 shared/app.css
+      // （第 7 步把 @font-face / @keyframes 统一提到基线），page.css 里一条都没有。
+      keyframesByFile: keyframesByFile,
+      animationsByFile: animationsByFile,
+      animationCount: appAnim.animations + pageAnim.animations,
+      infiniteCount: appAnim.infinite + pageAnim.infinite,
       // 站内自定义属性：原样写出去的条数 / 丢掉的（只有宿主皮肤 --dsw-* 与解析不了的空值）
       customPropsKept: st.customPropsKept,
       customPropsDropped: st.customPropsDropped,
@@ -1734,5 +1828,11 @@
 
   // dedupeAtRules 也挂出去：离线拿现成材料的 app.css 重跑同一份去重逻辑（验收脚本用），
   // 不给它就没有第二条路能在不重抓页面的前提下量出「改后」的计数与字节。
-  globalThis.dshPageCapture = { extract: extract, dedupeAtRules: dedupeAtRules, version: '0.1.0' };
+  // isTemplatePlaceholder / countAnimations 同样挂出去：离线拿现成材料的原文复核同一条判据
+  // （验收脚本用）——不给就没有第二条路能在不重抓页面的前提下验「这条到底算不算占位」。
+  globalThis.dshPageCapture = {
+    extract: extract, dedupeAtRules: dedupeAtRules,
+    isTemplatePlaceholder: isTemplatePlaceholder, countAnimations: countAnimations,
+    version: '0.1.0'
+  };
 })();

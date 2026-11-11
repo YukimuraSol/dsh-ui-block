@@ -100,6 +100,21 @@ check('read_ui_block description keeps render-not-delivery (image for the model,
   assert.equal(/renders the entry page/.test(byName.read_ui_block.description), true)
   assert.equal(/::dsh-ui <name>/.test(byName.read_ui_block.description), true)
 })
+// 真实事故（44.5 s）：描述里写着 ~/.dsh/ui-blocks，模型去那里找块 → MISSING，然后 glob 扫
+// C:\ 根、30 s 超时，最后才在 <DSH_HOME>\ui-blocks 找到。描述必须点名这台机器的真身。
+check("the block directory in the description is this machine's <DSH_HOME>\\ui-blocks, not ~/.dsh", () => {
+  const expected = join(tempHome, 'ui-blocks', '<name>.uiblock')
+  assert.equal(byName.create_ui_block.description.includes(expected), true, 'the create description must spell the real path: ' + expected)
+  assert.equal(byName.create_ui_block.description.includes('~/.dsh/ui-blocks'), false, 'the old, wrong path is gone')
+  assert.equal(byName.create_ui_block.parameters.properties.name.description.includes(expected), true, 'the name parameter must spell it too')
+})
+check("create_ui_block returns the block's absolute path as its own field (path stays the relative spelling)", () => {
+  const schema = byName.create_ui_block.output.schema
+  assert.equal(schema.properties.absolutePath.type, 'string')
+  assert.equal(schema.required.includes('absolutePath'), true)
+  assert.equal(schema.properties.path.type, 'string', 'path is unchanged: the reference line and read_ui_block take it')
+  assert.match(schema.properties.absolutePath.description, /ui-blocks/)
+})
 check('both descriptions teach the ::dsh-ui line and nothing about fences', () => {
   for (const tool of ['create_ui_block', 'read_ui_block']) {
     assert.equal(byName[tool].description.includes('::dsh-ui'), true)
@@ -369,6 +384,9 @@ async function runScreenshotLeg() {
     authenticatedUrl: (base) => (token === undefined ? base : base + '/?token=' + token)
   }
   const value = await byName.read_ui_block.execute({ name: 'selfcheck-card' }, {})
+  // 读回来的 note 必须自己说清块在磁盘上的绝对位置：否则模型只能拿相对串去猜。
+  assert.ok(String(value.note).includes(join(tempHome, 'ui-blocks', 'selfcheck-card.uiblock')),
+    'the note carries the absolute path: ' + JSON.stringify(value.note))
   assert.equal(value.image.mediaType, 'image/png')
   assert.equal(saved.length, 1)
   return { png: saved[0].data, width: value.width, height: value.height, tokens: value.tokens, scheme: value.scheme }

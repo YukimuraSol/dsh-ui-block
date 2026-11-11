@@ -164,6 +164,16 @@ await ta('the skip ledger names each left-out file and why', async () => {
   assert.match(create.output.render({}, value).map((part) => part.text).join('\n'), /^NEXT: read_ui_block\(\{ name: "from-probe-2" \}\)$/m, 'the rendered text still spells the follow-up call out')
   assert.ok(!value.files.some((file) => file.path === 'report.json'), 'the report never becomes a section')
 })
+console.log('--- 2a. the result says WHERE the block is, as an absolute path ---')
+await ta('absolutePath is the real file under this DSH_HOME, and the render names it', async () => {
+  const value = await create.execute({ name: 'abs-probe', fromDir: site })
+  assert.equal(value.absolutePath, blockFile('abs-probe'), 'the absolute path IS the file on disk')
+  assert.equal(value.path, 'ui-blocks/abs-probe.uiblock', 'path stays the relative spelling the reference line uses')
+  assert.ok(existsSync(value.absolutePath), 'and it exists')
+  const text = create.output.render({}, value).map((part) => part.text).join('\n')
+  assert.match(text, /^UI block: ui-blocks\/abs-probe\.uiblock$/m, 'the path line is unchanged')
+  assert.ok(text.includes('Absolute path: ' + value.absolutePath), 'the rendered text names the absolute path too: ' + JSON.stringify(text.split('\n').slice(0, 3)))
+})
 
 console.log('--- 2b. srcset-only material is loaded, never reported as unreferenced ---')
 const retina = material('retina')

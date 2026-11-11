@@ -5,7 +5,7 @@
  * file-tools that turn a UI draft into a durable file, plus the route the client
  * reads that file back through:
  *
- *   create_ui_block(name, entry?, title?, files) -> ~/.dsh/ui-blocks/<name>.uiblock
+ *   create_ui_block(name, entry?, title?, files) -> <DSH_HOME>/ui-blocks/<name>.uiblock
  *   read_ui_block(name, width?, height?, probe?) -> a PNG of the SAME rendering the user sees,
  *     plus, when `probe` is given, the measured box of each selector
  *   GET /ui-blocks/<name>.uiblock        -> the client's read path for a reference line
@@ -1663,8 +1663,11 @@ async function readBlockBody(blockName) {
   return await readFile(target, 'utf8')
 }
 
+/** Where blocks actually live on this machine: <DSH_HOME>\ui-blocks, never ~/.dsh when DSH_HOME is set. */
+const BLOCKS_DIR_ABS = blocksDir()
+
 const CREATE_DESCRIPTION = [
-  'Create one UI block: a small virtual folder at ~/.dsh/ui-blocks/<name>.uiblock. One file is the ENTRY that renders; the rest are assets and extra pages it links. Use it whenever the user asks for a page, panel, dialog, card, widget or any other visual object — something to look at rather than read about.',
+  'Create one UI block: a small virtual folder at ' + join(BLOCKS_DIR_ABS, '<name>.uiblock') + ' — that is <DSH_HOME>\\ui-blocks, NOT ~/.dsh. One file is the ENTRY that renders; the rest are assets and extra pages it links. Use it whenever the user asks for a page, panel, dialog, card, widget or any other visual object — something to look at rather than read about.',
   '',
   'NO SCRIPTING: a block is pure data. Every document it serves ships under CSP `script-src \'none\'`, so a <script>, an on* handler or a javascript: URL in it never runs, and nothing remote arrives either — a CDN stylesheet or a remote image stays empty. Everything the block shows comes from its own files; anything that moves (a state switch, a canned demo) is produced from outside the block, by the message or by the timeline in DEMO below.',
   '',
@@ -2577,17 +2580,26 @@ function droppedItemOf(item) {
 }
 function splitDropped(report) {
   const raw = report !== null && typeof report === 'object' ? report.dropped : undefined
-  if (typeof raw === 'number') return { dropped: { count: raw, items: [] }, movedToAssets: { count: 0, sample: [] } }
+  if (typeof raw === 'number') return { dropped: { count: raw, items: [] }, movedToAssets: { count: 0, sample: [] }, placeholders: [] }
   // The extension writes moved-to-assets work into report.spilled (one row per resource,
   // with its path and bytes) and keeps report.dropped for real losses only. When that
   // field exists it IS the moved count; the word-matching below stays for older captures
   // whose report has no spilled array at all.
   const spilled = report !== null && typeof report === 'object' && Array.isArray(report.spilled) ? report.spilled : null
+  // 未插值的模板占位名不是「丢了的资源」：单列一栏。它们混进 really lost 的账里，
+  // 就是那次十个 web_fetch 复核的由来——数它们等于告诉模型"有东西真的没了"。
+  const placeholderTexts = new Set()
+  const kinds = report !== null && typeof report === 'object' && Array.isArray(report.droppedItems) ? report.droppedItems : []
+  for (const item of kinds) {
+    if (item !== null && typeof item === 'object' && item.kind === 'templatePlaceholder') placeholderTexts.add(String(item.text))
+  }
   const lost = []
   const moved = []
+  const placeholders = []
   for (const item of Array.isArray(raw) ? raw : []) {
     const parsed = droppedItemOf(item)
-    if (spilled === null && MOVED_REASON_RE.test(parsed.line)) moved.push({ url: parsed.url, reason: parsed.reason })
+    if (placeholderTexts.has(parsed.line)) placeholders.push({ url: parsed.url, reason: parsed.reason })
+    else if (spilled === null && MOVED_REASON_RE.test(parsed.line)) moved.push({ url: parsed.url, reason: parsed.reason })
     else lost.push({ url: parsed.url, reason: parsed.reason })
   }
   if (spilled !== null) {
@@ -2598,7 +2610,7 @@ function splitDropped(report) {
       moved.push({ url, reason: (reason === '' ? 'moved into assets/' : reason) + (path === '' ? '' : ' -> ' + path) })
     }
   }
-  return { dropped: { count: lost.length, items: lost }, movedToAssets: { count: moved.length, sample: moved.slice(0, 1) } }
+  return { dropped: { count: lost.length, items: lost }, movedToAssets: { count: moved.length, sample: moved.slice(0, 1) }, placeholders }
 }
 
 /** The type bucket one captured file belongs to, for the index. */
@@ -2635,6 +2647,7 @@ async function indexMaterial(dir, files, report) {
   const split = splitDropped(report)
   const dropped = split.dropped
   const movedToAssets = split.movedToAssets
+  const placeholders = split.placeholders
   // A stylesheet the extension could not read (cross-origin) takes its whole
   // <link> with it, so the dangling scan below looks clean by construction.
   const sheetsFailed = report !== null && typeof report === 'object' && Number.isFinite(Number(report.sheetsFailed))
@@ -2666,6 +2679,7 @@ async function indexMaterial(dir, files, report) {
     groups,
     dropped,
     movedToAssets,
+    placeholders,
     sheetsFailed,
     dangling,
     /** What create_ui_block needs: the directory itself is the whole material set. */
@@ -2703,6 +2717,9 @@ function isFrameShell(report) {
   return report !== null && typeof report === 'object' && report.frameShell === true
 }
 
+/** The two CSS files a capture always writes, in the order the @keyframes line names them. */
+const ANIMATION_FILE_ORDER = ['shared/app.css', 'pages/current/page.css']
+
 /** The capture tool's rendered text: where it landed, what to do with it, the index, the report. */
 function captureText(value) {
   const lines = []
@@ -2721,6 +2738,24 @@ function captureText(value) {
       const bucket = index.groups[key]
       if (bucket.length === 0) continue
       lines.push('  ' + key + ': ' + bucket.map((file) => file.path + ' ' + String(file.bytes)).join(', '))
+    }
+    // 动画在哪份文件里。抓取把 @keyframes 全提到 shared/app.css，page.css 里一条都没有；
+    // 不说这一句，模型就在 page.css 里找 @keyframes，找不到再去 web_fetch 原站（实测 57.5 s）。
+    const anim = value.report !== null && typeof value.report === 'object' ? value.report.keyframesByFile : undefined
+    if (anim !== null && typeof anim === 'object') {
+      const parts = ANIMATION_FILE_ORDER.filter((file) => anim[file] !== undefined)
+        .map((file) => String(anim[file]) + ' in ' + file)
+      lines.push('  @keyframes: ' + parts.join(', ') + '; animations: ' + String(value.report.animationCount)
+        + ' declarations, ' + String(value.report.infiniteCount) + ' with infinite')
+    }
+    // Template placeholders are NOT lost resources: they are names that never got a value,
+    // and the browser cannot fetch them either. Listing them under "really LOST" is what
+    // sent a model off to web_fetch ten of them (93.6 s).
+    if (index.placeholders !== undefined && index.placeholders.length > 0) {
+      const urls = index.placeholders.map((item) => item.url).filter((url) => url !== '')
+      lines.push('  ' + String(index.placeholders.length) + ' resource(s) look like UNRESOLVED TEMPLATE placeholders (not real resources): '
+        + (urls.length === 0 ? '(no url)' : urls.join(', ')))
+      lines.push('  A placeholder is a template name that never got a value: the browser cannot load it either and nothing on screen is missing because of it — do not go and re-check these.')
     }
     if (index.dropped.count > 0) {
       // Every lost one, in full: a lost resource is a defect to report, and a count
@@ -2846,7 +2881,7 @@ export function apply(ctx, config) {
       name: {
         type: 'string',
         required: true,
-        description: 'Block name: 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit. The file is ~/.dsh/ui-blocks/<name>.uiblock.'
+        description: 'Block name: 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit. The file is ' + join(BLOCKS_DIR_ABS, '<name>.uiblock') + '.'
       },
       entry: {
         type: 'string',
@@ -2884,6 +2919,7 @@ export function apply(ctx, config) {
         additionalProperties: false,
         properties: {
           path: { type: 'string', required: true },
+          absolutePath: { type: 'string', required: true, description: 'The block file\'s absolute path on disk (<DSH_HOME>\\ui-blocks\\<name>.uiblock). \'path\' is the relative spelling the reference line uses; this is the one to hand to a shell or an editor.' },
           name: { type: 'string', required: true },
           backup: { type: 'string' },
           requested: { type: 'string', description: 'Present only when the requested name was taken and the block was written under the next free number: the name that was asked for. `name` is the one that exists.' },
@@ -2946,7 +2982,7 @@ export function apply(ctx, config) {
       },
       render: (args, value) => [{
         type: 'text',
-        text: 'UI block: ' + value.path + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
+        text: 'UI block: ' + value.path + '\nAbsolute path: ' + value.absolutePath + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
           + (value.requested === undefined ? '' : '\nRENAMED — "' + value.requested + '" is already taken, so this one was written as "' + value.name + '". Use the NEW name everywhere: read_ui_block({ name: "' + value.name + '" }) and the ::dsh-ui ' + value.name + ':: line.')
           + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
           + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
@@ -3013,6 +3049,9 @@ export function apply(ctx, config) {
       const written = await writeBlock(finalName, assembled.text)
       return {
         path: blockPath(finalName),
+        // The absolute path on disk: 'path' is the spelling the reference line and read_ui_block
+        // take, and it is NOT a filesystem path (~/.dsh is wrong here — DSH_HOME decides).
+        absolutePath: written.target,
         name: finalName,
         ...finalName === blockName ? {} : { requested: blockName },
         ...written.backup === undefined ? {} : { backup: written.backup },
@@ -3085,7 +3124,7 @@ export function apply(ctx, config) {
           tokens: { type: 'number', required: true },
           // Not the page's own colours: `scheme` is the skin the CLIENT renders blocks in (render.tokens().scheme), so a light page painted in the dark canvas still reports "dark".
           scheme: { type: 'string', required: true, description: 'The skin the client rendered this block in (window.__dshPageBlock.render.tokens().scheme: "dark" or "light"). It describes the CANVAS the block was wrapped in, NOT the captured page\'s own colours — a light page rendered in the dark skin still reads "dark" here.' },
-          note: { type: 'string', description: 'Present when the requested height was clamped to the first screen: says both numbers and the way to get the whole page.' },
+          note: { type: 'string', required: true, description: 'The block file\'s absolute path on disk (<DSH_HOME>\\ui-blocks\\<name>.uiblock). When the requested height was clamped to the first screen, the same string also says both numbers and how to get the whole page.' },
           measurements: {
             type: 'string',
             description: 'One line per probed selector: match count, then the first match box. Present only when probe was passed.'
@@ -3142,6 +3181,9 @@ export function apply(ctx, config) {
       })
       if (exec !== undefined && exec.signal !== undefined && exec.signal.aborted) throw new Error(READ_TOOL + ': aborted')
       const image = await attachments.saveImage({ data: shot.png, mediaType: 'image/png', name: blockName + '.png' })
+      // Where the block actually is, in full: 'path' is the reference-line spelling, and a
+      // model that treats it as a disk path goes hunting in ~/.dsh (one globbed all of C: for 30 s).
+      const blockAbsolute = join(blocksDir(), blockName + EXT)
       return {
         path: blockPath(blockName),
         width: shot.width,
@@ -3150,7 +3192,7 @@ export function apply(ctx, config) {
         tokens: shot.tokenCount,
         scheme: String(shot.scheme ?? ''),
         ...shot.measurements === undefined ? {} : { measurements: shot.measurements },
-        ...note === undefined ? {} : { note },
+        note: (note === undefined ? '' : note + ' — ') + 'the block file is ' + blockAbsolute,
         image: {
           attachmentId: String(image.attachmentId),
           mediaType: String(image.mediaType),

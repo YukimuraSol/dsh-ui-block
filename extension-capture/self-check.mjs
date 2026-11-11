@@ -270,6 +270,24 @@ function sheetsPage(port2) {
     '</head><body><main><h1>两张跨域样式表</h1>' +
     '<button class="fallback-btn" id="savebtn">保存</button><p id="note">一张能取，一张 404</p></main></body></html>';
 }
+// ---- 夹具：未插值的模板占位名 ---------------------------------------------
+// 真实事故（93.6 s 返工）：Angular 模板渲染前残留的 img src 写着 /user/avatarSmallUrl、
+// /course/99569/instructor.avatar_small_url，服务器一律回 200 + SPA 兜底 HTML，模型逐个
+// web_fetch 复核了 10 条。同一页的 iconfont.woff?t=… 带扩展名带查询串，是**真资源**——
+// 「宁窄勿宽」那条边界就压在它身上：它绝不许被判成占位。
+// 断言两头都要：占位们一次都没被取（FETCH_LOG 里没有），iconfont 被取了（判据没误伤）。
+const PLACEHOLDER_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>template placeholders</title>' +
+  '<style>html,body{margin:0}main{padding:24px}img{width:40px;height:40px;display:inline-block}' +
+  '@font-face{font-family:IconTest;src:url("/static/iconfont.woff?t=1595385243010") format("woff")}' +
+  '@keyframes ph-pulse{0%{opacity:.4}100%{opacity:1}}' +
+  '.ph-anim{animation:ph-pulse 1.2s ease-in-out infinite}' +
+  '.ph-plain{animation:ph-pulse 2s ease both}</style></head><body><main>' +
+  '<h1>未插值的模板占位</h1>' +
+  '<img id="avatar" src="/user/avatarSmallUrl">' +
+  '<img id="instructor" src="/course/99569/instructor.avatar_small_url">' +
+  '<p class="ph-anim">动画</p><p class="ph-plain">第二条</p>' +
+  '</main></body></html>';
+
 // ---- 缺陷 B 夹具：一页多张大图，把内嵌总量顶过预算 → 必须有条目从 data: 改判成文件 ----
 const SPILL_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>inline budget spill</title>' +
   '<style>html,body{margin:0}main{padding:24px}.shot{display:block;width:180px;height:180px;margin:8px 0}</style>' +
@@ -292,10 +310,13 @@ function squareSvg(n, color) {
   return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '"><rect width="' + n + '" height="' + n + '" fill="' + color + '"/></svg>';
 }
 
+// 每次请求都记一笔路径：用来证明「模板占位名一次都没去取」（省下的就是那 93.6 s 白跑）。
+const FETCH_LOG = [];
 function startServer(routes) {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
       const key = decodeURIComponent(String(req.url || '').split('?')[0]);
+      FETCH_LOG.push(key + (String(req.url || '').indexOf('?') >= 0 ? '?' + String(req.url).split('?')[1] : ''));
       const hit = routes[key];
       if (!hit) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('not found'); return; }
       res.writeHead(200, { 'content-type': hit.mime, 'content-length': hit.bytes.length, 'cache-control': 'no-store' });
@@ -306,7 +327,11 @@ function startServer(routes) {
 }
 
 // background.js 的取字节就是一个带主机权限的 fetch；这里用 Node 的 fetch 演同一个动作。
+// 走「后台取字节」这条通道的 URL：只有扩展真的去取时才会出现在这里。
+// 服务端自己的 FETCH_LOG 分不清这个——页面自己的 <img src> 也是同一条 HTTP 请求。
+const BG_FETCH_LOG = [];
 async function bgFetchBytes(url) {
+  BG_FETCH_LOG.push(String(url));
   try {
     const res = await fetch(url);
     // 与 background.js 同一口径：非 2xx 时把 HTTP 码带回去（report.sheetsFailedItems.httpStatus）
@@ -501,6 +526,9 @@ async function main() {
       // 缺陷 A / B 的两张夹具页（A 的跨域表在另一台服务、另一个端口上）
       '/sheets.html': { mime: 'text/html', bytes: Buffer.from(sheetsPage(port2), 'utf8') },
       '/spill.html': { mime: 'text/html', bytes: Buffer.from(SPILL_PAGE, 'utf8') },
+      '/placeholder.html': { mime: 'text/html', bytes: Buffer.from(PLACEHOLDER_PAGE, 'utf8') },
+      // 带查询串的字体：请求时服务端按 ? 截过的 key 找这一条，真字节照发。
+      '/static/iconfont.woff': { mime: 'font/woff', bytes: Buffer.alloc(3 * 1024, 0x43) },
     });
     srv = started.server;
     const hostA = 'http://127.0.0.1:' + started.port;
@@ -930,6 +958,7 @@ async function main() {
         dir, count: run.files.length, totalBytes: run.report.bytes,
         groups: { html: [], css: [], images: [], fonts: [], other: [] },
         dropped: split.dropped, movedToAssets: split.movedToAssets,
+        placeholders: split.placeholders,
         sheetsFailed: run.report.sheetsFailed, dangling: [], fromDir: dir, suggestedName: name
       };
       const summary = reporting.captureSummary(run.files, run.report);
@@ -1003,6 +1032,48 @@ async function main() {
         /report\.movedToAssets: \d+ resource\(s\) KEPT/.test(bText.text),
       'summary=' + JSON.stringify(bText.summary) + '；文本里的账=' +
         JSON.stringify(bText.text.split(NL).filter((l) => /report\.(dropped|movedToAssets)/.test(l))));
+
+    // ---- 15k2. 模板占位名单列：一次都不取，真资源一条都不许误判 -------------
+    // 真实事故（93.6 s）：一条 run_code 里连发 10 次 web_fetch 复核 6 个 avatar 占位 URL
+    // 与 4 个 iconfont，返回全是 200 + SPA 兜底 HTML。占位不是资源，取它纯属白跑。
+    await cdp.navigate(s, hostA + '/placeholder.html');
+    const injPh = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injPh.exceptionDetails) throw new Error('placeholder 页注入 extractor 失败：' + JSON.stringify(injPh.exceptionDetails));
+    await installBgSeam(s, cdp);
+    const phRun = await runExtract(s, { origin: hostA + '/placeholder.html' });
+    const pr = phRun.report;
+    const phItems = (pr.droppedItems || []).filter((it) => it.kind === 'templatePlaceholder');
+    const phItemText = phItems.map((it) => String(it.text)).join(' | ');
+    // 判据是「扩展真的去取了吗」：走后台那条通道的 URL 才作数。服务端自己的日志不算——
+    // 页面上的 <img src="/user/avatarSmallUrl"> 本身就是一条 HTTP 请求。
+    const phFetched = BG_FETCH_LOG.some((url) => /avatarSmallUrl|avatar_small_url/.test(url));
+    assert('占位夹具：两条模板占位进 droppedItems(kind=templatePlaceholder)，且一次都没去取',
+      phItems.length === 2 && /avatarSmallUrl/.test(phItemText) && /instructor\.avatar_small_url/.test(phItemText) && !phFetched,
+      'kind=templatePlaceholder ' + phItems.length + ' 条：' + JSON.stringify(phItems) +
+        '；服务端收到过这些路径吗=' + String(phFetched) +
+        '；dropped 里那两条原文=' + JSON.stringify((pr.dropped || []).filter((d) => /avatarSmallUrl|avatar_small_url/.test(String(d)))));
+    assert('占位夹具：带扩展名带查询串的 iconfont.woff?t=… 不算占位（去了、取到了）',
+      !phItems.some((it) => /iconfont/.test(String(it.text))) &&
+        BG_FETCH_LOG.some((url) => /iconfont\.woff\?t=1595385243010$/.test(url)),
+      '后台通道里的 iconfont 请求=' + JSON.stringify(BG_FETCH_LOG.filter((url) => /iconfont/.test(url))) +
+        '；被判成占位的 iconfont=' + String(phItems.some((it) => /iconfont/.test(String(it.text)))) +
+        '；assets 里 iconfont 那条=' + JSON.stringify((pr.assets || []).filter((row) => /iconfont/.test(String(row.url)))));
+    assert('占位夹具：@keyframes 在哪份文件、animation 几条几条带 infinite，都进 report',
+      !!pr.keyframesByFile && pr.keyframesByFile['shared/app.css'] >= 1 && pr.keyframesByFile['pages/current/page.css'] === 0 &&
+        !!pr.animationsByFile && pr.animationsByFile['shared/app.css'] === 0 && Number(pr.animationCount) >= 2 &&
+        Number(pr.infiniteCount) >= 1,
+      'keyframesByFile=' + JSON.stringify(pr.keyframesByFile) + '；animationsByFile=' + JSON.stringify(pr.animationsByFile) +
+        '；animationCount=' + pr.animationCount + '；infiniteCount=' + pr.infiniteCount);
+    const phText = textOf(phRun, path.join(HERE, 'out-selfcheck-PH'), 'fixture-ph').text;
+    assert('占位夹具：capture_page 文本单列一行占位，并说「不必去复核」，不混进 really LOST',
+      /2 resource\(s\) look like UNRESOLVED TEMPLATE placeholders \(not real resources\): .*avatarSmallUrl/.test(phText) &&
+        /do not go and re-check these/.test(phText) &&
+        !/report\.dropped: \d+ resource\(s\) really LOST[\s\S]*avatarSmallUrl/.test(phText),
+      '文本里的相关行=' + JSON.stringify(phText.split(NL).filter((l) => /TEMPLATE placeholders|@keyframes:|report\.dropped|avatarSmallUrl/.test(l))));
+    assert('占位夹具：文本里那行 @keyframes 点名 shared/app.css 与实测计数',
+      /@keyframes: 1 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 2 declarations, 1 with infinite/.test(phText),
+      '那一行=' + JSON.stringify(phText.split(NL).filter((l) => /@keyframes:/.test(l))) +
+        '；report 里的数=' + JSON.stringify({ kf: pr.keyframesByFile, an: pr.animationsByFile, c: pr.animationCount, i: pr.infiniteCount }));
 
     // ---- 15l. 变量作用域：站内变量原样保留、逐元素生效 ------------------------
     // 真实事故（pintia 考试页）：「保存」按钮在真站是 rgb(62,126,234)，抓下来是

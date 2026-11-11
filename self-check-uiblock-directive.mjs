@@ -838,6 +838,52 @@ await ta('the text lists every lost one, one moved example, and no all-clear whe
   assert.doesNotMatch(clean, /could NOT be captured/)
   assert.match(clean, /report\.dropped: nothing lost/)
 })
+// ---------------------------------------------------------------------------
+// 19b. 两行新增的账：未插值的模板占位名单列（不是「丢了」），@keyframes 点名在哪份文件。
+// 真实事故：占位名被当成 lost 资源 → 十个 web_fetch 复核（93.6 s）；@keyframes 只在
+// shared/app.css，page.css 里一条都没有 → 在 page.css 里 grep 三轮（57.5 s）。
+// ---------------------------------------------------------------------------
+console.log('--- 19b. placeholders are their own line; @keyframes says which file ---')
+const phLost = '取不到字节，丢弃：https://x.test/user/avatarSmallUrl （HTTP 404）'
+const ph404 = '取不到字节，丢弃：https://x.test/m.png （HTTP 404）'
+const phReport = {
+  dropped: [phLost, ph404],
+  droppedItems: [{ kind: 'templatePlaceholder', text: phLost }, { kind: 'httpStatus', text: ph404 }],
+  sheetsFailed: 0,
+  keyframesByFile: { 'shared/app.css': 11, 'pages/current/page.css': 0 },
+  animationsByFile: { 'shared/app.css': 40, 'pages/current/page.css': 1 },
+  animationCount: 41,
+  infiniteCount: 1
+}
+const phSplit = reporting.splitDropped(phReport)
+const phIndex = {
+  dir: 'D:/cap', count: 0, totalBytes: 0,
+  groups: { html: [], css: [], images: [], fonts: [], other: [] },
+  dropped: phSplit.dropped, movedToAssets: phSplit.movedToAssets, placeholders: phSplit.placeholders,
+  sheetsFailed: 0, dangling: [], suggestedName: 'cap'
+}
+const phTextOut = reporting.captureText({ dir: 'D:/cap', summary: 'x', index: phIndex, files: [], report: phReport })
+await ta('a template placeholder is its own bucket, not "really lost"', () => {
+  assert.equal(phSplit.dropped.count, 1, 'only the 404 is really lost')
+  assert.deepEqual(phSplit.placeholders.map((item) => item.url), ['https://x.test/user/avatarSmallUrl'])
+})
+await ta('the text gives placeholders their own line and one sentence saying not to re-check them', () => {
+  assert.match(phTextOut, /1 resource\(s\) look like UNRESOLVED TEMPLATE placeholders \(not real resources\): https:\/\/x\.test\/user\/avatarSmallUrl/)
+  assert.match(phTextOut, /do not go and re-check these/)
+  assert.match(phTextOut, /report\.dropped: 1 resource\(s\) really LOST/)
+  // 只有 404 那条算丢：占位名不许出现在 really LOST 那一段里（report.json 逐字打印的
+  // 那段不算——那是原始数据，dropped 与 droppedItems 都在里面）。
+  const textLines = phTextOut.split('\n')
+  const at = textLines.findIndex((line) => line.startsWith('  report.dropped: '))
+  const lostLines = []
+  for (let i = at + 1; i < textLines.length && textLines[i].startsWith('    '); i += 1) lostLines.push(textLines[i])
+  assert.equal(lostLines.length, 1, 'exactly one really-lost line: ' + JSON.stringify(lostLines))
+  assert.match(lostLines[0], /m\.png/)
+  assert.doesNotMatch(lostLines.join('\n'), /avatarSmallUrl/, 'the placeholder is not listed under really LOST')
+})
+await ta('the @keyframes line names both files and the animation counts', () => {
+  assert.match(phTextOut, /@keyframes: 11 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 41 declarations, 1 with infinite/)
+})
 rmSync(home, { recursive: true, force: true })
 
 console.log('\nself-check-uiblock-directive: ' + n + ' assertions passed')
