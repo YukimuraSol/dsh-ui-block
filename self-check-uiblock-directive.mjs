@@ -1045,16 +1045,18 @@ t('both document kinds reload, and nothing else about the block changes', () => 
   // 不给块的渲染加任何参数
   assert.doesNotMatch(replayBody, /state\.res =|state\.zoom =|setAttribute\('width'|setAttribute\('height'/)
 })
-t('the sandbox is not widened, and a demo block gets no replay button', () => {
+t('the sandbox is not widened, and a demo block is no longer special-cased', () => {
+  // replayBlock 仍然拒绝演示块（它的画面归播放器，重载会和时间轴抢状态）；
+  // 但「有没有这颗按钮」不再看 demoSpec——一套头，两种动作。
   assert.match(replayBody, /if \(state\.demoSpec\) return null/)
-  assert.match(controlsBody, /if \(!state\.demoSpec\) \{/)
+  assert.doesNotMatch(controlsBody, /if \(!state\.demoSpec\)/, 'the replay button went back behind a demo branch')
   // allow-scripts 只允许出现在注释里（文档在讲「为什么不能加」），代码里一次都不许有：
   // 与 allow-same-origin 同时给等于没有沙箱，块里的脚本就能摸到聊天页。
   assert.doesNotMatch(source, /setAttribute\(\s*'sandbox'\s*,\s*'[^']*allow-scripts/)
   const sandboxes = source.match(/setAttribute\('sandbox'/g) || []
-  assert.equal(sandboxes.length, 2, 'both canvases (block iframe + player iframe) declare a sandbox')
+  assert.equal(sandboxes.length, 2, 'both canvases (block iframe + player layer) declare a sandbox')
   assert.match(source, /frame\.setAttribute\('sandbox', 'allow-same-origin'\)/)
-  assert.match(source, /iframe\.setAttribute\('sandbox', 'allow-same-origin'\)/)
+  assert.match(source, /el\.setAttribute\('sandbox', 'allow-same-origin'\)/)
 })
 t('icon only: no visible word; every hint comes from the row own bubble', () => {
   assert.match(controlsBody, /aria-label', '重放动画'/, 'the accessible name is gone')
@@ -1066,7 +1068,10 @@ t('icon only: no visible word; every hint comes from the row own bubble', () => 
   // 反的。所以三颗一起改成与「复制路径」同款的自绘气泡，title 一个都不许留。
   assert.doesNotMatch(controlsBody, /\.title = /, 'a native title is back on the banner row')
   assert.match(controlsBody, /attachTip\(resButton, '画布分辨率（点开可改，含自定义 W×H）'\)/)
-  assert.match(controlsBody, /attachTip\(replayButton, '重新加载画布内容（等同刷新）'\)/)
+  // 一颗按钮两种说明：普通块说「重新加载」，演示块说「从第 1 步重来」。
+  assert.match(controlsBody, /attachTip\(replayButton, function \(\) \{/)
+  assert.match(controlsBody, /'重新开始演示（从第 1 步重来）'/)
+  assert.match(controlsBody, /'重新加载画布内容（等同刷新）'/)
   assert.match(controlsBody, /attachTip\(pickButton, '在画布内选取元素 · 点元素插入输入框 · 滚轮切层 · 再点退出'\)/)
   // 气泡本体钉的是外壳 span._bubble 的实测值（out/probe/tooltip-bubble/report-shell.json）：
   // bg rgb(67,69,74)、白字、13px/20px、radius 8、padding 3px 7px、z 1100、无阴影、固定定位。
@@ -1110,10 +1115,14 @@ t('icon only: no visible word; every hint comes from the row own bubble', () => 
   // 照最右边「复制路径」那个 24×24 的样子做。分辨率 / 重放 / 选取元素共用同一条
   // 24px 规则；图标 14×14、stroke 1.5。行距 2px 只给这一行，演示块的传输条
   // （播放/暂停/重新开始）在标题里另起一行，仍保持旧的小胶囊形状。
-  assert.match(source, /\.dshpb-ctl>\.dshpb-btn:not\(\[data-dshpb-demo\]\)\{display:inline-flex/)
+  // 一套头（2026-11-11 定稿）：演示块不再有自己的传输条，四颗按钮共用同一条
+  // 24px / 无边框 / 2px 间距规则——所以 CSS 里一个 demo 专用选择器都不该留。
+  assert.match(source, /\.dshpb-ctl>\.dshpb-btn\{display:inline-flex/)
   assert.match(source, /height:24px;min-width:24px;padding:0 5px;border:0;border-radius:6px;background:transparent/)
+  assert.match(source, /\.dshpb-ctl\{[^}]*gap:2px/)
   assert.match(source, /\.dshpb-replay svg\{display:block;width:14px;height:14px;/)
-  assert.match(source, /\.dshpb-ctl:not\(\[data-dshpb-demo-bar\]\)\{gap:2px\}/)
+  assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
+  assert.doesNotMatch(source, /data-dshpb-demo|buildTransport/, 'a demo-only control is back in client.js')
   assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
 })
 t('the test seam calls the same function the button does', () => {
@@ -1152,6 +1161,118 @@ t('both readers use it, so a skipped paragraph is skipped in the index too', () 
   assert.match(sweepBody, /if \(isPageChrome\(node\)\) continue/)
   const indexBody = sliceBetween('function refIndexIn(host, lineNode) {', 'function pinOf(')
   assert.match(indexBody, /if \(isPageChrome\(node\)\) continue/)
+})
+
+// ---------------------------------------------------------------------------
+// 22. demo.json 指向入口：入口文档没有自己的 section 名，所以 entry.html /
+//     index.html / ./entry.html 都解析到入口；真不存在的名字要在报错里列出这个块
+//     **实际可用**的 section 名（模型据此自改，用户不必来回一趟）。
+// ---------------------------------------------------------------------------
+console.log('--- 22. demo snapshots may name the entry, and a 404 teaches what exists ---')
+const aliasSrc = hostSource.slice(hostSource.indexOf('const ENTRY_SECTION_ALIASES'), hostSource.indexOf('/** The lowercase extension of a path'))
+t('entry.html / index.html / ./entry.html all mean the entry document', () => {
+  assert.ok(aliasSrc.length > 0, 'the alias helper is missing from index.js')
+  const helpers = new Function(aliasSrc + '; return { isEntryAlias, availableSections };')()
+  for (const name of ['entry.html', 'index.html', './entry.html', './index.html', 'Entry.HTML', 'entry.htm', 'entry', 'index']) {
+    assert.equal(helpers.isEntryAlias(name), true, name + ' must resolve to the entry')
+  }
+  for (const name of ['pages/after.html', 'home', 'entry2.html', 'index.html.bak', null]) {
+    assert.equal(helpers.isEntryAlias(name), false, name + ' must NOT resolve to the entry')
+  }
+  assert.match(hostSource, /if \(sectionPath === null \|\| sectionPath === ''\) \{\n\s+sendEntry\(\)/, 'the empty path must still serve the entry')
+  assert.match(hostSource, /const file = sections\.files\.find\(\(entry\) => entry\.path === sectionPath\)\n\s+if \(file === undefined\) \{[\s\S]{0,400}isEntryAlias\(sectionPath\)/, 'an explicit section of that name must win over the alias')
+})
+t('a wrong snapshot name comes back listing the sections that do exist', () => {
+  const helpers = new Function(aliasSrc + '; return { isEntryAlias, availableSections };')()
+  const text = helpers.availableSections({ files: [{ path: 'pages/after.html' }, { path: 'assets/a.css' }] })
+  assert.equal(text, '(entry), pages/after.html, assets/a.css')
+  assert.match(hostSource, /no section ' \+ sectionPath \+ ' in ' \+ blockPath\(blockName\)/, 'the 404 must still name the section')
+  assert.match(hostSource, /' — available: ' \+ availableSections\(sections\)/, 'the 404 must name what exists')
+})
+// 真实的 route：一个 demo.json 把入口写成 entry.html 的多文件块
+const aliasBlockPath = join(home, 'ui-blocks', 'alias-probe.uiblock')
+writeFileSync(aliasBlockPath, '<!doctype html><html><body>ENTRY DOC</body></html>\n' + MARK + 'pages/after.html -->\n<!doctype html><html><body>AFTER</body></html>\n' + MARK + 'demo.json -->\n{"snapshots":{"home":"entry.html","after":"pages/after.html"}}\n', 'utf8')
+await ta('a demo snapshot spelled entry.html serves the entry document (no 404)', async () => {
+  const answer = await call('/ui-blocks/alias-probe/entry.html')
+  assert.equal(answer.status, 200)
+  assert.equal(answer.headers['content-type'], 'text/html; charset=utf-8')
+  assert.equal(html(answer.body), '<!doctype html><html><body>ENTRY DOC</body></html>')
+})
+await ta('index.html / entry.htm resolve to the same document', async () => {
+  for (const name of ['index.html', 'entry.htm']) {
+    const answer = await call('/ui-blocks/alias-probe/' + name)
+    assert.equal(answer.status, 200, name)
+    assert.equal(html(answer.body), '<!doctype html><html><body>ENTRY DOC</body></html>')
+  }
+  const after = await call('/ui-blocks/alias-probe/pages/after.html')
+  assert.equal(after.status, 200)
+  assert.equal(html(after.body), '<!doctype html><html><body>AFTER</body></html>')
+})
+await ta('a name that really is not there lists the ones that are', async () => {
+  const answer = await call('/ui-blocks/alias-probe/nope.html')
+  assert.equal(answer.status, 404)
+  assert.equal(html(answer.body), 'no section nope.html in ui-blocks/alias-probe.uiblock — available: (entry), pages/after.html, demo.json')
+})
+t('create_ui_block tells the model how to point at the entry', () => {
+  const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
+  assert.match(create, /the ENTRY document has no section name of its own/)
+  assert.match(create, /point at it as "entry\.html", "index\.html"/)
+  assert.match(create, /an error that lists the available ones/)
+})
+
+// ---------------------------------------------------------------------------
+// 23. 闪黑帧：切步骤不许再换文档。每份快照一层 iframe，开场各导航一次，切换只切
+//     显示哪一层，交换在一帧里（opacity 1/0），我们不加任何过渡；容器也不许写死黑底。
+// ---------------------------------------------------------------------------
+console.log('--- 23. a step switch swaps layers; it never re-navigates, and never paints black ---')
+t('the stage is not painted black and a switch never re-navigates a frame', () => {
+  const vendored = source.slice(source.indexOf('// [vendored-player]'), source.indexOf('// [/vendored-player]'))
+  assert.ok(vendored.length > 2000, 'the vendored player is missing')
+  assert.match(vendored, /\.snap-stage\{position:relative;overflow:hidden;background:transparent\}/, 'the stage still has a hard-coded background')
+  assert.doesNotMatch(vendored, /iframe\.src = srcFor/, 'a switch still re-navigates the frame')
+  assert.match(vendored, /el\.src = srcFor\(key\)/, 'each snapshot must navigate once, when its layer is created')
+  assert.match(vendored, /function swapTo\(rec\)/, 'the layer swap is missing')
+})
+t('the swap is one frame of opacity, with no transition of our own', () => {
+  const swapBody = sliceBetween('function swapTo(rec) {', 'function want(key) {')
+  assert.ok(swapBody.length > 0, 'swapTo() not found')
+  assert.match(swapBody, /requestAnimationFrame\(\(\) => \{/, 'the swap must happen inside one frame')
+  assert.match(swapBody, /r\.el\.style\.opacity = on \? '1' : '0'/, 'opacity must flip 1/0 in that frame')
+  assert.doesNotMatch(swapBody, /transition|animation:/, 'we must not animate the swap')
+})
+t('a layer is only shown once its document is ready (fonts included), 800ms fallback', () => {
+  const readyBody = sliceBetween('function settle(rec, deadline) {', 'function sampleBg(rec) {')
+  assert.ok(readyBody.length > 0, 'settle() not found')
+  assert.match(readyBody, /d\.readyState === 'complete'/, 'readyState complete is the criterion')
+  assert.match(readyBody, /d\.fonts\.status === 'loaded'/, 'fonts must be in before we swap')
+  assert.match(source, /const READY_TIMEOUT_MS = 800/, 'the 800ms fallback must be one constant')
+  assert.match(readyBody, /if \(Date\.now\(\) >= deadline\) \{ finish\(rec\); return; \}/, 'the fallback must still swap instead of stalling the timeline')
+})
+t('a demo block autoplays and loops, and the header has no transport row', () => {
+  const paintDemoBody = sliceBetween('function paintDemo(state) {', 'function armAutoplay(state) {')
+  assert.match(paintDemoBody, /state\.player\.play\(\)/, 'a demo block must start by itself')
+  assert.match(source, /const loopEnabled = timeline\.loop !== false/)
+  assert.match(source, /if \(loopEnabled\) \{ resetPlayback\(\); return; \}/, 'the timeline must restart itself at the end')
+  assert.doesNotMatch(source, /buildTransport|data-dshpb-demo/, 'the transport row is back')
+})
+t('the swap keeps the old layer on screen until the new one is ready', () => {
+  const wantBody = sliceBetween('function want(key) {', 'function setCursor(x, y, instant) {')
+  assert.match(wantBody, /if \(rec\.ready\) swapTo\(rec\);/, 'a ready layer swaps at once; a loading one waits')
+  const finishBody = sliceBetween('function finish(rec) {', 'function sampleBg(rec) {')
+  assert.match(finishBody, /if \(wantKey === rec\.key\) swapTo\(rec\);/, 'readiness is what triggers the swap')
+})
+
+t('a hidden layer keeps its animations paused, a shown one starts at 0', () => {
+  const freeze = sliceBetween('function freezeLayer(rec) {', 'function rewindLayer(rec) {')
+  assert.match(freeze, /a\.pause\(\)/, 'a hidden layer must stop its animations')
+  assert.match(freeze, /rec\.animCapped = all\.length > MAX_ANIM/, 'the cap must be recorded, not silently applied')
+  const rewind = sliceBetween('function rewindLayer(rec) {', 'function finish(rec) {')
+  assert.match(rewind, /a\.currentTime = 0; a\.play\(\)/, 'a shown layer must start from 0')
+  const swap = sliceBetween('function swapTo(rec) {', 'function want(key) {')
+  assert.match(swap, /if \(on\) rewindLayer\(r\);/, 'the shown layer is rewound')
+  assert.match(swap, /else freezeLayer\(r\);/, 'the hidden layers are frozen')
+  assert.match(swap, /phaseMs/, 'the swap must record the animation phase it showed')
+  assert.match(source, /const MAX_ANIM = 300/)
 })
 
 rmSync(home, { recursive: true, force: true })

@@ -229,26 +229,27 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 
 **边界**：刷新能重播 CSS 动画、重置滚动与表单，但「靠 JS 在加载后加 class 才触发」的入场动画不会因为刷新再播一次——那个 class 已经写进快照了。这是抓取的边界，不是按钮的缺陷；因为块内脚本不执行，这类入场**只能由抓取侧改写成 CSS 动画（或把初始态写进标记）来还原**。
 
-演示块不挂这颗按钮（已有 播放 / 暂停 / 重新开始），尺寸、缩放、sandbox 都不动。测试接缝：`window.__dshPageBlock.replay(i)`，返回 `{ mode }`。
+⟲ 对所有块都在（一套头，演示块不再例外）：普通块按下是重载 entry，演示块按下是把时间轴放回第 1 步再继续跑。尺寸、缩放、sandbox 都不动。测试接缝：`window.__dshPageBlock.replay(i)`，返回 `{ mode }`；演示块的同一条路是 `demos.restart(i)`。
 
 ## 演示块：宿主驱动的时间轴（2026-11-09，路线 1）
 
 **效果：** 块文件里多一份 `<!-- @@file demo.json -->` 段（内容是 `{ snapshots, timeline }`）时，这个块变成**演示块**：块本身仍是纯数据（沙箱不变、帧仍 `pointer-events:none`），由插件在外层把时间轴演给块看——光标、高亮、合成点击、切页（换快照）、逐字输入都由宿主完成。
 1. 判据只有一条：块文件里存在可解析的 `demo.json` 段，且 `snapshots` 非空、`timeline.steps` 非空。不带这段的块走原来的 srcdoc 路径，**不建任何新 DOM、不起 rAF、不加控件**。
 2. `demo.json` 解析失败 → `console.warn` 一条并退回静态显示；`steps` 为空 → 同样退回静态。**不会白屏。**
-3. 时间轴没写 `loop` 时**默认循环**（`loop !== false`）；播到末尾回到第一份快照，不会停在末帧。
+3. 时间轴没写 `loop` 时**默认循环**（`loop !== false`）；播到末尾回到第一份快照，不会停在末帧。演示块**没有播放/暂停按钮**：进可视区就演，一直循环；⟲ 把它放回第 1 步。
 4. 快照写 `url:pages/home/index.html` 这类相对块根的路径，插件按块自身的服务目录解析；空块 → 静态。
 5. 播放层是 `<div class="dshpb-stage">`（绝对定位，几何与画布帧逐帧同步，`pointer-events:none`），里面挂 vendored 播放器；块自己的 frame 在演示块里 `display:none`。
-6. 工具条：`播放 / 暂停 / 重新开始` 三个按钮，复用 `dshpb-ctl` + `dshpb-btn`，放在 banner 的**标题侧**——实测放在右侧动作组里会把 `1440×900 / 选取元素` 左移 162px，所以不放那儿。静态块的 banner 一个字节不变。
-7. 进入可视区自动播放、离开暂停、回来继续（`IntersectionObserver`）；用户点过"暂停"后，滚进滚出不会自己恢复。
+6. 头只有一套：`尺寸 ｜ ⟲ ｜ 选取 ｜ 复制`，演示块与静态块逐字同一套结构（原先那条第 2 行的 `播放/暂停/重新开始` 传输条已删除，连 CSS 选择器一起）。
+7. 进入可视区自动播放、离开暂停、回来继续（`IntersectionObserver`，阈值 0.05）。没有暂停按钮，所以没有「用户暂停」这一层状态。
 8. 选取元素（pick）与播放互斥：`armPick` 时暂停播放并记住状态，`disarmPick` 后恢复；`frame.pointerEvents` 的置位/复位逻辑未改。
 9. 宿主侧新增一种 section 类型 `html`（`index.js` 的 `SECTION_TYPES`）：多页快照的 `pages/*.html` 需要能当 section 服务（原来只允许 ENTRY 是 `.html`，其余一律 415）。路径校验不变（`..` / 前导 `/` / 反斜杠 / NUL 全部拒），每个 section 仍带 `script-src 'none'` 的 CSP。
-10. 新增测试接缝 `__dshPageBlock.demos.{count,state,play,pause,restart}(index)`，`sweep().live[]` 多一个 `demo` 字段。
+10. **切页不换文档（2026-11-11）**：每份快照一个 iframe，开场全部导航一次，之后切换只改「显示哪一层」——`opacity` 一帧内 1/0，在 `requestAnimationFrame` 里做，没有任何过渡；就绪判据 = load 后 `readyState === 'complete'` 且 `document.fonts.status === 'loaded'`，800ms 兜底后照切、不卡时间轴。隐藏层的 `getAnimations()` 全部 `pause()`，显示层 `currentTime = 0` 再 `play()`（最多管 300 条，超了记 `animCapped`）。容器与 iframe 不再写死 `#000`：底色取快照自己的 `body` 背景色。
+11. 入口文档没有自己的 section 名，所以 demo.json 指向它时可以写 `entry.html` / `index.html` / `./entry.html` / 空串；同名 section 优先。写错名字的 404 会列出这个块实际可用的 section 名（`— available: (entry), pages/…`），模型据此自己改。
+12. 测试接缝 `__dshPageBlock.demos.{count,state,play,pause,restart}(index)`；`state()` 带 `layers`（每层 ready/on/op/bg/anims）与 `switched`（最近 8 次交换的 `costMs`/`phaseMs`），`sweep().live[]` 多一个 `demo` 字段。
 
-**锚点：** `client.js` 的 `readDemo / blockSections / paintDemo / ensureStage / armAutoplay / buildTransport / demoSet / demoInfoOf`；`player.mjs`（从 ui-snapshot 复制、独立维护，`self-check-player-vendor.mjs` 断言它与 client.js 里的 `[vendored-player]` 段逐字一致）；`index.js` 的 `SECTION_TYPES.html`。
+**锚点：** `client.js` 的 `readDemo / blockSections / paintDemo / ensureStage / armAutoplay / demoRestart / demoInfoOf / destroyPlayer` 与 `[vendored-player]` 段（`createPlayer / makeLayer / settle / swapTo / freezeLayer / rewindLayer`）；`player.mjs`（独立维护，与 client.js 里的 `[vendored-player]` 段逐字一致）；`index.js` 的 `SECTION_TYPES.html`、`isEntryAlias()`、`availableSections()`。
 
-**验：** `node self-check-player-vendor.mjs`；CDP 用 `demos.state()` 读 `t/snapshot`，点 `[data-dshpb-demo=pause]` 后两帧哈希应相同。
-
+**验：** 4000 上 CDP 抓帧：`out/probe/demo-black/`（before/after 各 300+ 帧黑帧计数 + `swap.json` 的交换耗时与相邻帧）。`demos.state()` 读 `t/snapshot/layers`，⟲ 后 `t` 回到个位数百毫秒。
 ## 沙箱（v0.4.0 变更）
 
 - `sandbox="allow-same-origin"`：**只有** `allow-same-origin`，**绝不**加 `allow-scripts`（两者同时 = 沙箱失效，规范明示）。

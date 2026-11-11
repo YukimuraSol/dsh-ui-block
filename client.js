@@ -1128,18 +1128,18 @@ window.__ModuleLoader__.load({
       '.dshpb-handle::after{content:"";position:absolute;left:50%;top:2px;width:36px;height:3px;margin-left:-18px;',
       'border-radius:2px;background:var(--dsw-alias-border-l1);opacity:0;transition:opacity .15s}',
       '.dshpb-shell:hover .dshpb-handle::after{opacity:.85}',
-      '.dshpb-ctl{display:inline-flex;align-items:center;gap:6px;margin-left:8px;flex:none}',
-      // Banner row, unified (user call, 2026-11-11): 分辨率 / 重放 / 选取元素 are
-      // measured against the shell's own copy-path button that sits right of them —
-      // 24px high, 24px wide for the two icons, text-sized with 5px side padding for
-      // the readout, no border at all, transparent until hover, 6px radius, 2px apart.
-      // The transport row (播放/暂停/重新开始) is a different .dshpb-ctl inside the
-      // heading and keeps the old pill shape — its buttons are tagged data-dshpb-demo.
-      '.dshpb-ctl:not([data-dshpb-demo-bar]){gap:2px}',
-      '.dshpb-ctl>.dshpb-btn:not([data-dshpb-demo]){display:inline-flex;align-items:center;justify-content:center;',
+      '.dshpb-ctl{display:inline-flex;align-items:center;gap:2px;margin-left:8px;flex:none}',
+      // Banner row, unified (user call, 2026-11-11): ONE header for every block —
+      // 尺寸 ｜ ⟲ ｜ 选取 ｜ 复制 — measured against the shell's own copy-path button
+      // that sits right of them: 24px high, no border at all, transparent until
+      // hover, 6px radius, 2px apart. A demo block is no longer special-cased here:
+      // it used to carry its own 播放/暂停/重新开始 pill row inside a second
+      // .dshpb-ctl; that row is deleted. The timeline loops by
+      // itself and ⟲ restarts it from step 1, so the header stays one header.
+      '.dshpb-ctl>.dshpb-btn{display:inline-flex;align-items:center;justify-content:center;',
       'box-sizing:border-box;height:24px;min-width:24px;padding:0 5px;border:0;border-radius:6px;background:transparent;',
       'line-height:1;cursor:pointer;white-space:nowrap}',
-      '.dshpb-ctl>.dshpb-btn:not([data-dshpb-demo]):hover{background:var(--dsw-alias-interactive-bg-hover);',
+      '.dshpb-ctl>.dshpb-btn:hover{background:var(--dsw-alias-interactive-bg-hover);',
       'color:var(--dsw-alias-label-primary)}',
       '.dshpb-btn{font:inherit;font-size:11px;line-height:18px;color:var(--dsw-alias-label-secondary);background:transparent;',
       'border:.5px solid var(--dsw-alias-border-l1);border-radius:6px;padding:1px 7px;cursor:pointer;white-space:nowrap}',
@@ -1561,7 +1561,6 @@ window.__ModuleLoader__.load({
           if (!Object.prototype.hasOwnProperty.call(spec.snapshots, name)) continue;
           snapshots[name] = blockUrl(state, spec.snapshots[name]);
         }
-        state.userPaused = false;
         state.player = createPlayer({
           snapshots: snapshots,
           timeline: spec.timeline,
@@ -1575,8 +1574,8 @@ window.__ModuleLoader__.load({
 
       /**
        * Autoplay by visibility: scrolling the block into view starts the show,
-       * scrolling it away pauses it. A pause the user asked for survives both —
-       * only 播放 / 重新开始 clears it.
+       * scrolling it away pauses it. There is no pause button any more — the
+       * timeline is meant to run by itself and loop; ⟲ only puts it back on step 1.
        */
       function armAutoplay(state) {
         if (typeof IntersectionObserver !== 'function' || !state.stage) return;
@@ -1584,7 +1583,7 @@ window.__ModuleLoader__.load({
         state.io = new IntersectionObserver(function (entries) {
           for (var i = 0; i < entries.length; i += 1) {
             if (!state.player) continue;
-            if (entries[i].isIntersecting) { if (!state.userPaused) state.player.play(); }
+            if (entries[i].isIntersecting) state.player.play();
             else state.player.pause();
           }
         }, { threshold: 0.05 });
@@ -1592,47 +1591,13 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * The transport: 播放 / 暂停 / 重新开始. Same class as the existing controls
-       * (no new style), appended AFTER them, and only on a demo block — a static
-       * block's banner is untouched.
+       * 演示块的 ⟲：把时间轴放回第 1 步，然后接着跑（要循环就还会循环）。
+       * 「重新加载」的语义没有变——对普通块是重载 entry，对演示块就是重放这份
+       * 时间轴；客户端不再为此多长一条控件。
        */
-      function buildTransport(state, controls) {
-        if (!state.demoSpec || state.transport) return;
-        var bar = document.createElement('span');
-        bar.className = 'dshpb-ctl';
-        bar.setAttribute('data-dshpb-demo-bar', 'true');
-        var actions = [['play', '播放'], ['pause', '暂停'], ['restart', '重新开始']];
-        for (var i = 0; i < actions.length; i += 1) {
-          var button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'dshpb-btn';
-          button.setAttribute('data-dshpb-demo', actions[i][0]);
-          button.setAttribute('aria-label', actions[i][1]);
-          button.textContent = actions[i][1];
-          button.addEventListener('click', (function (action) {
-            return function (event) {
-              event.preventDefault();
-              event.stopPropagation();
-              demoSet(state, action);
-            };
-          })(actions[i][0]));
-          bar.appendChild(button);
-        }
-        // Placement is measured, not guessed: the banner's action group is
-        // right-aligned, so a fourth item inside it pushes 分辨率 / 选取元素 left by
-        // the transport's whole width. The heading (which holds the dsh-ui label)
-        // has free room to its right, so nothing that existed before moves.
-        var heading = state.block && state.header ? state.header.firstElementChild : null;
-        if (heading && heading !== controls) heading.appendChild(bar);
-        else controls.appendChild(bar);
-        state.transport = bar;
-      }
-
-      function demoSet(state, action) {
+      function demoRestart(state) {
         if (!state.player) return null;
-        if (action === 'pause') { state.userPaused = true; state.player.pause(); }
-        else if (action === 'restart') { state.userPaused = false; state.player.restart(); }
-        else { state.userPaused = false; state.player.play(); }
+        state.player.restart();
         return state.player.state();
       }
 
@@ -1649,55 +1614,54 @@ window.__ModuleLoader__.load({
           duration: st ? st.duration : null,
           stepsFired: st ? st.stepsFired : null,
           stage: !!(s.stage && s.stage.isConnected),
-          transport: s.transport ? s.transport.querySelectorAll('button').length : 0,
+          headerButtons: s.controls ? s.controls.querySelectorAll('button').length : 0,
+          layers: st ? st.layers : [],
+          switched: st ? st.switched : [],
+          switchMs: st ? st.switchMs : [],
           frame: s.player ? s.player.frameInfo() : null
         };
       }
 
     // ── vendored player (ui-snapshot/player.mjs) — host-driven timeline ──────
-    // [vendored-player] copied 2026-11-09; keep byte-identical to player.mjs in
-    // this plugin directory (self-check-player-vendor.mjs asserts it).
-// dsh-ui-block — vendored copy of ui-snapshot/player.mjs (copied 2026-11-09).
-// Route 1 (host-driven): a demo BLOCK stays pure data — sandbox keeps
-// allow-same-origin only, the block frame keeps pointer-events:none — and this
-// player projects the timeline from outside, on the block's own snapshot pages.
-// Independent on purpose: nothing in the plugin points back at ui-snapshot.
-// Differences from the source, both deliberate:
-//   * the player's own iframe carries sandbox="allow-same-origin" (no scripts);
-//   * the text normalizer uses /\s+/ (the source lost its backslash);
-//   * frameInfo() tolerates a frame whose body does not exist yet.
-// The same text is embedded in client.js between the [vendored-player] markers;
-// self-check-player-vendor.mjs asserts the two copies are identical.
+    // [vendored-player] copied 2026-11-09, re-vendored 2026-11-11 (double buffer);
+    // keep byte-identical to player.mjs in this plugin directory.
 // player.mjs — 宿主侧时间轴播放器（路线 1：块只当素材，外面演）
 // 用法：createPlayer({ snapshots, timeline, mount }) → { play, pause, seek, restart, destroy, state }
 // 快照是纯数据 HTML，用 blob: 装进同源 iframe；播放器在 iframe 之上画光标/高亮/涟漪，
 // 并直接改 iframe 里的 DOM（同源）来演示“填字 / 按下”。
+//
+// 双缓冲（2026-11-11）。用户口径：浏览器里点链接就是硬切，不许我们“帮他画过渡”。
+// 所以这里做的只有一件事——**下一份文档画好之前，不把旧内容撤掉**：
+//   · 每份快照各自一个 iframe，开场全部导航一次；切步骤只改「显示哪一层」，永不重新导航；
+//   · 就绪判据 = load 之后 readyState complete + document.fonts.status loaded，超时 800ms 兜底；
+//   · 就绪的那一刻在 requestAnimationFrame 里一次交换（opacity 直接 1/0，没有 transition/animation，
+//     没有淡入淡出）——硬切，只是把这次硬切挪到内容完整的那一刻；
+//   · 容器不写死底色：底色由每份快照自己的 body 背景色补上，取不到就保持透明。
 
 const STYLE_ID = 'snap-player-style';
+
+// 底色曾经写死 #000：快照文档画出来之前露出的就是它，于是每次“旧文档已卸、新文档未画”都是黑帧。
+// 现在容器显式透明，每层 iframe 也透明，底色只从快照自己的 body 上取（sampleBg）。
+const CSS = [
+  '.snap-stage{position:relative;overflow:hidden;background:transparent}',
+  '.snap-frame{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:transparent;opacity:0;visibility:hidden}',
+  '.snap-overlay{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:5}',
+  '.snap-cursor{position:absolute;left:0;top:0;width:22px;height:22px;margin:-2px 0 0 -2px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.45));transition:transform .55s cubic-bezier(.33,.02,.2,1);z-index:3}',
+  '.snap-cursor.press{transform-origin:2px 2px}',
+  '.snap-cursor.press::after{content:"";position:absolute;left:2px;top:2px;width:12px;height:12px;border:2px solid rgba(255,255,255,.9);border-radius:50%;animation:snap-press .28s ease-out forwards}',
+  '.snap-ring{position:absolute;border:2px solid #4da3ff;border-radius:6px;opacity:0;box-shadow:0 0 0 3px rgba(77,163,255,.28),0 0 18px rgba(77,163,255,.5);transition:opacity .18s ease,transform .18s ease,width .18s ease,height .18s ease}',
+  '.snap-ring.show{opacity:1}',
+  '.snap-ripple{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;border:2px solid rgba(255,255,255,.85);opacity:0;z-index:2}',
+  '.snap-ripple.go{animation:snap-ripple .5s ease-out forwards}',
+  '@keyframes snap-ripple{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(4.2)}}',
+  '@keyframes snap-press{0%{opacity:.9;transform:scale(.6)}100%{opacity:0;transform:scale(1.9)}}'
+].join('');
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
   const st = document.createElement('style');
   st.id = STYLE_ID;
-  st.textContent = `
-  .snap-stage { position: relative; overflow: hidden; background: #000; }
-  .snap-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
-  .snap-overlay { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 5; }
-  .snap-cursor { position: absolute; left: 0; top: 0; width: 22px; height: 22px; margin: -2px 0 0 -2px;
-    filter: drop-shadow(0 2px 4px rgba(0,0,0,.45)); transition: transform .55s cubic-bezier(.33,.02,.2,1); z-index: 3; }
-  .snap-cursor.press { transform-origin: 2px 2px; }
-  .snap-cursor.press::after { content: ''; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px;
-    border: 2px solid rgba(255,255,255,.9); border-radius: 50%; animation: snap-press .28s ease-out forwards; }
-  .snap-ring { position: absolute; border: 2px solid #4da3ff; border-radius: 6px; opacity: 0;
-    box-shadow: 0 0 0 3px rgba(77,163,255,.28), 0 0 18px rgba(77,163,255,.5);
-    transition: opacity .18s ease, transform .18s ease, width .18s ease, height .18s ease; }
-  .snap-ring.show { opacity: 1; }
-  .snap-ripple { position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%;
-    border: 2px solid rgba(255,255,255,.85); opacity: 0; z-index: 2; }
-  .snap-ripple.go { animation: snap-ripple .5s ease-out forwards; }
-  @keyframes snap-ripple { 0% { opacity: .9; transform: scale(.4); } 100% { opacity: 0; transform: scale(4.2); } }
-  @keyframes snap-press { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.9); } }
-  `;
+  st.textContent = CSS;
   document.head.appendChild(st);
 }
 
@@ -1737,6 +1701,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   const steps = [...(timeline.steps || [])].sort((a, b) => a.at - b.at).map((s, i) => ({ ...s, _i: i }));
   const loopEnabled = timeline.loop !== false;
   const duration = timeline.duration || Math.max(0, ...steps.map((s) => s.at)) + 1500;
+  const READY_TIMEOUT_MS = 800;
+  // 隐藏层上不许让动画偷跑：最多管这么多条，超了如实记下来（不假装全管住）。
+  const MAX_ANIM = 300;
 
   // 快照两种形态，接口不变（仍是"换一份已抓快照"）：
   //   HTML 字符串  → 装进 blob:
@@ -1753,13 +1720,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   };
 
   mount.classList.add('snap-stage');
-  const iframe = document.createElement('iframe');
-  iframe.className = 'snap-frame';
-  iframe.setAttribute('scrolling', 'no');
-  iframe.setAttribute('title', 'snapshot');
-  // Route 1 keeps the block script-inert: the SNAPSHOT runs in a frame that
-  // may be read (same origin) but never runs scripts either.
-  iframe.setAttribute('sandbox', 'allow-same-origin');
   const overlay = document.createElement('div');
   overlay.className = 'snap-overlay';
   const ring = document.createElement('div');
@@ -1770,16 +1730,145 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   cursor.className = 'snap-cursor';
   cursor.innerHTML = CURSOR_SVG;
   overlay.append(ripple, ring, cursor);
-  mount.append(iframe, overlay);
+  mount.append(overlay);
 
-  const state = { t: 0, playing: false, snapshot: null, fired: 0, done: 0 };
-  let raf = 0, last = 0, fired = new Set(), updates = [], retries = [], switchWait = null;
-  let cursorAt = { x: 120, y: 120 }, timers = [];
+  const state = { t: 0, playing: false, snapshot: null, fired: 0 };
+  const layers = new Map();
+  const switches = [];
+  const undo = [];
+  const originals = new Map();
+  const hiddenOriginals = new Map();
+  const readyWaiters = new Map();
+  let raf = 0, last = 0, fired = new Set(), updates = [], retries = [], timers = [], readyTimers = [];
+  let cursorAt = { x: 120, y: 120 };
+  let activeKey = null, wantKey = null, wantPlay = false;
+  const t0 = performance.now();
 
   const later = (ms, fn) => { const id = setTimeout(() => { timers = timers.filter((x) => x !== id); fn(); }, ms); timers.push(id); return id; };
   const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
+  const laterReady = (ms, fn) => { const id = setTimeout(() => { readyTimers = readyTimers.filter((x) => x !== id); fn(); }, ms); readyTimers.push(id); return id; };
+  const doc = () => { try { const rec = activeKey === null ? null : layers.get(activeKey); return rec ? rec.el.contentDocument : null; } catch { return null; } };
+  const recOf = (key) => layers.get(key) || null;
 
-  const doc = () => { try { return iframe.contentDocument; } catch { return null; } };
+  // ── 双缓冲：一层一快照，开场各自导航一次 ─────────────────────────────────────
+  function makeLayer(key) {
+    const el = document.createElement('iframe');
+    el.className = 'snap-frame';
+    el.setAttribute('scrolling', 'no');
+    el.setAttribute('title', 'snapshot');
+    el.setAttribute('data-snap', key);
+    // 沙箱不变：可被同源读取，绝不执行脚本。
+    el.setAttribute('sandbox', 'allow-same-origin');
+    const rec = { key, el, ready: false, bg: '', decideAt: 0, readyAt: 0 };
+    el.addEventListener('load', () => settle(rec, Date.now() + READY_TIMEOUT_MS));
+    el.src = srcFor(key);
+    mount.insertBefore(el, overlay);
+    layers.set(key, rec);
+    return rec;
+  }
+
+  function settle(rec, deadline) {
+    if (rec.ready) return;
+    let complete = false, fonts = true;
+    try {
+      const d = rec.el.contentDocument;
+      complete = !!d && d.readyState === 'complete' && !!d.body;
+      fonts = !d || !d.fonts || d.fonts.status === 'loaded';
+    } catch { complete = false; }
+    if (complete && fonts) { finish(rec); return; }
+    if (Date.now() >= deadline) { finish(rec); return; }   // 兜底：宁可慢一帧，也不许卡住时间轴
+    laterReady(16, () => settle(rec, deadline));
+  }
+
+  // 隐藏不是「暂停看」，而是「别在你看不到的时候跑」：层一就绪就把动画停住，
+  // 切过去的那一刻再从 0 开始。否则切过去看到的是已经播完的终态。
+  function layerAnims(rec) {
+    try { const d = rec.el.contentDocument; return d && typeof d.getAnimations === 'function' ? d.getAnimations() : []; } catch { return []; }
+  }
+  function freezeLayer(rec) {
+    const all = layerAnims(rec);
+    const list = all.slice(0, MAX_ANIM);
+    rec.animCount = all.length;
+    rec.animCapped = all.length > MAX_ANIM;
+    for (const a of list) { try { a.pause(); } catch { /* 已经没了 */ } }
+    return list.length;
+  }
+  function rewindLayer(rec) {
+    const all = layerAnims(rec);
+    const list = all.slice(0, MAX_ANIM);
+    for (const a of list) { try { a.currentTime = 0; a.play(); } catch { /* 已经没了 */ } }
+    return list.length;
+  }
+
+  function finish(rec) {
+    if (rec.ready) return;
+    rec.ready = true;
+    rec.readyAt = performance.now();
+    sampleBg(rec);
+    freezeLayer(rec);
+    const waiters = readyWaiters.get(rec.key);
+    if (waiters) { readyWaiters.delete(rec.key); waiters.forEach((fn) => fn()); }
+    if (wantKey === rec.key) swapTo(rec);
+  }
+
+  // 底色不写死：从快照自己的 body 上取；取不到就保持透明（露出的就是外壳底色）
+  function sampleBg(rec) {
+    let bg = '';
+    try { const d = rec.el.contentDocument; bg = d && d.body ? getComputedStyle(d.body).backgroundColor : ''; } catch { bg = ''; }
+    if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') return;
+    rec.bg = bg;
+    if (activeKey === null || rec.key === activeKey) mount.style.background = bg;
+  }
+
+  function waitReady(key) {
+    const rec = recOf(key);
+    if (rec && rec.ready) return Promise.resolve(true);
+    return new Promise((res) => {
+      const list = readyWaiters.get(key) || [];
+      list.push(() => res(true));
+      readyWaiters.set(key, list);
+      laterReady(READY_TIMEOUT_MS + 200, () => res(false));
+    });
+  }
+
+  // 切换 = 换显示哪一层，一帧内 1/0，没有任何过渡。
+  function swapTo(rec) {
+    if (!rec || !rec.ready || rec.key === activeKey) return;
+    const decideAt = rec.decideAt || performance.now();
+    requestAnimationFrame(() => {
+      if (wantKey !== rec.key) return;      // 目标又变了：这一层不用露面
+      for (const r of layers.values()) {
+        const on = r === rec;
+        r.el.style.opacity = on ? '1' : '0';
+        r.el.style.visibility = on ? 'visible' : 'hidden';
+        // 隐藏层停住；显示层从 0 开始（首帧就是「刚进场」那一帧）
+        if (on) rewindLayer(r);
+        else freezeLayer(r);
+      }
+      activeKey = rec.key;
+      state.snapshot = rec.key;
+      if (rec.bg) mount.style.background = rec.bg;
+      ring.classList.remove('show');
+      const appliedAt = performance.now();
+      // 相位证据：交换这一刻新层动画的当前时间（≈0 才说明它没偷跑）
+      let phaseMs = null;
+      try { const first = layerAnims(rec)[0]; phaseMs = first ? Math.round(Number(first.currentTime) || 0) : null; } catch { phaseMs = null; }
+      switches.push({ key: rec.key, costMs: Math.round(appliedAt - decideAt), applyAt: Math.round(appliedAt - t0), phaseMs, anims: rec.animCount === undefined ? null : rec.animCount, animCapped: !!rec.animCapped });
+      if (switches.length > 24) switches.shift();
+      if (wantPlay) { wantPlay = false; last = 0; raf = requestAnimationFrame(tick); }
+      onState && onState(publicState());
+    });
+  }
+
+  function want(key) {
+    if (!(key in snapshots)) return false;
+    wantKey = key;
+    const rec = recOf(key);
+    if (!rec) return false;
+    rec.decideAt = performance.now();
+    if (rec.ready) swapTo(rec);
+    return true;
+  }
 
   function setCursor(x, y, instant) {
     cursorAt = { x, y };
@@ -1830,17 +1919,42 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     }
   }
 
+  // 双缓冲之后文档不再重载，我们自己的改动必须自己撤销（否则第二次循环会看到上一轮打的字）。
+  function remember(el) {
+    if (originals.has(el)) return;
+    const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
+    originals.set(el, { isInput, value: isInput ? el.value : el.textContent });
+    undo.push(() => {
+      const o = originals.get(el);
+      if (!o) return;
+      if (o.isInput) el.value = o.value;
+      else el.textContent = o.value;
+    });
+  }
+  function rememberHidden(el) {
+    if (hiddenOriginals.has(el)) return;
+    hiddenOriginals.set(el, el.style.display);
+    undo.push(() => { el.style.display = hiddenOriginals.get(el) || ''; });
+  }
+  function runUndo() {
+    const list = undo.splice(0);
+    for (const fn of list) { try { fn(); } catch { /* 层已经不在了 */ } }
+    originals.clear();
+    hiddenOriginals.clear();
+  }
+
   function doType(el, text, cps, at) {
     if (!el || !text) return;
+    remember(el);
     const tag = el.tagName;
     const isInput = tag === 'INPUT' || tag === 'TEXTAREA';
     if (isInput) el.value = '';
     else el.textContent = '';
     const chars = [...text];
     const total = (chars.length * 1000) / (cps || 12);
-    const t0 = at !== undefined ? at : state.t;
+    const t0s = at !== undefined ? at : state.t;
     updates.push(() => {
-      const p = Math.min(1, (state.t - t0) / Math.max(1, total));
+      const p = Math.min(1, (state.t - t0s) / Math.max(1, total));
       const n = Math.round(p * chars.length);
       const val = chars.slice(0, n).join('');
       if (isInput) el.value = val;
@@ -1849,29 +1963,13 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     });
   }
 
-  function switchSnapshot(key) {
-    if (!(key in snapshots)) return Promise.resolve(false);
-    state.snapshot = key;
-    return new Promise((res) => {
-      switchWait = res;
-      iframe.addEventListener('load', onLoad, { once: true });
-      iframe.src = srcFor(key);
-    });
-  }
-  function onLoad() {
-    const cb = switchWait; switchWait = null;
-    // 切页后 overlay 状态清掉，避免上一页的框残留
-    ring.classList.remove('show');
-    cb && cb(true);
-  }
-
   function fire(step) {
     const d = doc();
     const to = step.to;
     const el = () => resolveTarget(d, to);
     switch (step.do) {
       case 'switch':
-        switchSnapshot(step.snapshot);
+        want(step.snapshot);
         break;
       case 'move': {
         const e = el();
@@ -1901,7 +1999,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         setCursor(c.x, c.y);
         // 占位符先藏起来，免得和打字叠在一起
         for (const hs of step.hide || []) {
-          try { const h = d.querySelector(hs); if (h) h.style.display = 'none'; } catch {}
+          try { const h = d.querySelector(hs); if (h) { rememberHidden(h); h.style.display = 'none'; } } catch { /* 选择器写错不该拖垮时间轴 */ }
         }
         doType(e, step.text, step.cps, step.at);
         break;
@@ -1930,8 +2028,13 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     }
   }
 
+  // 回到第 1 步：撤销我们写进文档的东西，停表，把第一份快照要回来。
+  // 起表交给交换那一刻（第一帧真的在屏幕上了才开始走时间），所以循环与重来都不会先播一帧错的画面。
   function resetPlayback() {
+    cancelAnimationFrame(raf);
+    wantPlay = state.playing;
     clearTimers();
+    runUndo();
     updates = [];
     retries = [];
     fired.clear();
@@ -1939,10 +2042,10 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     state.fired = 0;
     ring.classList.remove('show');
     ripple.classList.remove('go');
-    // 回到第一帧应当的画面：第一个 switch 步骤
-    const first = steps.find((s) => s.do === 'switch');
-    if (first) switchSnapshot(first.snapshot);
     setCursor(120, 120, true);
+    const first = steps.find((s) => s.do === 'switch');
+    const key = first ? first.snapshot : (Object.keys(snapshots)[0] || null);
+    if (key !== null) want(key);
   }
 
   function tick(now) {
@@ -1954,39 +2057,59 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     fireDue();
     updates = updates.filter((fn) => fn() !== true);
     if (state.t >= duration) {
-      if (loopEnabled) { resetPlayback(); last = now; }
-      else { state.playing = false; onState && onState(publicState()); return; }
+      if (loopEnabled) { resetPlayback(); return; }
+      state.playing = false;
+      onState && onState(publicState());
+      return;
     }
     onState && onState(publicState());
     raf = requestAnimationFrame(tick);
   }
 
   function publicState() {
-    return { t: Math.round(state.t), playing: state.playing, snapshot: state.snapshot, duration, stepsFired: state.fired, steps: steps.length };
+    const ls = [];
+    for (const r of layers.values()) {
+      ls.push({ snap: r.key, ready: r.ready, on: r.el.style.visibility === 'visible', op: r.el.style.opacity, bg: r.bg, anims: r.animCount === undefined ? null : r.animCount, animCapped: !!r.animCapped });
+    }
+    return {
+      t: Math.round(state.t), playing: state.playing, snapshot: state.snapshot, duration,
+      stepsFired: state.fired, steps: steps.length, layers: ls,
+      switched: switches.slice(-8), switchMs: switches.map((x) => x.costMs)
+    };
   }
+
+  // 开场：每一份快照各就位（各自导航一次，之后永不重导航）
+  for (const key of Object.keys(snapshots)) {
+    try { makeLayer(key); } catch (e) { console.warn('[player] 快照装不进层：' + String((e && e.message) || e)); }
+  }
+  if (layers.size === 0) throw new Error('createPlayer: 没有可用的快照');
+  resetPlayback();
 
   const api = {
     play() {
       if (state.playing) return;
       state.playing = true;
+      if (activeKey === null) { wantPlay = true; return; }   // 首帧还没上屏：等交换那一刻才起表
       last = 0;
       raf = requestAnimationFrame(tick);
     },
     pause() {
       state.playing = false;
+      wantPlay = false;
       cancelAnimationFrame(raf);
       return publicState();
     },
     // 一次性把时间轴推到 ms 处（用于逐帧核对/截图）：先落定最后一个 switch，再补跑其余步骤。
-    // 必须 await：iframe 换源是异步的，加载完会把之前的 DOM 改动冲掉。
+    // 双缓冲之后换页是同步的，但仍要等那层就绪，否则改的是还没画出来的文档。
     async seek(ms) {
       clearTimers();
       updates = [];
       retries = [];
       fired.clear();
+      runUndo();
       const due = steps.filter((s) => s.at <= ms);
       const lastSwitch = [...due].reverse().find((s) => s.do === 'switch');
-      if (lastSwitch) await switchSnapshot(lastSwitch.snapshot);
+      if (lastSwitch) { want(lastSwitch.snapshot); await waitReady(lastSwitch.snapshot); }
       state.t = ms;
       for (const s of due) {
         fired.add(s._i);
@@ -1997,23 +2120,32 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       onState && onState(publicState());
       return publicState();
     },
-    restart() { resetPlayback(); api.play(); return publicState(); },
+    restart() {
+      state.playing = true;
+      resetPlayback();
+      return publicState();
+    },
     destroy() {
       cancelAnimationFrame(raf);
       clearTimers();
+      readyTimers.forEach(clearTimeout);
+      readyTimers = [];
       blobUrls.forEach((u) => URL.revokeObjectURL(u));
-      iframe.remove();
+      for (const r of layers.values()) r.el.remove();
+      layers.clear();
       overlay.remove();
     },
     state: publicState,
+    ready: () => activeKey !== null,
     // 核对用：当前帧里 iframe 的可见文本，证明演的是哪一份快照
     frameInfo() {
       const d = doc();
-      return { snapshot: state.snapshot, src: iframe.src.slice(0, 40), text: d && d.body ? norm(d.body.innerText).slice(0, 160) : null, size: d && d.body ? d.body.getBoundingClientRect().width + 'x' + d.body.getBoundingClientRect().height : null };
+      let src = '';
+      try { const rec = activeKey === null ? null : layers.get(activeKey); src = rec ? String(rec.el.src).slice(0, 48) : ''; } catch { src = ''; }
+      return { snapshot: state.snapshot, src, text: d && d.body ? norm(d.body.innerText).slice(0, 160) : null, size: d && d.body ? d.body.getBoundingClientRect().width + 'x' + d.body.getBoundingClientRect().height : null };
     },
   };
 
-  resetPlayback();
   return api;
 }
     // [/vendored-player]
@@ -2243,22 +2375,24 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // box as the picker, sitting BETWEEN 分辨率 and 选取元素. The name lives
         // in aria-label (what a screen reader says) and in the row's bubble (what
         // the pointer gets) — one hover mechanism for the whole row.
-        var replayButton = null;
-        if (!state.demoSpec) {
-          replayButton = document.createElement('button');
-          replayButton.type = 'button';
-          replayButton.className = 'dshpb-btn dshpb-replay';
-          replayButton.setAttribute('aria-label', '重放动画');
-          // Names what it does: what this really is, is throwing the document away
-          // and parsing it again.
-          attachTip(replayButton, '重新加载画布内容（等同刷新）');
-          replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
-          replayButton.addEventListener('click', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-            replayBlock(state);
-          });
-        }
+        // Every block gets this button — demo or not (user call, 2026-11-11: one
+        // header, no demo-only row). What it does is the only thing that differs:
+        // a plain block throws its document away and parses it again (a reload); a
+        // demo block puts its timeline back on step 1.
+        var replayButton = document.createElement('button');
+        replayButton.type = 'button';
+        replayButton.className = 'dshpb-btn dshpb-replay';
+        replayButton.setAttribute('aria-label', '重放动画');
+        attachTip(replayButton, function () {
+          return state.demoSpec ? '重新开始演示（从第 1 步重来）' : '重新加载画布内容（等同刷新）';
+        });
+        replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
+        replayButton.addEventListener('click', function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (state.demoSpec) demoRestart(state);
+          else replayBlock(state);
+        });
         // The copy icon is OURS now (see the block further down): same 24x24 box,
         // no border, same hover fill as the other three, and the same attachTip.
         var copyButton = document.createElement('button');
@@ -2279,14 +2413,11 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         controls.appendChild(resButton);
         // Between 分辨率 and the picker (user call): one more icon in the same
         // group, so neither the size button's x nor the copy-path button moves.
-        if (replayButton !== null) controls.appendChild(replayButton);
+        controls.appendChild(replayButton);
         controls.appendChild(pickButton);
         // Rightmost, where the shell's copy icon used to be: the row reads
         // 尺寸 -> 重放 -> 选取 -> 复制, so neither of the other three moves.
         controls.appendChild(copyButton);
-        // Demo transport goes leftmost: it is the only part of a demo block a
-        // pointer can reach, because the frame never takes the pointer.
-        buildTransport(state, controls);
         if (!state.declared || !state.hDeclared) controls.appendChild(note);
         if (slot === header) slot.appendChild(controls);
         else slot.insertBefore(controls, slot.firstChild);
@@ -2868,8 +2999,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         destroyPlayer(state);
         state.stage = null;
         state.mount = null;
-        state.transport = null;
-        state.userPaused = false;
         state.paintedBody = null;
         attachInteractions(state);
         mountCodeBlockShell(state);
@@ -3196,7 +3325,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       schedule();
 
       var api = {
-        version: '0.6.0',
+        version: '0.6.1',
         stats: stats,
         /**
          * Read-only render seam for the host's read_ui_block screenshot: the SAME
@@ -3256,9 +3385,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         demos: {
           count: function () { var n = 0; for (var i = 0; i < live.length; i += 1) if (live[i].demoSpec) n += 1; return n; },
           state: function (index) { return demoInfoOf(index); },
-          play: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'play'); return demoInfoOf(index); },
-          pause: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'pause'); return demoInfoOf(index); },
-          restart: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoSet(s, 'restart'); return demoInfoOf(index); }
+          play: function (index) { var s = live[index || 0]; if (s && s.demoSpec && s.player) s.player.play(); return demoInfoOf(index); },
+          pause: function (index) { var s = live[index || 0]; if (s && s.demoSpec && s.player) s.player.pause(); return demoInfoOf(index); },
+          restart: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoRestart(s); return demoInfoOf(index); }
         },
         sweep: function () {
           sweep();

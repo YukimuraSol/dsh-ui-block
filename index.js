@@ -377,6 +377,35 @@ function sectionType(path) {
   return type
 }
 
+/**
+ * Names that mean "the block's entry document".
+ *
+ * A block's entry has NO section name of its own: splitSections() puts whatever
+ * precedes the first marker into `entry`, and only the files after markers get a
+ * path. So a demo.json that points at its own entry the obvious way — "entry.html",
+ * "index.html", "./entry.html", "" — used to 404 forever, and the model writing
+ * that name was following common sense, not making a typo. These spellings are
+ * resolved to the entry; anything else still 404s.
+ */
+const ENTRY_SECTION_ALIASES = new Set(['entry.html', 'entry.htm', 'index.html', 'index.htm', 'entry', 'index'])
+
+/** True when one section path is a spelling of the entry document. */
+function isEntryAlias(path) {
+  if (path === null || path === undefined) return false
+  let text = String(path).trim()
+  try { text = decodeURIComponent(text) } catch { /* keep it raw */ }
+  text = text.replace(/^(\.\/)+/, '').replace(/^\/+/, '').toLowerCase()
+  return ENTRY_SECTION_ALIASES.has(text)
+}
+
+/** The section names this block really has, for a 404 the model can act on. */
+function availableSections(sections) {
+  const names = ['(entry)']
+  for (const file of sections.files) names.push(file.path)
+  if (names.length > 12) return names.slice(0, 12).join(', ') + ', … (' + String(names.length) + ' total)'
+  return names.join(', ')
+}
+
 /** The lowercase extension of a path, without the dot. */
 function extOf(path) {
   const text = String(path)
@@ -1683,7 +1712,7 @@ const CREATE_DESCRIPTION = [
   '',
   'PAGES: any .html member is a whole page of its own, so one block can carry several screens of the same product — the same form at rest, in error, mid-load — instead of faking them inside one document.',
   '',
-  'DEMO: add a demo.json member — { snapshots: { home: "pages/home.html" }, timeline: { steps: [{ at: 0, do: "switch", snapshot: "home" }, { at: 900, do: "type", to: "#email", text: "a@b.c" }] } } — and with a non-empty timeline.steps the plugin plays the block itself and loops it: switch / move / highlight / click / type all run from outside, and a page change is a snapshot change. Without that member, or with an empty timeline, the block is a still page. A demo may be orchestrated and fictional; the screens it switches between are ones you wrote.',
+  'DEMO: add a demo.json member — { snapshots: { home: "pages/home.html" }, timeline: { steps: [{ at: 0, do: "switch", snapshot: "home" }, { at: 900, do: "type", to: "#email", text: "a@b.c" }] } } — and with a non-empty timeline.steps the plugin plays the block itself and loops it: switch / move / highlight / click / type all run from outside, and a page change is a snapshot change. snapshot VALUES are paths relative to the block ("pages/home.html"); the ENTRY document has no section name of its own, so point at it as "entry.html", "index.html", "./entry.html" or "". Every other name must be a section the block really has — the section list is in this tool result (files[].path), and a wrong name comes back as an error that lists the available ones. Without that member, or with an empty timeline, the block is a still page. A demo may be orchestrated and fictional; the screens it switches between are ones you wrote.',
   '',
   'REPLAY: the card\'s banner carries one more icon — a broken circle with a play mark, icon only, no label on screen (its accessible name is 重放动画). Clicking it loads the block\'s content again, exactly like pressing F5 on the page: the document is parsed again, every CSS animation and transition starts over, the scroll position goes back to the top, images are fetched again. Nothing about the block itself changes: a one-shot animation stays one-shot and still comes to rest on its final frame, because that is what the site does — the button only runs it again. It sends nothing into the block and the block cannot react to it: a block is script-inert by default (see NO SCRIPTING). A BLOCK HAS NO SCRIPT: the iframe carries sandbox="allow-same-origin" (no allow-scripts) and the block document carries CSP default-src \'none\', so no <script> inside a block ever runs — do not try to restore anything with block-side JavaScript. CSS still animates: animation and transition are driven by the renderer, so they play, and after a replay they all start over. THE BOUNDARY: a reload replays CSS animations, resets scroll and forms, but an entrance the site played by ADDING A CLASS after load will not play again — that class is already written into the snapshot, so the copied page starts in its final state. That is the capture\'s boundary, not the button\'s: restore such an entrance by rewriting it as a CSS animation (or by writing the initial state into the markup) on the capture side.',
   '',
@@ -3573,10 +3602,7 @@ export function apply(ctx, config) {
             return
           }
           const sections = splitSections(served)
-          // Both spellings serve the entry: /ui-blocks/<name> and, the one the
-          // client navigates to, /ui-blocks/<name>/ — only the trailing slash makes
-          // the entry's own ./logo.svg resolve to /ui-blocks/<name>/logo.svg.
-          if (sectionPath === null || sectionPath === '') {
+          const sendEntry = () => {
             const html = sections.entry
             res.writeHead(200, {
               'content-type': 'text/html; charset=utf-8',
@@ -3586,6 +3612,12 @@ export function apply(ctx, config) {
               ...blockHeaders()
             })
             res.end(html)
+          }
+          // Both spellings serve the entry: /ui-blocks/<name> and, the one the
+          // client navigates to, /ui-blocks/<name>/ — only the trailing slash makes
+          // the entry's own ./logo.svg resolve to /ui-blocks/<name>/logo.svg.
+          if (sectionPath === null || sectionPath === '') {
+            sendEntry()
             return
           }
           let type
@@ -3600,7 +3632,16 @@ export function apply(ctx, config) {
           }
           const file = sections.files.find((entry) => entry.path === sectionPath)
           if (file === undefined) {
-            sendText(res, 404, 'no section ' + sectionPath + ' in ' + blockPath(blockName))
+            // An explicit section of that name always wins; only when there is
+            // none does a spelling like "entry.html" mean the entry document.
+            if (isEntryAlias(sectionPath)) {
+              sendEntry()
+              return
+            }
+            // The message has to teach: name what exists, so the model can fix its
+            // own demo.json instead of costing the user another round trip.
+            sendText(res, 404, 'no section ' + sectionPath + ' in ' + blockPath(blockName)
+              + ' — available: ' + availableSections(sections))
             return
           }
           const bytes = file.base64 ? Buffer.from(file.body.trim(), 'base64') : Buffer.from(file.body, 'utf8')
