@@ -117,13 +117,26 @@ async function buildFixture(P) {
     '.avatar-svg{display:flex;width:100%;height:100%;overflow:hidden}',
     '.avatar-svg svg{display:block;width:100%;height:100%;overflow:hidden}',
     // 单位矩阵 = 视觉上没动，和 transform:none 一样不许写进块。
-    '.noopmove{position:relative;transform:translateX(0);top:auto;left:auto;}'
+    '.noopmove{position:relative;transform:translateX(0);top:auto;left:auto;}',
+    // ---- 变量作用域夹具（真实事故：pintia 的蓝按钮被抓成 hsl(0,0%,25%) 灰）----
+    // :root 给一个「全局值」，两个按钮各自用 class 覆盖同一个变量；抓完必须是各自的颜色。
+    ':root{--scope-color:rgb(9, 9, 9);}',
+    '.var-btn{--scope-color:rgb(62, 126, 234);background:var(--scope-color);color:#fff;border:0;padding:6px 12px;}',
+    '.var-btn-alt{--scope-color:rgb(214, 48, 49);background:var(--scope-color);color:#fff;border:0;padding:6px 12px;}',
+    // 只声明自定义属性的规则：不许因为「没有普通声明」被当成空规则丢掉。
+    '.cv-a{--c:rgb(20, 120, 60);}',
+    '.cv-b{--c:rgb(120, 20, 160);}',
+    '.cv-card{background:var(--c);padding:4px;}'
   ].join('') + '</style>';
   document.body.innerHTML = '<main class="wrap">' +
     '<section><h1 id="headline">抓取自检</h1><p id="tagline">目标元素在这里</p></section>' +
     '<div class="card" id="target">\u4f60\u597d\uff0cdsh</div>' +
     '<div class="hero"></div>' +
     '<div class="probe" id="probe"></div>' +
+    // 变量作用域：两个按钮 + 两张卡片，各自用自己的 --* 值
+    '<button id="varbtn" class="var-btn">变量按钮 A</button>' +
+    '<button id="varbtn2" class="var-btn-alt">变量按钮 B</button>' +
+    '<div id="cvbox"><div id="cva" class="cv-a cv-card">卡片 A</div><div id="cvb" class="cv-b cv-card">卡片 B</div></div>' +
     '<div class="drawerlike" id="drawerprobe">抽屉容器</div>' +
     '<div class="noopmove" id="noopmove">没移动</div>' +
     '<p><a id="rootlink" href="/abs/link">一个根绝对外链</a></p>' +
@@ -990,6 +1003,70 @@ async function main() {
         /report\.movedToAssets: \d+ resource\(s\) KEPT/.test(bText.text),
       'summary=' + JSON.stringify(bText.summary) + '；文本里的账=' +
         JSON.stringify(bText.text.split(NL).filter((l) => /report\.(dropped|movedToAssets)/.test(l))));
+
+    // ---- 15l. 变量作用域：站内变量原样保留、逐元素生效 ------------------------
+    // 真实事故（pintia 考试页）：「保存」按钮在真站是 rgb(62,126,234)，抓下来是
+    // hsl(0,0%,25%) 灰。根因：cleanDecls 拿**文档级全局变量表**去替换 var(--color)，
+    // 而 --color 是逐元素/逐组件声明的，全局表里存的是别的作用域的值。
+    // 现在站内自定义属性与含站内 var() 的声明原样写出去，谁覆盖谁由浏览器的层叠按元素算。
+    const varCssText = files.filter((f) => /\.css$/.test(f.path)).map((f) => String(f.content)).join(NL);
+    const ruleOfCss = (sel) => {
+      const at = varCssText.indexOf(sel + '{');
+      if (at < 0) return '';
+      const end = varCssText.indexOf('}', at);
+      return end < 0 ? '' : varCssText.slice(at, end + 1);
+    };
+    const varBtnRule = ruleOfCss('.var-btn');
+    const varBtnAltRule = ruleOfCss('.var-btn-alt');
+    const cvARule = ruleOfCss('.cv-a');
+    const rootScopeRule = (/:root\{[^}]*--scope-color[^}]*\}/.exec(varCssText) || [''])[0];
+    assert('变量作用域：var(--scope-color) 原样保留（不冻成全局值），两个按钮各带自己的值，只声明自定义属性的规则没被弃',
+      /background:var\(--scope-color\)/.test(varBtnRule) && /--scope-color:rgb\(62, 126, 234\)/.test(varBtnRule) &&
+        /background:var\(--scope-color\)/.test(varBtnAltRule) && /--scope-color:rgb\(214, 48, 49\)/.test(varBtnAltRule) &&
+        /\.cv-a\{--c:rgb\(20, 120, 60\)\}/.test(cvARule) &&
+        /--scope-color:rgb\(9, 9, 9\)/.test(rootScopeRule) &&
+        report.customPropsKept >= 3 && report.varDeclsKept >= 2 &&
+        (report.unresolvedVars || []).indexOf('--scope-color') < 0 && (report.unresolvedVars || []).indexOf('--c') < 0,
+      '.var-btn=' + varBtnRule + '；.var-btn-alt=' + varBtnAltRule + '；.cv-a=' + cvARule +
+        '；:root 兜底=' + rootScopeRule +
+        '；report.customPropsKept=' + report.customPropsKept + ' varDeclsKept=' + report.varDeclsKept +
+        ' unresolvedVars=' + JSON.stringify(report.unresolvedVars || []));
+
+    // 渲染验证：产物落盘后量 getComputedStyle。第二份把元素固化层（[data-dsh-el] 规则）
+    // 整段删掉——颜色必须仍是各自的，证明「逐元素」不是靠计算层兜、而是规则本身对。
+    const VAR_DIRS = {
+      full: path.join(HERE, 'out-selfcheck-var'),
+      nocomputed: path.join(HERE, 'out-selfcheck-var-nocomputed')
+    };
+    const writeProduct = (dir, stripComputed) => {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      for (const f of files) {
+        const target = path.join(dir, f.path);
+        mkdirSync(path.dirname(target), { recursive: true });
+        let body = f.base64 ? Buffer.from(String(f.content), 'base64') : String(f.content);
+        if (stripComputed && /\.css$/.test(f.path)) body = String(body).replace(/\[data-dsh-el="e\d+"\]\{[^}]*\}/g, '');
+        writeFileSync(target, body);
+      }
+    };
+    writeProduct(VAR_DIRS.full, false);
+    writeProduct(VAR_DIRS.nocomputed, true);
+    const measureVarColors = async (dir) => {
+      await cdp.navigate(s, pathToFileURL(path.join(dir, 'entry.html')).href, { settle: 500 });
+      return cdp.evaluate(s, () => {
+        const bg = (id) => { const el = document.getElementById(id); return el ? getComputedStyle(el).backgroundColor : ''; };
+        return { a: bg('varbtn'), b: bg('varbtn2'), ca: bg('cva'), cb: bg('cvb') };
+      });
+    };
+    const fullColors = await measureVarColors(VAR_DIRS.full);
+    const bareColors = await measureVarColors(VAR_DIRS.nocomputed);
+    const wantColors = { a: 'rgb(62, 126, 234)', b: 'rgb(214, 48, 49)', ca: 'rgb(20, 120, 60)', cb: 'rgb(120, 20, 160)' };
+    const sameColors = (got) => ['a', 'b', 'ca', 'cb'].every((key) => String(got[key]) === wantColors[key]);
+    assert('变量作用域渲染：两个按钮/两张卡片各自生效（rgb(62,126,234) 与 rgb(214,48,49) 不是同一个值）',
+      sameColors(fullColors),
+      '带元素固化层=' + JSON.stringify(fullColors) + '；期望=' + JSON.stringify(wantColors));
+    assert('变量作用域渲染：删掉元素固化层（[data-dsh-el] 规则）仍是各自的颜色 —— 逐元素不是靠计算层兜的',
+      sameColors(bareColors),
+      '只留样式表规则=' + JSON.stringify(bareColors));
 
     // ---- 16. frame shell：正文在 iframe 里，顶层文档抓下来是空的 ---------------
     // 真实事故：教务页正文整个装在 iframe 里，扩展只注入顶层文档，抓到一片空；模型于是

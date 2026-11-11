@@ -116,8 +116,44 @@
     return resolveText(text.slice(0, hit.start) + sub.text + text.slice(hit.end), vars, depth + 1);
   }
 
-  // 一条声明块（"a:b;c:d"）过一遍：自定义属性一律丢弃（消费方已固化），
-  // var() 递归解析，解析不了整条丢。
+  // ---- 自定义属性：站内变量原样保留，只固化宿主皮肤 -----------------------
+  // 真实事故（pintia 考试页）：.pc-button 的 background 本该是 var(--color)=#3E7EEA，
+  // 产物里被冻成 hsl(0,0%,25%)——因为 cleanDecls 拿**文档级全局变量表**去替换
+  // var(--color)，而 --color 是逐元素/逐组件的，全局表里存的是**别的**作用域的值
+  // （report.varsFromElements 里那条「--color = hsl(0, 0%, 25%)」就是它）。
+  // 现在：站内自定义属性与含站内 var() 的声明**原样写出去**，谁覆盖谁交给浏览器的
+  // 层叠按元素算；必须固化的只有宿主皮肤（--dsw-*/--columbina-），那属于 3080 的皮肤。
+  var HOST_VAR_RE = /^--(?:dsw-|columbina)/;
+
+  /** 只把 var(--dsw-*) 换成字面值；站内变量原样留着（连同它的 fallback）。 */
+  function substHostVars(text, vars, st) {
+    var s = String(text), out = '', i = 0, guard = 0;
+    while (i < s.length && guard++ < 200) {
+      var rest = s.slice(i);
+      var hit = findVar(rest);
+      if (!hit) { out += rest; break; }
+      out += rest.slice(0, hit.start);
+      var tok = rest.slice(hit.start, hit.end);
+      var name = String(splitTopLevel(hit.inside, ',')[0] || '').trim();
+      if (HOST_VAR_RE.test(name)) {
+        var r = resolveText(tok, vars, 0);
+        out += (r.ok && !/var\(/.test(r.text)) ? r.text : tok;
+      } else {
+        if (name && st && st.varRefs) st.varRefs[name] = 1;
+        out += tok;
+      }
+      i += hit.end;
+    }
+    return out;
+  }
+
+  /**
+   * 一条声明块过一遍。
+   * - 宿主皮肤变量（--dsw-*）的声明丢掉、用法换成字面值；
+   * - 站内自定义属性的声明照原样写出去——只声明自定义属性的规则因此不再被判「空规则」
+   *   丢弃（.pc-active-primary{--color:…} 这类正是「这个按钮是 primary」的唯一信息）；
+   * - 含站内 var() 的普通声明原样保留，不拿全局表替换（交互态跟着一起活）。
+   */
   function cleanDecls(body, vars, st) {
     var parts = splitTopLevel(String(body || ''), ';');
     var out = [];
@@ -129,17 +165,17 @@
       var prop = d.slice(0, c).trim();
       var val = d.slice(c + 1).trim();
       if (!prop || !val) continue;
-      if (prop.slice(0, 2) === '--') { st.customPropsDropped++; continue; }
-      var r = resolveText(val, vars, 0);
-      if (!r.ok || /var\(\s*--/.test(r.text)) {
-        // 没声明、也没 fallback：浏览器在「计算值阶段」判整条声明无效，属性退到 unset
-        // （继承属性照旧继承，其余取初始值）。写成 unset 才等价，也不留悬空的 var()。
-        st.declarationsInvalid++;
-        st.invalidAtComputedValue.push((r.name || '?') + ' -> ' + prop);
-        out.push(prop + ':unset');
+      if (prop.slice(0, 2) === '--') {
+        if (HOST_VAR_RE.test(prop)) { st.customPropsDropped++; continue; }
+        var cv = substHostVars(val, vars, st);
+        if (!cv) { st.customPropsDropped++; continue; }
+        out.push(prop + ':' + cv);
+        st.customPropsKept++;
         continue;
       }
-      out.push(prop + ':' + r.text);
+      var sv = substHostVars(val, vars, st);
+      if (/var\(\s*--/.test(sv)) { st.varDeclsKept++; out.push(prop + ':' + sv); continue; }
+      out.push(prop + ':' + sv);
     }
     return out.join(';');
   }
@@ -448,8 +484,9 @@
       // 去重掉的重复 at-rule 条数（见 dedupeAtRules；只算这两类，别的一律不碰）
       fontFacesDeduped: 0, keyframesDeduped: 0,
       elements: 0, computedRules: 0, assetsInlined: 0, assetsSpilled: 0,
-      // 令牌固化：解析不到的名字不再静默丢声明，而是按浏览器的实际行为写成 unset 并记名
+      // 令牌固化：宿主皮肤（--dsw-*）换成字面值；站内变量原样保留并记账
       declarationsInvalid: 0, invalidAtComputedValue: [],
+      customPropsKept: 0, varDeclsKept: 0, varRefs: {},
       skinSelectorRewrites: 0, skinSelectorKept: 0, skinAttrsStripped: 0,
       // 活值固化（input/textarea/select）与敏感字段跳过
       liveValuesWritten: 0, liveValuesSkipped: 0, sensitiveSample: [],
@@ -564,26 +601,56 @@
       var bodyVars = readVars(win.getComputedStyle(doc.body));
       for (var k in bodyVars) if (Object.prototype.hasOwnProperty.call(bodyVars, k)) vars[k] = bodyVars[k];
     }
-    // 只在子树里声明的令牌（根与 body 上抄不到）：解析时按名字现问一遍元素，问到了就写进表。
+    // 只在子树里声明的令牌（根与 body 上抄不到）：解析时按名字现问一遍元素。
+    // 这些值**只**进报告、**不**变成 :root 兜底：它们取自「某个元素」，属于那个元素/组件
+    // 的作用域，把它抬成全局单值正是蓝色变灰的病根（见 cleanDecls 上的注释）。
+    var varsSource = {};
+    Object.keys(vars).forEach(function (name) { varsSource[name] = 'root'; });
+    if (doc.body && win.getComputedStyle) {
+      var bodyVarNames = readVars(win.getComputedStyle(doc.body));
+      Object.keys(bodyVarNames).forEach(function (name) { varsSource[name] = 'body'; });
+    }
     var probeCache = {};
     var varsFromElements = [];
     var lookupVar = function (name) {
       if (Object.prototype.hasOwnProperty.call(vars, name)) return String(vars[name]).trim();
       if (Object.prototype.hasOwnProperty.call(probeCache, name)) return probeCache[name];
-      var found = '';
+      var found = '', at = '';
       try {
         var all = doc.querySelectorAll('body, body *');
         for (var i = 0; i < all.length && i < 4000; i++) {
           var v = win.getComputedStyle(all[i]).getPropertyValue(name);
-          if (v && String(v).trim() !== '') { found = String(v).trim(); break; }
+          if (v && String(v).trim() !== '') {
+            found = String(v).trim();
+            at = String(all[i].tagName || '').toLowerCase() + (all[i].id ? '#' + all[i].id : '') +
+              (all[i].className && typeof all[i].className === 'string' ? '.' + all[i].className.split(/\s+/).slice(0, 2).join('.') : '');
+            break;
+          }
         }
       } catch (e) { found = ''; }
       probeCache[name] = found;
-      if (found) { vars[name] = found; varsFromElements.push(name + ' = ' + found.slice(0, 60)); }
+      if (found) {
+        vars[name] = found;
+        varsSource[name] = 'element-probe';
+        varsFromElements.push({ name: name, value: found.slice(0, 120), from: 'element-probe', at: at.slice(0, 120) });
+      }
       return found;
     };
     Object.defineProperty(vars, 'lookup', { value: lookupVar, enumerable: false });
     var varCount = Object.keys(vars).length;
+    /** :root 兜底层：只收真的挂在根/body 上的令牌（元素的私有值不许升级成全局单值）。 */
+    var rootVarDecls = [];
+    Object.keys(vars).forEach(function (name) {
+      if (HOST_VAR_RE.test(name)) return;
+      var src = varsSource[name];
+      if (src !== 'root' && src !== 'body') return;
+      var v = String(vars[name] || '').trim();
+      // 值里带 url() 的不进兜底层：这些 URL 在资源那一趟之后才出现，来不及本地化，
+      // 留在 :root 里就是一条悬空/越界引用。ponytail: 代价是这类变量退回「没有值」，
+      // 升级路径是把它并进第 5 步的 URL 清单再本地化。
+      if (!v || /url\(/i.test(v)) return;
+      rootVarDecls.push(name + ':' + v);
+    });
 
     // 1) 祖先链：从目标元素往上走到 body 的直系子元素为止（不要把整个 document 塞进去）
     var root = doc.body;
@@ -1493,7 +1560,22 @@
       'img,svg,video,canvas{max-width:100%;height:auto}'
     ].concat(deduped.fontFaces).concat(deduped.keyframes);
     var pageCssBody = rest.length ? rest : ['/* 本页没有命中任何样式表规则 */'];
-    var pageCss = ['/* dsh-page-capture: 本页样式表命中规则 + 元素计算样式固化 */'].concat(pageCssBody).concat(computedRules);
+    // :root 兜底层放最前：只给「样式表里没有规则声明它」的令牌兜个值（主题常由 JS 塞到
+    // html/body 上）。后面任何声明了同名令牌的规则都会按层叠覆盖它。
+    var pageCss = ['/* dsh-page-capture: 本页样式表命中规则 + 元素计算样式固化 */']
+      .concat(rootVarDecls.length ? [':root{' + rootVarDecls.join(';') + '}'] : [])
+      .concat(pageCssBody).concat(computedRules);
+    // 这些名字被 var() 引用了，但产物里没有任何规则/兜底层声明它们 → 浏览器会按
+    // 「计算值阶段无效」退成 unset。报告里点名，别让它静默。
+    var declaredVars = {};
+    var scanVarDecls = function (txt) {
+      var re = /(--[A-Za-z0-9_-]+)\s*:/g, m;
+      while ((m = re.exec(txt))) declaredVars[m[1]] = 1;
+    };
+    scanVarDecls(pageRules.join(NL));
+    scanVarDecls(computedRules.join(NL));
+    scanVarDecls(rootVarDecls.join(';'));
+    var unresolvedVars = Object.keys(st.varRefs).filter(function (n) { return !declaredVars[n]; });
     var appCssText = subCss(appCss.join(NL), '../') + NL;
     var pageCssText2 = subCss(pageCss.join(NL), '../../') + NL;
     if (utf8Len(appCssText) > SECTION_MAX_BYTES) { degrade.push('shared/app.css 超单段上限 ' + Math.round(SECTION_MAX_BYTES / 1024) + 'KB（' + utf8Len(appCssText) + '）'); }
@@ -1555,12 +1637,16 @@
       // 那是「碰到的条数」，写进 app.css 的是去重之后的那份。
       fontFacesDeduped: st.fontFacesDeduped,
       keyframesDeduped: st.keyframesDeduped,
+      // 站内自定义属性：原样写出去的条数 / 丢掉的（只有宿主皮肤 --dsw-* 与解析不了的空值）
+      customPropsKept: st.customPropsKept,
       customPropsDropped: st.customPropsDropped,
+      // 含站内 var() 的普通声明：原样保留、交给浏览器按元素算的条数
+      varDeclsKept: st.varDeclsKept,
       declarationsDropped: st.declarationsDropped,
       declarationsInvalid: st.declarationsInvalid,
-      // 判据：unresolvedVars 为空（没有悬空的 var() 留给宿主令牌表），且产物里
-      // data-dsh-columbina / --columbina- 计数为 0。
-      unresolvedVars: [],
+      // 被 var() 引用、却在产物里找不到声明的令牌名：浏览器会把这些声明退成 unset。
+      // （宿主皮肤 --dsw-* 不在此列——它已经换成字面值了。）
+      unresolvedVars: unresolvedVars.slice(0, 40),
       invalidAtComputedValue: st.invalidAtComputedValue,
       skinSelectorRewrites: st.skinSelectorRewrites,
       skinSelectorKept: st.skinSelectorKept,

@@ -118,7 +118,7 @@ POST {发任务那个实例的 baseUrl}/ui-blocks/agent/result[?token=…]
 ```
 entry.html                 入口：<link rel="stylesheet" href="./shared/app.css"> + ./pages/current/page.css
 shared/app.css             基线（重置 + @font-face + @keyframes），字体引用 ../assets/
-pages/current/page.css     本页命中规则（死选择器已丢、var 已固化）+ 元素计算样式清单，引用 ../../assets/
+pages/current/page.css     本页命中规则（死选择器已丢、站内 var() 原样保留、宿主皮肤 --dsw-* 已固化）+ 元素计算样式清单，引用 ../../assets/
 assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且降采样后仍超限的图，以及雪碧图/长条图（长宽比 ≥8，原尺寸不降采样）
 ```
 
@@ -179,7 +179,11 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
 
 ## 皮肤不许被抓进块里
 
-抓取时把 `:root`/`body` 上此刻的自定义属性收成字面值表，再把每条声明里的 `var(--x)` 递归替换；解析不了就丢整条声明，绝不把 `var(--dsw-*)` 留在素材里。SVG 的呈现属性（`fill="var(--dsw-…)"`）同样处理——3080 的图标就是这个形态，漏了会留下 7 处残留。
+只固化**宿主皮肤**：`var(--dsw-*)` / `var(--columbina-*)` 换成字面值、对应声明丢掉；SVG 的呈现属性（`fill="var(--dsw-…)"`）同样处理——3080 的图标就是这个形态，漏了会留下 7 处残留。
+
+**站点自己的自定义属性与 `var()` 一律原样保留**：`--color` 这类令牌大多是逐元素/逐组件声明的（同一页两个按钮的 `--color` 不同），拿一张「文档级全局变量表」去替换，就会把每个元素都写成**别的**作用域的值——真实事故：pintia 考试页「保存」按钮冻结成 `hsl(0,0%,25%)` 灰，真站是 `#3E7EEA`。现在规则里的 `var(--color)` 原样写出去，谁覆盖谁交给浏览器的层叠按元素算；只声明自定义属性的规则（`.pc-active-primary{--color:…}`）也照旧输出，不再被当成空规则丢掉。
+
+对应 `report`：`customPropsKept`（原样输出的站内自定义属性条数）、`varDeclsKept`（原样保留的含 var() 声明条数）、`unresolvedVars`（被引用但产物里找不到声明的令牌名——浏览器会退成 unset）、`varsFromElements[]`（只在某个元素上探到的令牌值，带 `from:'element-probe'` 与 `at:'tag#id.cls'` 出处，**不会**升级成全局单值）。样式表里没有任何规则声明的令牌才由 `:root{…}` 兜底层补值，兜底层放在 page.css 最前，任何声明了同名令牌的规则都会覆盖它。
 
 ## 表单活值：值住在 property 里，抓取时写成属性
 
