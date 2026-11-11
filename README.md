@@ -204,14 +204,22 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 
 **问题**：块里的动画是**一次性**的（`iterations=1`），播完停在终态，用户任何时候看都是静态的。**不改成循环**——那等于改原站的效果。
 
-分辨率与选区图标**右边**再一颗 13×13 图标：断开的圆 + 箭头 + 一个实心小三角（「再播一遍」，不是「刷新整页」）。按一下做两件事：
+位置：`span.dshpb-ctl` 里，夹在**分辨率与选区图标之间**，与选区图标同尺寸同风格：纯图标（断开的圆 + 箭头 + 一个实心小三角），**无可见文字、无 `title` 悬停提示**，可访问名 `aria-label="重放动画"`；悬停才显底色（沿用 `.dshpb-btn:hover`）。
 
-1. 先往块里 `postMessage({ type: 'dsh:replay' })`（`targetOrigin: '*'`，消息里没有秘密）；有监听者可以在这时复位自己的状态，没有就什么也不发生。
-2. 一个任务之后（`setTimeout(…, 0)`）重新加载 entry：srcdoc 块 `removeAttribute('srcdoc')` 再写回；分段块重设 `src`，带一个只这一下用的 `replay=N` 参数。块里所有 CSS 动画与过渡从头播，**时序一个字节都不改**。
+按一下 = **把块的内容重新加载一次，等同在浏览器里按 F5**：
 
-重载必须晚于消息：同一个 tick 里换文档会把这条消息连同旧文档一起丢掉（实测踩过，`setTimeout(…, 0)` 之后正常）。演示块不挂这颗按钮（已有 播放 / 暂停 / 重新开始），尺寸、缩放、sandbox 都不动。
+1. srcdoc 块：`removeAttribute('srcdoc')` 再写回同一份 `buildSrcdoc()`——真的重新解析，而不是被当成「值没变」跳过。
+2. 分段块：按 `entryUrl()` 重设 `src`，带一个只这一下用的 `replay=N` 参数（同一个 src 再赋一次不保证导航）。
 
-**消息现在到不了块里的脚本**：块是 script-inert 的（iframe `sandbox="allow-same-origin"`、文档 CSP `script-src 'none'`），块内 `<script>` 不执行。这条消息是「将来块能带脚本」时的接口，不是重播的依赖——现在真正让动画重播的是重新加载 entry。测试接缝：`window.__dshPageBlock.replay(i)`。
+结果：文档重新解析、块里所有 CSS 动画与过渡从头播、**滚动位置回到顶部**、图片重新请求；**时序一个字节都不改**。
+
+**不向块里发消息**：块是**无 JS** 的——iframe `sandbox="allow-same-origin"`（**没有 `allow-scripts`**），块内 CSP 是 `default-src 'none'`，块里的 `<script>` 一律不执行；而重载又会把旧文档整个换掉。消息没有接收方，所以没有 `dsh:replay` 这个契约（用户定稿 2026-11-11）。实测：块里留的 `data-inline-script` 标记始终为空，父页面挂的监听能收到消息，块自己的监听器永远收不到。
+
+**无 JS ≠ 无动画**：`animation` / `transition` 由渲染引擎驱动，不需要脚本；重播后块里的动画全部重新 `running`，播完仍停在终态。
+
+**边界**：刷新能重播 CSS 动画、重置滚动与表单，但「靠 JS 在加载后加 class 才触发」的入场动画不会因为刷新再播一次——那个 class 已经写进快照了。这是抓取的边界，不是按钮的缺陷；因为块内脚本不执行，这类入场**只能由抓取侧改写成 CSS 动画（或把初始态写进标记）来还原**。
+
+演示块不挂这颗按钮（已有 播放 / 暂停 / 重新开始），尺寸、缩放、sandbox 都不动。测试接缝：`window.__dshPageBlock.replay(i)`，返回 `{ mode }`。
 
 ## 演示块：宿主驱动的时间轴（2026-11-09，路线 1）
 

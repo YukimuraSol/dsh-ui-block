@@ -2048,8 +2048,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         state.frame.style.visibility = '';
       }
       /**
-       * Replay one block: load its entry again, so every CSS animation and
-       * transition in it starts over.
+       * Replay one block: load its entry again, exactly like F5 in a browser.
        *
        * NOT a loop. A block copies the site as it is, and the site plays its
        * entrance once and stops on the final frame — turning that into an
@@ -2057,47 +2056,41 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
        * document keeps its one-shot timing, and only this button makes it run a
        * second time.
        *
-       * Before the reload the block gets `{ type: 'dsh:replay' }`: a listener
-       * INSIDE the block can reset state that outlives the document (a form, a
-       * storage entry, a class switch). No listener means no listener — the
-       * message is ignored and the reload happens anyway. A block is
-       * script-inert by default (sandbox allow-same-origin only, CSP
-       * script-src 'none'), so treat this as the hook for the day a block CAN
-       * carry a script, never as a thing the reload depends on.
+       * Nothing else comes with it: no message, no reset hook, no window into
+       * the block's own state. A reload is a reload — the document is parsed
+       * again, CSS animations and transitions start over, scroll position goes
+       * back to the top, images are fetched again.
+       *
+       * What a reload CANNOT bring back is an entrance the site played by
+       * ADDING A CLASS after load: that class is already baked into the
+       * snapshot, so the copied page simply starts in its final state. That is
+       * the capture's boundary, not this button's — a page that wants such an
+       * entrance back has to bring its own reset, and a block cannot run one
+       * (script-inert by default).
        */
       function replayBlock(state) {
         if (!state || !state.frame || !state.frame.isConnected) return null;
         // A demo block already has 播放 / 暂停 / 重新开始 and is owned by the
-        // player; replaying its frame underneath would fight the timeline.
+        // player; reloading its frame underneath would fight the timeline.
         if (state.demoSpec) return null;
-        var posted = false;
-        try {
-          var win = state.frame.contentWindow;
-          if (win) { win.postMessage({ type: 'dsh:replay' }, '*'); posted = true; }
-        } catch (e) { posted = false; /* a frame that never loaded has no window */ }
-        // The reload goes one task later ON PURPOSE. postMessage only queues the
-        // message; tearing the document down in the same tick would throw it
-        // away before the block ever saw it. Queued first, delivered first.
-        var reload = function () {
-          if (!state.frame || !state.frame.isConnected) return;
-          if (state.urlMode) {
-            // Assigning the same src again is not a guaranteed navigation: the
-            // counter makes it a different URL, and nothing else reads it.
-            state.replays = (state.replays || 0) + 1;
-            var url = entryUrl(state);
-            state.frame.setAttribute('src', url + (url.indexOf('?') < 0 ? '?' : '&') + 'replay=' + state.replays);
-            return;
-          }
-          // srcdoc: remove then write it back, so this really is a re-parse
-          // (re-setting an identical value is not relied upon). Both happen in
-          // one task, so nothing repaints in between; buildSrcdoc reads the live
-          // token sheet, exactly like the first paint did.
-          var html = buildSrcdoc(state, tokenCache);
-          state.frame.removeAttribute('srcdoc');
-          state.frame.setAttribute('srcdoc', html);
-        };
-        window.setTimeout(reload, 0);
-        return { posted: posted, mode: state.urlMode ? 'url' : 'srcdoc' };
+        if (state.urlMode) {
+          // Assigning the same src again is not a guaranteed navigation: the
+          // counter makes it a different URL, and nothing else reads it.
+          state.replays = (state.replays || 0) + 1;
+          var url = entryUrl(state);
+          state.frame.setAttribute('src', url + (url.indexOf('?') < 0 ? '?' : '&') + 'replay=' + state.replays);
+          return { mode: 'url' };
+        }
+        // srcdoc: remove then write it back, so this really is a re-parse
+        // (re-setting an identical value is not relied upon). Both happen in
+        // one task, so nothing repaints in between; buildSrcdoc reads the live
+        // token sheet, exactly like the first paint did. Measured: a marker
+        // stamped on the old document is gone afterwards and
+        // performance.timeOrigin changes — the old document is really gone.
+        var html = buildSrcdoc(state, tokenCache);
+        state.frame.removeAttribute('srcdoc');
+        state.frame.setAttribute('srcdoc', html);
+        return { mode: 'srcdoc' };
       }
       function relayout(state) {
         applySize(state);
@@ -2201,13 +2194,16 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // second later. This button reloads the entry instead of changing that
         // timing: the loop stays a one-shot, the user decides when it runs.
         // Not on a demo block — the transport already has 重新开始.
+        // Icon only (user call, 2026-11-11): no visible word, no title tooltip,
+        // and the same 24x16 box as the picker, sitting BETWEEN 分辨率 and
+        // 选取元素. The name survives in aria-label; "重放动画" is what a screen
+        // reader says, which is also why the word never reaches the screen.
         var replayButton = null;
         if (!state.demoSpec) {
           replayButton = document.createElement('button');
           replayButton.type = 'button';
           replayButton.className = 'dshpb-btn dshpb-replay';
-          replayButton.title = '重播：重新加载画布，让动画与过渡从头再播一遍（不改成循环）';
-          replayButton.setAttribute('aria-label', '重播块内动画');
+          replayButton.setAttribute('aria-label', '重放动画');
           replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
           replayButton.addEventListener('click', function (event) {
             event.preventDefault();
@@ -2219,9 +2215,10 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         note.className = 'dshpb-note';
         note.textContent = '未声明，使用默认';
         controls.appendChild(resButton);
-        controls.appendChild(pickButton);
-        // Right of the picker, so the two controls that existed keep their x.
+        // Between 分辨率 and the picker (user call): one more icon in the same
+        // group, so neither the size button's x nor the copy-path button moves.
         if (replayButton !== null) controls.appendChild(replayButton);
+        controls.appendChild(pickButton);
         // Demo transport goes leftmost: it is the only part of a demo block a
         // pointer can reach, because the frame never takes the pointer.
         buildTransport(state, controls);
@@ -3013,9 +3010,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           }
         },
         /**
-         * Test seam: the banner's replay button, as a function. Sends one
-         * dsh:replay message into the block and loads its entry again; returns
-         * { posted, mode } or null for a demo block / a block that is gone.
+         * Test seam: the banner's replay button, as a function. Loads the
+         * block's entry again (exactly like F5); returns { mode } or null for a
+         * demo block / a block that is gone.
          */
         replay: function (index) { var s = live[index || 0]; if (!s) return null; return replayBlock(s); },
         /**

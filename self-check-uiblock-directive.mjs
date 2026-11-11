@@ -989,14 +989,16 @@ await ta('the @keyframes line carries one-shot vs infinite and the dangling name
   assert.match(rmTextOut, /A looping animation stays infinite in your copy/)
 })
 // ---------------------------------------------------------------------------
-// 20. 重播按钮：一次性动画不改成循环，按一下把 entry 重新加载一遍。
+// 20. 重播按钮：一次性动画不改成循环，按一下把块的内容重新加载一遍（等同 F5）。
 // 真实诉求（2026-11-11）：块里的动画 getAnimations() 全部 running 但 iterations=1，
 // 播完停在终态，用户任何时候看都是静态的。修法不是把动画改成 infinite（那是改原站
-// 效果），而是在卡片外壳上加一颗重播按钮：先发 dsh:replay 消息，再重新加载 entry。
-// 这一节钉住四条不能漂的东西：按钮在 buildControls 里、消息在重载之前、重载延后一个
-// 任务（同一个 tick 换文档会把消息丢掉）、sandbox 没被放宽成 allow-scripts。
+// 效果），而是在卡片外壳上加一颗纯图标按钮：重新加载 entry。
+// 用户定稿（同日晚）：按钮就是「重新渲染」，像真刷新一样——不向块里发消息、不留
+// dsh:replay 契约（重载会把旧文档整个换掉，换之前的消息没有接收方）。
+// 这一节钉住不能漂的东西：按钮在 buildControls 里且夹在分辨率与选区之间、纯图标
+// 无 title、重载走 srcdoc 重写或 src 重设、不发消息、sandbox 没被放宽。
 // ---------------------------------------------------------------------------
-console.log('--- 20. the replay button reloads the entry after one dsh:replay message ---')
+console.log('--- 20. the replay button reloads the block like F5, and sends nothing ---')
 const fnAt = (name) => source.indexOf('function ' + name + '(')
 const sliceBetween = (from, to) => {
   const a = source.indexOf(from)
@@ -1012,15 +1014,26 @@ t('replayBlock() exists and replayBlock is reachable from the banner controls', 
   assert.match(controlsBody, /replayBlock\(state\)/, 'the button does not call replayBlock')
   assert.match(controlsBody, /controls\.appendChild\(replayButton\)/, 'the button is built but never mounted')
 })
-t('the message goes out BEFORE the reload, and the reload waits one task', () => {
-  const post = replayBody.indexOf("postMessage({ type: 'dsh:replay' }")
-  const defer = replayBody.indexOf('window.setTimeout(reload, 0)')
-  assert.ok(post > 0, 'no dsh:replay postMessage')
-  assert.ok(defer > post, 'the reload is not queued after the message')
-  assert.match(replayBody, /postMessage\(\{ type: 'dsh:replay' \}, '\*'\)/)
-  // 同一个 tick 里换文档会把这条消息连同旧文档一起丢掉：重载必须在 reload 闭包里延后。
-  const reloadFn = replayBody.indexOf('var reload = function ()')
-  assert.ok(reloadFn > 0 && reloadFn < defer, 'the reload must live in the deferred closure')
+t('the replay icon sits BETWEEN the size button and the picker, not after it', () => {
+  // 用户定稿（2026-11-11）：不要独立的按钮/分组，插进已有的 span.dshpb-ctl 里，
+  // 顺序是 分辨率 → 重放 → 选取元素（复制路径在最右，不参与）。
+  const sizeAt = controlsBody.indexOf('controls.appendChild(resButton)')
+  const replayAt = controlsBody.indexOf('controls.appendChild(replayButton)')
+  const pickAt = controlsBody.indexOf('controls.appendChild(pickButton)')
+  assert.ok(sizeAt > 0 && replayAt > sizeAt, 'replay is not appended after the size button')
+  assert.ok(pickAt > replayAt, 'replay must be appended BEFORE the picker')
+  assert.equal(controlsBody.split('appendChild(replayButton)').length - 1, 1, 'replay is mounted twice')
+})
+t('a replay is a plain reload: no message, no hook, nothing injected into the block', () => {
+  // 用户定稿：按钮 = 重新渲染，像真刷新一样。发消息那一步整个删掉了。
+  assert.doesNotMatch(replayBody, /postMessage/, 'the block must not receive a message any more')
+  assert.doesNotMatch(source, /dsh:replay/, 'the retired dsh:replay contract is still in client.js')
+  assert.doesNotMatch(replayBody, /setTimeout/, 'the reload no longer needs to wait a task for a message')
+  // 两条路都是「换掉整份文档」，这是 F5 等价性的实现落点。
+  const srcdocAt = replayBody.indexOf("state.frame.setAttribute('srcdoc', html)")
+  const urlAt = replayBody.indexOf("state.frame.setAttribute('src'")
+  assert.ok(srcdocAt > 0 && urlAt > 0, 'both document kinds must reload')
+  assert.match(replayBody, /if \(state\.urlMode\)/, 'the two paths are chosen by urlMode')
 })
 t('both document kinds reload, and nothing else about the block changes', () => {
   // srcdoc：去掉再写回去，保证真的重新解析
@@ -1042,9 +1055,11 @@ t('the sandbox is not widened, and a demo block gets no replay button', () => {
   assert.match(source, /frame\.setAttribute\('sandbox', 'allow-same-origin'\)/)
   assert.match(source, /iframe\.setAttribute\('sandbox', 'allow-same-origin'\)/)
 })
-t('the icon and the tooltip say "replay", not "reload the page"', () => {
-  assert.match(controlsBody, /aria-label', '重播块内动画'/)
-  assert.match(controlsBody, /replayButton\.title = '重播：重新加载画布，让动画与过渡从头再播一遍（不改成循环）'/)
+t('icon only: no visible word, no title tooltip, the name lives in aria-label', () => {
+  assert.match(controlsBody, /aria-label', '重放动画'/, 'the accessible name is gone')
+  // 「重播」不许出现在可见界面上：没有 title（悬停会显示文字），也没有 textContent。
+  assert.doesNotMatch(controlsBody, /replayButton\.title/, 'a title tooltip would print 重播 on hover')
+  assert.doesNotMatch(controlsBody, /replayButton\.textContent/, 'visible text on the replay button')
   assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
   assert.match(source, /\.dshpb-pick,\.dshpb-replay\{padding:1px 5px/)
   assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
@@ -1052,11 +1067,15 @@ t('the icon and the tooltip say "replay", not "reload the page"', () => {
 t('the test seam calls the same function the button does', () => {
   assert.match(source, /replay: function \(index\) \{ var s = live\[index \|\| 0\]; if \(!s\) return null; return replayBlock\(s\); \}/)
 })
-t('create_ui_block says the banner has a replay button and what the message means', () => {
+t('create_ui_block says the button reloads like F5 and names the capture boundary', () => {
   const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
-  assert.match(create, /REPLAY: the card\\'s banner carries one more button/)
-  assert.match(create, /sends \{ type: "dsh:replay" \} into the block and then loads the entry again/)
+  assert.match(create, /REPLAY: the card\\'s banner carries one more icon/)
+  assert.match(create, /loads the block\\'s content again, exactly like pressing F5/)
   assert.match(create, /a one-shot animation stays one-shot/)
+  assert.doesNotMatch(create, /dsh:replay/, 'the tool description still promises a message that is never sent')
+  // 边界必须写进描述：刷新救不了「靠 JS 加 class 的入场动画」，那是抓取的边界。
+  assert.match(create, /THE BOUNDARY: a reload replays CSS animations/)
+  assert.match(create, /already written into the snapshot/)
   // 块仍然是 script-inert 的：描述必须说「别依赖块内脚本」，否则模型会写出跑不起来的代码。
   assert.match(create, /script-inert by default/)
 })
