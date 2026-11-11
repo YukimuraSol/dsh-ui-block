@@ -1173,7 +1173,35 @@ window.__ModuleLoader__.load({
       '.dshpb-pick-on{background:transparent}',
       '.dshpb-pick-on path{stroke:#22d3ee;stroke-width:1.5}',
       '.dshpb-pickbox{position:fixed;z-index:2147483000;pointer-events:none;display:none;',
-      'border:2px solid #4d6bfe;background:rgba(77,107,254,.12)}'
+      'border:2px solid #4d6bfe;background:rgba(77,107,254,.12)}',
+      // One-line hover hint (2026-11-11, third pass). The row's four buttons must
+      // answer the same gesture with the same bubble, and the only one that
+      // answers at all on the user's machine is the shell's own tooltip on the
+      // copy-path button. Its live values are reproduced here value for value
+      // instead of borrowing the shell component, which is out of bounds.
+      //
+      // What drives it, measured not assumed (out/probe/tooltip-unify2/
+      // report-mechanism.json): the shell bubble is a React component. It clones
+      // its child and injects onMouseEnter/onMouseLeave, so a plugin-created
+      // button can never get one — clean clones carrying aria-label, title, both,
+      // or the copy button's exact attributes showed no node at all. `title` is
+      // the browser's OS tooltip, which lives outside the render tree: that is
+      // why headless could not tell it from no hint, and why the size button
+      // showed nothing on real hardware.
+      //
+      // The only visible gap to the shell bubble was the entry: it fades in over
+      // 150ms on var(--ds-ease-in-out); this one used to pop in. Same keyframes,
+      // same duration, same curve. pointer-events:none: a hint must never eat the
+      // click it is describing.
+      '.dshpb-tip{position:fixed;z-index:1100;display:none;align-items:center;gap:8px;',
+      'width:max-content;max-width:50vw;padding:3px 7px;border-radius:var(--dsw-radius-sm,8px);',
+      'background:var(--dsw-alias-tooltip-bg,#43454a);color:var(--dsw-static-neutral-bluish-00,#fff);',
+      'font-size:13px;line-height:20px;white-space:pre-line;overflow-wrap:break-word;',
+      'box-shadow:none;pointer-events:none;transform:translate(-50%,-100%);',
+      'animation:dshpb-tip-in .15s var(--ds-ease-in-out,cubic-bezier(.4,0,.2,1))}',
+      '.dshpb-tip[data-side="bottom"]{transform:translate(-50%,0)}',
+      '@keyframes dshpb-tip-in{0%{opacity:0}}',
+      '@media(prefers-reduced-motion:reduce){.dshpb-tip{animation:none}}'
     ].join('');
 
     // ── canvas picker (2026-10-10) ─────────────────────────────────────────────
@@ -2174,7 +2202,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         var resButton = document.createElement('button');
         resButton.type = 'button';
         resButton.className = 'dshpb-btn';
-        resButton.title = '画布分辨率（点开可改，含自定义 W×H）';
+        // No title attribute anywhere in this row: the native hint is exactly what
+        // failed on the user's machine (see attachTip below). The bubble is ours.
+        attachTip(resButton, '画布分辨率（点开可改，含自定义 W×H）');
         resButton.addEventListener('click', function (event) { event.preventDefault(); event.stopPropagation(); openResMenu(state); });
         // Canvas picker toggle. Icon only (14x14), sitting to the RIGHT of the
         // resolution button; the lit state is the cyan stroke alone — the banner row
@@ -2184,14 +2214,10 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         pickButton.className = 'dshpb-btn dshpb-pick';
         pickButton.setAttribute('aria-pressed', 'false');
         pickButton.setAttribute('aria-label', '在画布内选取元素');
-        // Hover explanation = the browser's OWN title tooltip, the same mechanism
-        // as the size button beside it (user call, 2026-11-11). The row must not
-        // mix two kinds of hover hint: the home-made one that used to live here
-        // showed up after a 3s delay, so the same gesture felt different on every
-        // icon. Delay and look are now the platform's everywhere.
-        // The text names the action first, then says how it works — a tooltip that
-        // only repeats the icon name tells the pointer nothing.
-        pickButton.title = '在画布内选取元素（点元素插入到输入框 · 滚轮切层 · 方向键导航 · 再点退出）';
+        // Hover explanation = the row's own bubble (attachTip), same look and same
+        // instant appearance as the copy-path tooltip beside it (user call,
+        // 2026-11-11). The text names the thing first, then how it works.
+        attachTip(pickButton, '在画布内选取元素 · 点元素插入输入框 · 滚轮切层 · 再点退出');
         pickButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M2.5 2.5l5 11 1.8-4.2 4.2-1.8z"/></svg>';
         pickButton.addEventListener('click', function (event) {
           event.preventDefault();
@@ -2205,19 +2231,17 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // Not on a demo block — the transport already has 重新开始.
         // Icon only (user call, 2026-11-11): no visible word, and the same 24x16
         // box as the picker, sitting BETWEEN 分辨率 and 选取元素. The name lives
-        // in aria-label (what a screen reader says) and in title (what the pointer
-        // gets): one hover mechanism for the whole row — the browser's own
-        // tooltip, the same one the size button beside it already uses.
+        // in aria-label (what a screen reader says) and in the row's bubble (what
+        // the pointer gets) — one hover mechanism for the whole row.
         var replayButton = null;
         if (!state.demoSpec) {
           replayButton = document.createElement('button');
           replayButton.type = 'button';
           replayButton.className = 'dshpb-btn dshpb-replay';
           replayButton.setAttribute('aria-label', '重放动画');
-          // Names the action, then says what it does: "replay" alone reads like a
-          // media control, and what this really does is throw the document away
-          // and parse it again.
-          replayButton.title = '重放动画（重新加载画布内容，等同刷新）';
+          // Names what it does: what this really is, is throwing the document away
+          // and parsing it again.
+          attachTip(replayButton, '重新加载画布内容（等同刷新）');
           replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
           replayButton.addEventListener('click', function (event) {
             event.preventDefault();
@@ -2250,6 +2274,67 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           pickButton.setAttribute('aria-pressed', 'true');
         }
         updateControls(state);
+      }
+
+      // ── the banner's hover hint (2026-11-11, second pass) ────────────────────
+      // History worth keeping: the row used to carry the browser's native title,
+      // and that was reported DEAD on real hardware ("尺寸的悬停直接没了"). The
+      // conclusion it replaced — "no floating node in headless means a native
+      // title, so a title everywhere is consistent" — was an inference from
+      // headless alone, and headless cannot tell the two apart: a native tooltip
+      // lives in the browser UI layer and never enters the render tree, so
+      // "nothing in the DOM" means either a native tip or NO tip at all. The user
+      // saw the second. Hence: one hand-owned bubble, measured against the shell's
+      // copy-path tooltip, the one hint on this row that is proven, controllable
+      // and observable from headless. Values come from
+      // out/probe/tooltip-bubble/report-shell.json.
+      var TIP_ID = 'dshpb-tip';
+      var TIP_GAP = 8;     // the shell's bubble sits 8px above the button
+      var TIP_MARGIN = 8;  // and never closer than 8px to a viewport edge
+      var tipNode = null;
+      function tipEl() {
+        if (tipNode && tipNode.parentNode) return tipNode;
+        tipNode = document.createElement('span');
+        tipNode.className = 'dshpb-tip';
+        tipNode.id = TIP_ID;
+        tipNode.setAttribute('role', 'tooltip');
+        document.body.appendChild(tipNode);
+        return tipNode;
+      }
+      function hideTip() {
+        if (tipNode) tipNode.style.display = 'none';
+      }
+      function showTip(button, text) {
+        var node = tipEl();
+        if (node.textContent !== text) node.textContent = text;
+        node.style.display = 'inline-flex';
+        var rect = button.getBoundingClientRect();
+        var w = node.offsetWidth;
+        var h = node.offsetHeight;
+        // Above-centred; these icons sit at the right edge, so "centred" gets held
+        // inside the viewport instead of being cut off (a clipped hint is worse
+        // than one leaning left). No room above means below, same box maths.
+        var cx = rect.left + rect.width / 2;
+        var half = w / 2 + TIP_MARGIN;
+        if (cx + half > window.innerWidth) cx = window.innerWidth - half;
+        if (cx - half < 0) cx = half;
+        var top = rect.top - TIP_GAP;
+        var side = 'top';
+        if (top - h < TIP_MARGIN) { side = 'bottom'; top = rect.bottom + TIP_GAP; }
+        node.setAttribute('data-side', side);
+        node.style.left = Math.round(cx) + 'px';
+        node.style.top = Math.round(top) + 'px';
+      }
+      // Hover/focus hint for one banner button; aria-describedby points at it.
+      function attachTip(button, text) {
+        button.setAttribute('aria-describedby', TIP_ID);
+        button.addEventListener('mouseenter', function () { showTip(button, text); });
+        button.addEventListener('mouseleave', hideTip);
+        button.addEventListener('focus', function () { showTip(button, text); });
+        button.addEventListener('blur', hideTip);
+        // A click that opens something (the resolution menu, the picker) means the
+        // hint has done its job; leaving it up would cover what it opened.
+        button.addEventListener('click', hideTip);
       }
 
       // Map-viewport gestures. The iframe itself is pointer-events:none, so
@@ -2938,8 +3023,10 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       var headObserver = new MutationObserver(schedule);
       headObserver.observe(document.head, { childList: true, subtree: true });
       var timer = window.setInterval(schedule, 1500);
-      var onResize = function () { schedule(); };
+      // The hint is fixed-positioned; once the page moves under it, it is lying.
+      var onResize = function () { hideTip(); schedule(); };
       window.addEventListener('resize', onResize);
+      window.addEventListener('scroll', hideTip, true);
       var onDown = function (event) { if (menu && !menu.contains(event.target)) closeMenu(); };
       var onKey = function (event) { if (event.key === 'Escape') closeMenu(); };
       document.addEventListener('pointerdown', onDown, true);
@@ -3048,6 +3135,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         headObserver.disconnect();
         window.clearInterval(timer);
         window.removeEventListener('resize', onResize);
+        window.removeEventListener('scroll', hideTip, true);
+        if (tipNode && tipNode.parentNode) tipNode.parentNode.removeChild(tipNode);
+        tipNode = null;
         document.removeEventListener('pointerdown', onDown, true);
         document.removeEventListener('keydown', onKey, true);
         closeMenu();

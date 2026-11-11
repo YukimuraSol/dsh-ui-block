@@ -996,8 +996,8 @@ await ta('the @keyframes line carries one-shot vs infinite and the dangling name
 // 用户定稿（同日晚）：按钮就是「重新渲染」，像真刷新一样——不向块里发消息、不留
 // dsh:replay 契约（重载会把旧文档整个换掉，换之前的消息没有接收方）。
 // 这一节钉住不能漂的东西：按钮在 buildControls 里且夹在分辨率与选区之间、纯图标
-// （没有可见文字，悬停解释文案走浏览器原生 title）、重载走 srcdoc 重写或 src 重设、
-// 不发消息、sandbox 没被放宽。
+// （没有可见文字，悬停解释文案走这一行自己的气泡，见第 20 节末尾那条）、重载走
+// srcdoc 重写或 src 重设、不发消息、sandbox 没被放宽。
 // ---------------------------------------------------------------------------
 console.log('--- 20. the replay button reloads the block like F5, and sends nothing ---')
 const fnAt = (name) => source.indexOf('function ' + name + '(')
@@ -1056,18 +1056,42 @@ t('the sandbox is not widened, and a demo block gets no replay button', () => {
   assert.match(source, /frame\.setAttribute\('sandbox', 'allow-same-origin'\)/)
   assert.match(source, /iframe\.setAttribute\('sandbox', 'allow-same-origin'\)/)
 })
-t('icon only: no visible word; the hover hint is the browser native title', () => {
+t('icon only: no visible word; every hint comes from the row own bubble', () => {
   assert.match(controlsBody, /aria-label', '重放动画'/, 'the accessible name is gone')
-  // 「重放」不许出现在按钮上：没有 textContent。悬停解释文案改走浏览器原生 title
-  // （用户定稿 2026-11-11 晚）：块头四颗同一套机制，延迟与样式由平台决定。
+  // 「重放」不许出现在按钮上：没有 textContent。
   assert.doesNotMatch(controlsBody, /replayButton\.textContent/, 'visible text on the replay button')
-  assert.match(controlsBody, /replayButton\.title = '重放动画（重新加载画布内容，等同刷新）'/,
-    'the replay hover hint must be the native title, naming the action and what it does')
-  // 选取元素同样挂原生 title；插件不再自造浮层（旧的自定义 tip 已整个删掉）。
-  assert.match(controlsBody, /pickButton\.title = '在画布内选取元素（点元素插入到输入框 · 滚轮切层 · 方向键导航 · 再点退出）'/,
-    'the pick hover hint must be the native title')
-  assert.doesNotMatch(source, /dshpb-pick-tip/, 'the home-made tooltip is back')
-  assert.doesNotMatch(source, /setAttribute\('role', 'tooltip'\)/, 'a hand-rolled role=tooltip node is back')
+  // 用户真机反馈（2026-11-11 晚，第二轮）：「尺寸的悬停直接没了」——挂了原生 title
+  // 的那一颗在他机器上什么都不出。上一轮「四颗都用 title 就一致」只是 headless
+  // 推断（原生提示不进渲染树，headless 分不清「有提示」和「没有提示」），真机是
+  // 反的。所以三颗一起改成与「复制路径」同款的自绘气泡，title 一个都不许留。
+  assert.doesNotMatch(controlsBody, /\.title = /, 'a native title is back on the banner row')
+  assert.match(controlsBody, /attachTip\(resButton, '画布分辨率（点开可改，含自定义 W×H）'\)/)
+  assert.match(controlsBody, /attachTip\(replayButton, '重新加载画布内容（等同刷新）'\)/)
+  assert.match(controlsBody, /attachTip\(pickButton, '在画布内选取元素 · 点元素插入输入框 · 滚轮切层 · 再点退出'\)/)
+  // 气泡本体钉的是外壳 span._bubble 的实测值（out/probe/tooltip-bubble/report-shell.json）：
+  // bg rgb(67,69,74)、白字、13px/20px、radius 8、padding 3px 7px、z 1100、无阴影、固定定位。
+  assert.match(source, /\.dshpb-tip\{position:fixed;z-index:1100;display:none;align-items:center;gap:8px;/)
+  assert.match(source, /padding:3px 7px;border-radius:var\(--dsw-radius-sm,8px\)/)
+  assert.match(source, /background:var\(--dsw-alias-tooltip-bg,#43454a\);color:var\(--dsw-static-neutral-bluish-00,#fff\)/)
+  assert.match(source, /font-size:13px;line-height:20px;white-space:pre-line;overflow-wrap:break-word;/)
+  assert.match(source, /box-shadow:none;pointer-events:none;transform:translate\(-50%,-100%\);/)
+  // 外壳那颗的入场是 150ms 淡入（_tooltip-in_12mhf_1 + var(--ds-ease-in-out)）。
+  // 2026-11-11 第三轮实测：自绘气泡原来「啪」地出现，外壳那颗是淡入——这正是用户说的
+  // 「出现时机和样式不一致」。同一条 @keyframes、同一个时长、同一条曲线，外加 reduced-motion 兜底。
+  assert.match(source, /animation:dshpb-tip-in \.15s var\(--ds-ease-in-out,cubic-bezier\(\.4,0,\.2,1\)\)\}/)
+  assert.match(source, /@keyframes dshpb-tip-in\{0%\{opacity:0\}\}/)
+  assert.match(source, /@media\(prefers-reduced-motion:reduce\)\{\.dshpb-tip\{animation:none\}\}/)
+  assert.match(source, /setAttribute\('role', 'tooltip'\)/, 'the bubble must be a role=tooltip node')
+  // 不许被右边界裁掉：居中之后必须夹进视口；上方放不下就翻到下方。
+  assert.match(source, /if \(cx \+ half > window\.innerWidth\) cx = window\.innerWidth - half;/)
+  assert.match(source, /if \(top - h < TIP_MARGIN\) \{ side = 'bottom'; top = rect\.bottom \+ TIP_GAP; \}/)
+  // 出现/消失/关联：hover 与 focus 都出，mouseleave 与 blur 都收，aria 指向同一个节点。
+  assert.match(source, /button\.setAttribute\('aria-describedby', TIP_ID\)/)
+  assert.match(source, /button\.addEventListener\('mouseenter', function \(\) \{ showTip\(button, text\); \}\)/)
+  assert.match(source, /button\.addEventListener\('mouseleave', hideTip\)/)
+  assert.match(source, /button\.addEventListener\('focus', function \(\) \{ showTip\(button, text\); \}\)/)
+  assert.match(source, /button\.addEventListener\('blur', hideTip\)/)
+  assert.doesNotMatch(source, /dshpb-pick-tip/, 'the old 3s home-made tooltip is back')
   assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
   // 用户定稿（2026-11-11 晚，真机看过后）：块头那四个控件同高、无边框、透明底，
   // 照最右边「复制路径」那个 24×24 的样子做。分辨率 / 重放 / 选取元素共用同一条

@@ -215,6 +215,16 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 
 **不向块里发消息**：块是**无 JS** 的——iframe `sandbox="allow-same-origin"`（**没有 `allow-scripts`**），块内 CSP 是 `default-src 'none'`，块里的 `<script>` 一律不执行；而重载又会把旧文档整个换掉。消息没有接收方，所以没有 `dsh:replay` 这个契约（用户定稿 2026-11-11）。实测：块里留的 `data-inline-script` 标记始终为空，父页面挂的监听能收到消息，块自己的监听器永远收不到。
 
+## 横栏四颗的悬停提示（2026-11-11 第三轮）
+
+四颗（分辨率 / 重放 / 选取元素 / 复制路径）悬停时是**同一套外观、同一个时机**：深灰底 `rgb(67,69,74)`、白字 13px/20px、圆角 8、内边距 `3px 7px`、`z-index:1100`、无阴影；出现时都是 **150ms 淡入**（`cubic-bezier(.4,0,.2,1)`）。
+
+**外壳那颗（复制路径）的气泡不是属性驱动的**——实测，不是推断（`out/probe/tooltip-unify2/report-mechanism.json`）：它是前端里的 React `Tooltip` 组件，克隆子元素、往子元素上挂 `onMouseEnter`/`onMouseLeave`，再渲染 `span._bubble_12mhf_1`（`role="tooltip"`，`delayMs` 默认 0，150ms 淡入）。所以：
+
+- 给插件自己创建的元素加 `aria-label` **唤不出**这颗气泡。干净克隆（无任何监听器）分别带 `title`、`aria-label`、两者都有、以及复制按钮的**逐字属性**，悬停一个节点都不出。
+- `title` 只是浏览器自己的 OS 提示，**不进渲染树**——headless 分不清「有提示」和「没有提示」，这正是上一轮「四颗都用 title 就一致」在真机上翻车的原因：尺寸那颗什么都不出。
+- 因此另外三颗用**自绘气泡**（`span.dshpb-tip`）复刻外壳那颗的样式与 150ms 淡入；`title` 一个都不留，`aria-label` 只负责可访问名，`aria-describedby` 指向气泡。
+
 **无 JS ≠ 无动画**：`animation` / `transition` 由渲染引擎驱动，不需要脚本；重播后块里的动画全部重新 `running`，播完仍停在终态。
 
 **边界**：刷新能重播 CSS 动画、重置滚动与表单，但「靠 JS 在加载后加 class 才触发」的入场动画不会因为刷新再播一次——那个 class 已经写进快照了。这是抓取的边界，不是按钮的缺陷；因为块内脚本不执行，这类入场**只能由抓取侧改写成 CSS 动画（或把初始态写进标记）来还原**。
