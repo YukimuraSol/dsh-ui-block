@@ -164,6 +164,64 @@ t('a well-formed but extreme size is clamped like the canvas control', () => {
   assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo res=99999x99999::').res, { w: api.MAX_RES, h: api.MAX_RES })
 })
 
+// ---------------------------------------------------------------------------
+// 8b. res= AFTER the closing :: (2026-11-11 real accident). A reply carried
+// `::dsh-ui yukimura-panel:: res=1337x951` — the block existed, the name was
+// right, the line was on its own line, and it still showed as plain text,
+// because the size sat outside the closing colons. The size is now accepted on
+// either side, while a line that merely MENTIONS the syntax stays text.
+// ---------------------------------------------------------------------------
+console.log('--- 8b. the size may sit on either side of the closing :: ---')
+t('the canonical form: res before the closing ::', () => {
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo res=820x510::'), { name: 'foo', res: { w: 820, h: 510 } })
+})
+t('the reported form: res after the closing ::', () => {
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo:: res=820x510'), { name: 'foo', res: { w: 820, h: 510 } })
+})
+t('accepting it does not make a size mandatory: both bare forms still parse', () => {
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo::'), { name: 'foo', res: null })
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo::   '), { name: 'foo', res: null })
+})
+t('surrounding whitespace is trimmed on the trailing form too', () => {
+  assert.deepEqual(api.parseDirectiveLine('   ::dsh-ui foo:: res=820x510   '), { name: 'foo', res: { w: 820, h: 510 } })
+  assert.deepEqual(api.parseDirectiveLine('\t::dsh-ui\tfoo::\tres=820x510\t'), { name: 'foo', res: { w: 820, h: 510 } })
+})
+t('the trailing size is clamped exactly like the leading one', () => {
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo:: res=10x10').res, { w: api.MIN_RES, h: api.MIN_RES })
+  assert.deepEqual(api.parseDirectiveLine('::dsh-ui foo:: res=99999x99999').res, { w: api.MAX_RES, h: api.MAX_RES })
+  assert.deepEqual(api.directiveRes(api.parseDirectiveLine('::dsh-ui foo:: res=1337x951')), { w: 1337, h: 951 })
+})
+t('an ill-formed trailing size rejects the whole line, like the leading one', () => {
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=axb'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=0x0'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=820'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=820x'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res='), null)
+})
+t('the trailing size needs its space: glued to the colons is a typo, not a reference', () => {
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo::res=820x510'), null)
+})
+t('a size may not be declared twice — the line is contradictory, so it stays text', () => {
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo res=820x510:: res=900x700'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo res=820x510:: res=820x510'), null)
+})
+t('two closing colons make three colons, not a reference', () => {
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=820x510::'), null)
+})
+t('a line that only MENTIONS the syntax is still plain text', () => {
+  assert.equal(api.parseDirectiveLine('看这里 ::dsh-ui foo:: res=820x510'), null)
+  assert.equal(api.parseDirectiveLine('::dsh-ui foo:: res=820x510 后面还有字'), null)
+  assert.equal(api.parseDirectiveLine('write ::dsh-ui foo:: res=820x510 to show it'), null)
+})
+t('backticks and fences still defeat it, trailing size or not', () => {
+  assert.equal(api.parseDirectiveLine('`::dsh-ui foo:: res=820x510`'), null)
+  assert.equal(api.parseDirectiveLine('```::dsh-ui foo:: res=820x510```'), null)
+})
+t('the accepted spelling is spelled out in the tool text, size before the closing colons', () => {
+  assert.match(hostSource, /res=WxH goes BEFORE the closing ::/)
+  assert.match(hostSource, /is not a reference and shows as plain text/)
+})
+
 console.log('--- 8. the block path the directive names ---')
 t('directivePath maps a name to ui-blocks/<name>.uiblock', () => {
   assert.equal(api.directivePath('foo'), 'ui-blocks/foo.uiblock')
@@ -883,6 +941,52 @@ await ta('the text gives placeholders their own line and one sentence saying not
 })
 await ta('the @keyframes line names both files and the animation counts', () => {
   assert.match(phTextOut, /@keyframes: 11 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 41 declarations, 1 with infinite/)
+})
+// ---------------------------------------------------------------------------
+// 19c. 抓取前被摘掉的节点：清单进文本一行，并给「可以模拟、但必须在差异里说明是推断」的指引。
+// 真实事故：panel.solyukimura.top 的加载覆盖层 .lwrap/.lbox 抓取时节点已不存在，report 只报
+// 了个数（而且那个数还是抽取时摘掉的 script/style），模型没有依据判断要不要把它塞回去，
+// 于是交付出来的块是静态的。动画的账同理：漏看 infinite 就把 loop 写成一次性。
+// ---------------------------------------------------------------------------
+console.log('--- 19c. nodes removed before the capture are named, and the animation counts say loop or once ---')
+const rmReport = {
+  dropped: [],
+  keyframesByFile: { 'shared/app.css': 2, 'pages/current/page.css': 0 },
+  animationCount: 3,
+  infiniteCount: 1,
+  oneShotAnimations: 2,
+  infiniteAnimations: 1,
+  danglingAnimationNames: 1,
+  danglingAnimationNameSample: ['missingFrames'],
+  removedNodes: [
+    { tag: 'div', id: 'loader', cls: 'lwrap in', bytes: 268, outerHTMLHead: '<div class="lwrap in" id="loader">' },
+    { tag: 'div', id: '', cls: 'lbox', bytes: 240, outerHTMLHead: '<div class="lbox">loading</div>' },
+    { tag: 'section', id: '', cls: 'skeleton rows', bytes: 900, outerHTMLHead: '<section class="skeleton rows">' }
+  ],
+  removedNodesTruncated: 17
+}
+const rmTextOut = reporting.captureText({
+  dir: 'D:/cap', summary: 'x', files: [], report: rmReport,
+  index: { dir: 'D:/cap', count: 0, totalBytes: 0, groups: { html: [], css: [], images: [], fonts: [], other: [] }, dropped: { count: 0, items: [] }, movedToAssets: { count: 0, sample: [] }, placeholders: [], sheetsFailed: 0, dangling: [], suggestedName: 'cap' }
+})
+await ta('the removed nodes are one line: how many, the first three as tag.cls, and where the rest live', () => {
+  assert.match(rmTextOut, /^20 node\(s\) were removed from the DOM before this capture: div#loader\.lwrap\.in, div\.lbox, section\.skeleton\.rows … \(first 3 of 20\) — report\.removedNodes lists the newest 3, report\.removedNodesTruncated counts the 17 older one\(s\) not listed\. Each entry has tag \/ id \/ cls \/ bytes \/ the first 300 chars of its outerHTML\.$/m)
+})
+await ta('the line says what may be done, and that doing it is an inference', () => {
+  assert.match(rmTextOut, /you may put it back inside the block and drive it with a CSS animation/)
+  assert.match(rmTextOut, /say in your diff that this is inferred: the capture never saw that state/)
+})
+await ta('no removed nodes → no line, and no claim about animations the report does not carry', () => {
+  const quiet = reporting.captureText({
+    dir: 'D:/cap', summary: 'x', files: [], report: { dropped: [] },
+    index: { dir: 'D:/cap', count: 0, totalBytes: 0, groups: { html: [], css: [], images: [], fonts: [], other: [] }, dropped: { count: 0, items: [] }, movedToAssets: { count: 0, sample: [] }, placeholders: [], sheetsFailed: 0, dangling: [], suggestedName: 'cap' }
+  })
+  assert.doesNotMatch(quiet, /were removed from the DOM before this capture/)
+  assert.doesNotMatch(quiet, /play once \(finite iterations\)/)
+})
+await ta('the @keyframes line carries one-shot vs infinite and the dangling names', () => {
+  assert.match(rmTextOut, /animations: 3 declarations, 1 with infinite — 2 play once \(finite iterations\), 1 loop forever \(infinite\); 1 animation-name reference\(s\) point at @keyframes that are NOT in this capture \(missingFrames\), so those declarations never run/)
+  assert.match(rmTextOut, /A looping animation stays infinite in your copy/)
 })
 rmSync(home, { recursive: true, force: true })
 

@@ -1685,7 +1685,9 @@ const CREATE_DESCRIPTION = [
   '',
   'DEMO: add a demo.json member — { snapshots: { home: "pages/home.html" }, timeline: { steps: [{ at: 0, do: "switch", snapshot: "home" }, { at: 900, do: "type", to: "#email", text: "a@b.c" }] } } — and with a non-empty timeline.steps the plugin plays the block itself and loops it: switch / move / highlight / click / type all run from outside, and a page change is a snapshot change. Without that member, or with an empty timeline, the block is a still page. A demo may be orchestrated and fictional; the screens it switches between are ones you wrote.',
   '',
-  'DELIVERY: nothing is visible until a reply carries the block\'s own line `::dsh-ui <name>::` — optionally res=WxH, the only way to set canvas size (default 1440x900). Size the height to the content: a dialog, card or toolbar wants roughly 280-420, a full page 600+; a card left at 900 reads as a broken preview. The line must be exactly that, alone on its line, no backticks or fence. A reference renders the version the block had when that message was first seen — updating a block only changes messages that reference it afterwards.',
+  'REPLAY: the card\'s banner carries one more button — a broken circle with a play mark. Clicking it sends { type: "dsh:replay" } into the block and then loads the entry again, so every CSS animation and transition in the block starts over. Nothing about the block itself changes: a one-shot animation stays one-shot and still comes to rest on its final frame, because that is what the site does — the button only runs it again. If an entrance animation in your block is driven by a class switch, the block\'s own script may listen for that message, put the initial class back and take it off again. A block is script-inert by default (see NO SCRIPTING), so do not depend on that: write the resting state into the markup and a plain reload replays it.',
+  '',
+  'DELIVERY: nothing is visible until a reply carries the block\'s own line, PASTED as one of these two — nothing else on the line, no backticks, no fence:\n\n    ::dsh-ui <name>::\n    ::dsh-ui <name> res=WxH::\n\nres=WxH goes BEFORE the closing `::` and is the only way to set the canvas size (default 1440x900). The closing `::` ENDS the line: `::dsh-ui <name>:: res=WxH` — the size after the closing colons — is not a reference and shows up in the chat as plain text. Size the height to the content: a dialog, card or toolbar wants roughly 280-420, a full page 600+; a card left at 900 reads as a broken preview. The line must be exactly that, alone on its line, no backticks or fence. A reference renders the version the block had when that message was first seen — updating a block only changes messages that reference it afterwards.',
   '',
   'INSIDE THE BLOCK: only the rendered UI — no headings, notes, captions or "方案 A" commentary; every character renders into the canvas.',
   '',
@@ -1708,7 +1710,7 @@ const READ_DESCRIPTION = [
 
   'When a size is not readable from the image — cards that should end up equal height — pass `probe` and compare the numbers it returns.',
   '',
-  'THIS IMAGE GOES TO THE MODEL, NOT TO THE USER. The user only sees what a message references with `::dsh-ui <name>::` on a line of its own. Rendering here without that line leaves the draft invisible to them — pass the check, then reference it in the same message.'
+  'THIS IMAGE GOES TO THE MODEL, NOT TO THE USER. The user only sees what a message references on a line of its own: `::dsh-ui <name>::`, or with the size you just rendered `::dsh-ui <name> res=WxH::` — res BEFORE the closing colons. Rendering here without that line leaves the draft invisible to them — pass the check, then reference it in the same message.'
 ].join('\n')
 
 const LIST_DESCRIPTION = [
@@ -2732,6 +2734,9 @@ function captureText(value) {
   // REFERENCE VIEWPORT: the capture-time viewport to compare a render against — NOT a target size.
   const shot = value.report !== null && typeof value.report === 'object' ? value.report.screenshot : null
   if (shot !== null && typeof shot === 'object') lines.push('', shot.mode === 'viewport' && shot.path ? 'REFERENCE VIEWPORT ' + String(shot.width) + 'x' + String(shot.height) + ' dpr=' + String(shot.dpr) + ' page-height=' + String(shot.scrollHeight) + ' saved to ' + String(shot.path) + '\nThat viewport is the capture viewport, NOT a target size. Render the block at whatever width you actually need, and compare against this image only at the same width. Geometry inside the block was frozen at the capture width, so do not rescale or copy those pixel values to another width.' : 'REFERENCE VIEWPORT unavailable: ' + String(shot.error || 'no screenshot'))
+  // Nodes the page removed BEFORE the capture ran (a loading overlay is the measured case):
+  // right next to the viewport line, because both describe the state the capture froze.
+  for (const line of removedNodesText(value.report)) lines.push(line)
   lines.push('Capture landed in ' + value.dir + ' — ' + value.summary, '')
   const index = value.index
   if (index !== undefined && index !== null) {
@@ -2747,8 +2752,23 @@ function captureText(value) {
     if (anim !== null && typeof anim === 'object') {
       const parts = ANIMATION_FILE_ORDER.filter((file) => anim[file] !== undefined)
         .map((file) => String(anim[file]) + ' in ' + file)
+      // Iteration counts decide whether motion is visible at all: the same @keyframes with the
+      // default single iteration plays once and looks static (measured: 7 s, 238-420 ms of motion).
+      const oneShot = value.report.oneShotAnimations
+      const looped = value.report.infiniteAnimations === undefined ? value.report.infiniteCount : value.report.infiniteAnimations
+      // Undefined = a report that predates this field: say nothing rather than claim all-clear.
+      const danglingCount = Number(value.report.danglingAnimationNames)
+      const dangling = Number.isFinite(danglingCount) ? danglingCount : undefined
+      const danglingSample = Array.isArray(value.report.danglingAnimationNameSample) ? value.report.danglingAnimationNameSample : []
       lines.push('  @keyframes: ' + parts.join(', ') + '; animations: ' + String(value.report.animationCount)
-        + ' declarations, ' + String(value.report.infiniteCount) + ' with infinite')
+        + ' declarations, ' + String(value.report.infiniteCount) + ' with infinite'
+        + (oneShot === undefined ? '' : ' — ' + String(oneShot) + ' play once (finite iterations), ' + String(looped) + ' loop forever (infinite)')
+        + (dangling === undefined ? '' : dangling === 0 ? '; every animation-name resolves to a captured @keyframes'
+          : '; ' + String(dangling) + ' animation-name reference(s) point at @keyframes that are NOT in this capture'
+            + (danglingSample.length === 0 ? '' : ' (' + danglingSample.join(', ') + ')') + ', so those declarations never run'))
+      if (oneShot !== undefined && looped > 0) {
+        lines.push('  A looping animation stays infinite in your copy — replay it once and it looks static. One-shot animations stay one-shot.')
+      }
     }
     // Template placeholders are NOT lost resources: they are names that never got a value,
     // and the browser cannot fetch them either. Listing them under "really LOST" is what
@@ -2809,6 +2829,38 @@ function captureText(value) {
   // they were in a file. They are not — this text is their only home.
   lines.push('', 'THESE LINES ARE NOT ON DISK: the @keyframes / UNRESOLVED TEMPLATE / report.dropped lines above exist only in this text. The material directory has none of them, so grepping it for them returns nothing and costs a call.')
   return lines.join('\n')
+}
+
+/**
+ * One removed node as "<tag#id.cls>" — the shortest thing that lets a model recognise it.
+ * The attribute values themselves are in report.removedNodes; only the first two classes are spelled here.
+ */
+function removedNodeLabel(item) {
+  const tag = String(item.tag === '' ? '?' : item.tag)
+  const id = item.id === undefined || item.id === '' ? '' : '#' + String(item.id)
+  const classes = String(item.cls === undefined ? '' : item.cls).trim().split(/\s+/).filter((part) => part !== '').slice(0, 2)
+  return tag + id + (classes.length === 0 ? '' : '.' + classes.join('.'))
+}
+
+/**
+ * The traceability line for nodes the page itself removed before the capture ran.
+ * Why it exists: a loading overlay that is gone at capture time leaves a static-looking block,
+ * and a bare count ("removedNodes: 2") gave the model nothing to decide with. This line names
+ * them, and says what may be done about it — including that doing it is an inference.
+ */
+function removedNodesText(report) {
+  const items = report !== null && typeof report === 'object' && Array.isArray(report.removedNodes) ? report.removedNodes : []
+  if (items.length === 0) return []
+  const extra = Number(report.removedNodesTruncated) || 0
+  const total = items.length + extra
+  const shown = items.slice(0, 3).map(removedNodeLabel)
+  return [
+    String(total) + ' node(s) were removed from the DOM before this capture: ' + shown.join(', ')
+      + (total > 3 ? ' … (first 3 of ' + String(total) + ')' : '')
+      + (extra > 0 ? ' — report.removedNodes lists the newest ' + String(items.length) + ', report.removedNodesTruncated counts the ' + String(extra) + ' older one(s) not listed' : '')
+      + '. Each entry has tag / id / cls / bytes / the first 300 chars of its outerHTML.',
+    'If one of them was a loading or skeleton layer, you may put it back inside the block and drive it with a CSS animation — but say in your diff that this is inferred: the capture never saw that state, and the block is not the site.'
+  ]
 }
 
 /** The last path segment, used only to suggest a block name. */
@@ -2911,7 +2963,11 @@ export function apply(ctx, config) {
         ? '\nReferenced via srcset only (' + String(value.srcsetReferenced.length) + ') — these are LOADS, not leftovers:\n  - ' + value.srcsetReferenced.join('\n  - ')
         : '')
       + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
-      + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
+      + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own, pasted as written:\n'
+      + '  ::dsh-ui ' + value.name + '::\n'
+      + 'For a canvas size, res=WxH goes BEFORE the closing :: (the closing :: ends the line):\n'
+      + '  ::dsh-ui ' + value.name + ' res=WxH::\n'
+      + 'Do not append the size after the closing colons — ::dsh-ui ' + value.name + ':: res=WxH is not a reference and shows as plain text.'
       + '\nNEXT: read_ui_block({ name: "' + value.name + '" })'
       + (value.backup === undefined ? '' : '\nOVERWROTE THE PREVIOUS VERSION (overwrite: true). The old one is kept byte for byte at: ' + value.backup)
   }

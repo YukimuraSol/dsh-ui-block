@@ -104,16 +104,23 @@ window.__ModuleLoader__.load({
     // lifted verbatim into a sandbox by self-check-uiblock-directive.mjs, so it
     // must not touch the DOM or any install()-scoped state.
     /**
-     * The ONE trigger (2026-10-24): a whole line, on its own, naming a file in
-     * the ui-blocks directory. Both spellings below are the SAME directive:
+     * The ONE trigger (2026-10-24, res-after-the-colon accepted 2026-11-11): a
+     * whole line, on its own, naming a file in the ui-blocks directory. All three
+     * spellings below are the SAME directive; the first two are the ones to write:
      *
      *   ::dsh-ui login-modal::
      *   ::dsh-ui login-modal res=820x510::
+     *   ::dsh-ui login-modal:: res=820x510      (res after the closing ::, accepted)
+     *
+     * The third is tolerance, not a style: a model that means to size the canvas
+     * sometimes appends res=WxH to the finished line instead of putting it inside,
+     * and refusing that showed the line as plain text with no hint why.
      *
      * Nothing else may sit on the line (leading/trailing whitespace aside), and a
-     * backtick or a fence is not in the pattern, so such a line stays plain text.
+     * backtick or a fence is not in the pattern, so a line that merely MENTIONS the
+     * syntax — in prose, in a code block — stays plain text.
      */
-    var DIRECTIVE_RE = /^[ \t]*::dsh-ui[ \t]+([A-Za-z0-9._-]+)(?:[ \t]+res=(\d{2,5})x(\d{2,5}))?[ \t]*::[ \t]*$/;
+    var DIRECTIVE_RE = /^[ \t]*::dsh-ui[ \t]+([A-Za-z0-9._-]+)(?:[ \t]+res=(\d{2,5})x(\d{2,5}))?[ \t]*::(?:[ \t]+res=(\d{2,5})x(\d{2,5}))?[ \t]*$/;
     /** Longest a reference line can be; the sweep rejects anything longer first. */
     var DIRECTIVE_MAX = 110;
     /**
@@ -130,9 +137,15 @@ window.__ModuleLoader__.load({
       if (!match) return null;
       var name = match[1];
       if (name.length > 64 || name.indexOf('..') >= 0) return null;
+      // A size may sit before the closing :: (groups 2/3) or after it (groups 4/5).
+      // Two different sizes on one line contradict each other: keep the whole line
+      // as text rather than silently pick one.
+      if (match[2] !== undefined && match[4] !== undefined) return null;
+      var w = match[2] === undefined ? match[4] : match[2];
+      var h = match[3] === undefined ? match[5] : match[3];
       return {
         name: name,
-        res: match[2] === undefined ? null : clampRes(parseInt(match[2], 10), parseInt(match[3], 10))
+        res: w === undefined ? null : clampRes(parseInt(w, 10), parseInt(h, 10))
       };
     }
     /** The block file a reference names, relative to the app root. */
@@ -1138,10 +1151,13 @@ window.__ModuleLoader__.load({
       // ICON STROKE in #22d3ee and nothing else — no fill. #22d3ee is written as a
       // literal on purpose: --dsw-alias-brand-primary resolves to a neutral-bluish
       // token that reads near-white on the dark theme.
-      '.dshpb-pick{padding:1px 5px;line-height:0;border-color:var(--dsw-alias-border-l2)}',
-      '.dshpb-pick svg{display:block;width:13px;height:13px;overflow:visible}',
-      '.dshpb-pick path{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.3;',
+      '.dshpb-pick,.dshpb-replay{padding:1px 5px;line-height:0;border-color:var(--dsw-alias-border-l2)}',
+      '.dshpb-pick svg,.dshpb-replay svg{display:block;width:13px;height:13px;overflow:visible}',
+      '.dshpb-pick path,.dshpb-replay path{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.3;',
       'stroke-linecap:round;stroke-linejoin:round}',
+      // The replay glyph is a broken circle with an arrowhead and a play triangle
+      // in the middle: "play this again", not "reload the page".
+      '.dshpb-replay path.dshpb-tri{fill:var(--dsw-alias-label-secondary);stroke:none}',
       '.dshpb-pick-on{border-color:#22d3ee;background:transparent}',
       '.dshpb-pick-on path{stroke:#22d3ee;stroke-width:1.5}',
       '.dshpb-pickbox{position:fixed;z-index:2147483000;pointer-events:none;display:none;',
@@ -2031,6 +2047,51 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // own markup instead of leaving an empty canvas.
         state.frame.style.visibility = '';
       }
+      /**
+       * Replay one block: load its entry again, so every CSS animation and
+       * transition in it starts over.
+       *
+       * NOT a loop. A block copies the site as it is, and the site plays its
+       * entrance once and stops on the final frame — turning that into an
+       * infinite animation would change the thing being reproduced. So the
+       * document keeps its one-shot timing, and only this button makes it run a
+       * second time.
+       *
+       * Before the reload the block gets `{ type: 'dsh:replay' }`: a listener
+       * INSIDE the block can reset state that outlives the document (a form, a
+       * storage entry, a class switch). No listener means no listener — the
+       * message is ignored and the reload happens anyway. A block is
+       * script-inert by default (sandbox allow-same-origin only, CSP
+       * script-src 'none'), so treat this as the hook for the day a block CAN
+       * carry a script, never as a thing the reload depends on.
+       */
+      function replayBlock(state) {
+        if (!state || !state.frame || !state.frame.isConnected) return null;
+        // A demo block already has 播放 / 暂停 / 重新开始 and is owned by the
+        // player; replaying its frame underneath would fight the timeline.
+        if (state.demoSpec) return null;
+        var posted = false;
+        try {
+          var win = state.frame.contentWindow;
+          if (win) { win.postMessage({ type: 'dsh:replay' }, '*'); posted = true; }
+        } catch (e) { posted = false; /* a frame that never loaded has no window */ }
+        if (state.urlMode) {
+          // Assigning the same src again is not a guaranteed navigation: the
+          // counter makes it a different URL, and nothing else reads it.
+          state.replays = (state.replays || 0) + 1;
+          var url = entryUrl(state);
+          state.frame.setAttribute('src', url + (url.indexOf('?') < 0 ? '?' : '&') + 'replay=' + state.replays);
+          return { posted: posted, mode: 'url', replays: state.replays };
+        }
+        // srcdoc: remove then write it back, so this really is a re-parse
+        // (re-setting an identical value is not relied upon). Both happen in
+        // one task, so nothing repaints in between; buildSrcdoc reads the live
+        // token sheet, exactly like the first paint did.
+        var html = buildSrcdoc(state, tokenCache);
+        state.frame.removeAttribute('srcdoc');
+        state.frame.setAttribute('srcdoc', html);
+        return { posted: posted, mode: 'srcdoc' };
+      }
       function relayout(state) {
         applySize(state);
         paint(state);
@@ -2128,11 +2189,32 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           cancelPickTip();
           armPick(state);
         });
+        // Replay. One-shot animations copy the site honestly and then sit on
+        // their final frame, which reads as "static" to anyone who looks a
+        // second later. This button reloads the entry instead of changing that
+        // timing: the loop stays a one-shot, the user decides when it runs.
+        // Not on a demo block — the transport already has 重新开始.
+        var replayButton = null;
+        if (!state.demoSpec) {
+          replayButton = document.createElement('button');
+          replayButton.type = 'button';
+          replayButton.className = 'dshpb-btn dshpb-replay';
+          replayButton.title = '重播：重新加载画布，让动画与过渡从头再播一遍（不改成循环）';
+          replayButton.setAttribute('aria-label', '重播块内动画');
+          replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
+          replayButton.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            replayBlock(state);
+          });
+        }
         var note = document.createElement('span');
         note.className = 'dshpb-note';
         note.textContent = '未声明，使用默认';
         controls.appendChild(resButton);
         controls.appendChild(pickButton);
+        // Right of the picker, so the two controls that existed keep their x.
+        if (replayButton !== null) controls.appendChild(replayButton);
         // Demo transport goes leftmost: it is the only part of a demo block a
         // pointer can reach, because the frame never takes the pointer.
         buildTransport(state, controls);
@@ -2142,6 +2224,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         state.controls = controls;
         state.resButton = resButton;
         state.pickButton = pickButton;
+        state.replayButton = replayButton;
         state.note = note;
         // A rebuilt banner must not silently un-light an armed picker.
         if (state.pick) {
@@ -2534,6 +2617,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         state.controls = null;
         state.resButton = null;
         state.pickButton = null;
+        state.replayButton = null;
         state.note = null;
         state.paintedKey = null;
         state.appliedTokensKey = null;
@@ -2914,6 +2998,12 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
             };
           }
         },
+        /**
+         * Test seam: the banner's replay button, as a function. Sends one
+         * dsh:replay message into the block and loads its entry again; returns
+         * { posted, mode } or null for a demo block / a block that is gone.
+         */
+        replay: function (index) { var s = live[index || 0]; if (!s) return null; return replayBlock(s); },
         /**
          * Test seam: one demo block's clock and transport (null for a plain
          * block). Read-only except play/pause/restart, which are the same
