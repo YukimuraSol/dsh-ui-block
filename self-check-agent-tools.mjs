@@ -28,7 +28,11 @@ import { fileURLToPath } from 'node:url'
 const tempHome = await mkdtemp(join(tmpdir(), 'dsh-agent-tools-home-'))
 process.env.DSH_HOME = tempHome
 
-const { apply, extensionHub, instanceRegistry } = await import('./index.js')
+const { apply, extensionHub, instanceRegistry, reporting } = await import('./index.js')
+// The same validator the registry runs on every tool's output (dsh-tools
+// createSuccessResult): a field the schema does not declare is a ToolOutputError
+// in production while a direct execute() call stays green.
+const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 
 const checks = []
@@ -285,6 +289,35 @@ await checkAsync('the report is report.json verbatim, and the text points at fil
   assert.equal(text.includes('from=' + value.files[0].from), true, 'the rendered text spells the absolute from path')
   assert.match(text, /create_ui_block/)
   assert.match(text, /none of this material enters the conversation/)
+})
+
+await checkAsync('the account is IN the value as `text`: a run_code program sees what the render shows', async () => {
+  const pending = tool('capture_page').execute({ instance: 'probe-ext', tabId: 7, name: 'agent-tools-text' })
+  const taken = (await poll({ instance: 'probe-ext', tabs: TABS })).json()
+  await result({
+    instance: 'probe-ext',
+    taskId: taken.task.id,
+    ok: true,
+    files: [{ path: 'entry.html', content: '<p>x</p>' }],
+    report: {
+      origin: 'https://example.com/a',
+      title: 'A',
+      dropped: [],
+      keyframesByFile: { 'shared/app.css': 3, 'pages/current/page.css': 0 },
+      animationCount: 5,
+      infiniteCount: 1
+    }
+  })
+  const value = await pending
+  assert.equal(typeof value.text, 'string', 'the value carries the text')
+  // Byte for byte the output of the ONE function that owns this text: a second
+  // copy of the wording would drift, and this field is all a run_code program gets.
+  assert.equal(value.text, reporting.captureText(value), 'text IS captureText(value), not a copy of it')
+  assert.equal(render('capture_page', {}, value), value.text, 'the rendered content is that same string')
+  assert.match(value.text, /@keyframes: 3 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 5 declarations, 1 with infinite/)
+  assert.match(value.text, /THESE LINES ARE NOT ON DISK/, 'the text says where those lines do NOT live, so nothing greps for them')
+  assert.deepEqual(validateJsonSchemaValue(tool('capture_page').output.schema, value, 'value'), [],
+    'the value satisfies its own output contract — otherwise every real call throws')
 })
 
 await checkAsync('dangling stays in the rendered text: every unresolved reference, spelled out', async () => {

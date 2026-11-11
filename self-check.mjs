@@ -50,6 +50,10 @@ const check = (name, fn) => { fn(); checks.push(name); console.log('  ok - ' + n
 const checkAsync = async (name, fn) => { await fn(); checks.push(name); console.log('  ok - ' + name) }
 
 const { apply, rendering } = await import('./index.js')
+// The validator the registry runs on every tool output (dsh-tools
+// createSuccessResult): an undeclared field throws there, while a direct
+// execute() call stays green.
+const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
 
 /** The slice of the tools service the plugin uses. */
 const registered = []
@@ -389,6 +393,17 @@ async function runScreenshotLeg() {
     'the note carries the absolute path: ' + JSON.stringify(value.note))
   assert.equal(value.image.mediaType, 'image/png')
   assert.equal(saved.length, 1)
+  // The words travel in the VALUE too: run_code hands a program the value and the
+  // PNG as an attachment, so without this field the size / skin / measurements
+  // (and any clamp note) never reach it.
+  assert.equal(typeof value.text, 'string', 'read_ui_block returns its rendered text as a field')
+  assert.equal(byName.read_ui_block.output.render({}, value)[0].text, value.text,
+    'the rendered content is that same string — one source, no drift')
+  assert.match(value.text, /<content>PNG image, \d+x\d+ px, \d+ bytes; rendered with \d+ theme tokens, skin: (light|dark)<\/content>/)
+  assert.ok(value.text.includes('the block file is ' + join(tempHome, 'ui-blocks', 'selfcheck-card.uiblock')),
+    'the text names the block file, like the note does')
+  assert.deepEqual(validateJsonSchemaValue(byName.read_ui_block.output.schema, value, 'value'), [],
+    'the value satisfies its own output contract — otherwise every real call throws')
   return { png: saved[0].data, width: value.width, height: value.height, tokens: value.tokens, scheme: value.scheme }
 }
 

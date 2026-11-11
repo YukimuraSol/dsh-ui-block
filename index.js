@@ -1740,7 +1740,9 @@ const CAPTURE_DESCRIPTION = [
   '',
   'THE RESULT IS AN INDEX, NOT A PILE: files grouped by type with their bytes, the totals, report.dropped summarised, and "dangling" — every url()/src/link href the captured documents make to something the capture does NOT have. That list is the honest answer to "which icon is missing", so read it instead of re-capturing. fromDir names the directory to hand create_ui_block, so the whole material set becomes one block in one call: capture_page -> create_ui_block({ name, fromDir }) -> read_ui_block.',
   '',
-  'A failure is always one concrete cause: the extension never reported in, it reported but never took the task, it took the task and never answered, the target tab is gone (call list_pages again — do not substitute another tab), or the extension itself failed, in which case its own message is repeated verbatim.'
+  'A failure is always one concrete cause: the extension never reported in, it reported but never took the task, it took the task and never answered, the target tab is gone (call list_pages again — do not substitute another tab), or the extension itself failed, in which case its own message is repeated verbatim.',
+  '',
+  'IF YOU CALL THIS FROM INSIDE A SCRIPT, PRINT THE RETURNED `text` FIELD VERBATIM: a program gets the value and not the rendered result, so `text` is the only place the whole account of the capture exists — print it instead of picking fields out of the object.'
 ].join('\n')
 
 // ---------------------------------------------------------------------------
@@ -2801,6 +2803,11 @@ function captureText(value) {
   const reportText = JSON.stringify(value.report, null, 2)
   if (reportText.length <= 4000) lines.push('', 'report.json, verbatim (also on disk at ' + value.dir + '/report.json):', reportText)
   else lines.push('', 'report.json is ' + String(reportText.length) + ' bytes — too long to repeat here; it is on disk at ' + value.dir + '/report.json and its counters are in the summary above.')
+  // The last line closes the one open question this text creates: WHERE did those
+  // lines come from. Measured: an agent grepped the material directory for
+  // "@keyframes:|UNRESOLVED TEMPLATE|report.dropped:" (hits=[]) because it assumed
+  // they were in a file. They are not — this text is their only home.
+  lines.push('', 'THESE LINES ARE NOT ON DISK: the @keyframes / UNRESOLVED TEMPLATE / report.dropped lines above exist only in this text. The material directory has none of them, so grepping it for them returns nothing and costs a call.')
   return lines.join('\n')
 }
 
@@ -2874,6 +2881,41 @@ export function apply(ctx, config) {
   // instance over the fixed port.
   const registryConfig = config !== null && typeof config === 'object' && config.registry !== null && typeof config.registry === 'object' ? config.registry : {}
   const registryAllowed = registryConfig.enabled !== false
+  /**
+   * create_ui_block's rendered text. It is one function because the value carries
+   * the SAME string in its `text` field: under run_code a program receives the value
+   * and never the rendered content, and this text holds the delivery line
+   * (::dsh-ui <name>::) a block is useless without.
+   */
+  function createText(value) {
+    return 'UI block: ' + value.path + '\nAbsolute path: ' + value.absolutePath + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
+      + (value.requested === undefined ? '' : '\nRENAMED — "' + value.requested + '" is already taken, so this one was written as "' + value.name + '". Use the NEW name everywhere: read_ui_block({ name: "' + value.name + '" }) and the ::dsh-ui ' + value.name + ':: line.')
+      + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
+      + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
+      + (Array.isArray(value.hygiene) && value.hygiene.length > 0
+        ? '\nFIXED ' + String(value.hygiene.length) + ' element(s) that used a raw-text tag as a container: '
+          + value.hygiene[0].from + ' → ' + value.hygiene[0].to
+          + (value.hygiene.length > 1 ? '\n  ' + value.hygiene.slice(1).map((row) => row.from + ' → ' + row.to).join('\n  ') : '')
+          + ' (otherwise its children would render as plain text). Original material untouched; this rewrite happens at build time.'
+        : '')
+      + (Array.isArray(value.skipped) && value.skipped.length > 0
+        ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + (item.via === 'srcset' ? '; referenced via srcset' : '') + ')').join('\n')
+        : '')
+      + (Array.isArray(value.skipped) && value.skipped.some((item) => BUDGET_REASONS.has(item.reason))
+        ? '\n' + DEGRADED_TEXT
+        : '')
+      + (Array.isArray(value.referencedSkipped) && value.referencedSkipped.length > 0
+        ? '\nReferenced but skipped — those 404 inside the block, the page still renders:\n' + value.referencedSkipped.map((line) => '  - ' + line).join('\n')
+        : '')
+      + (Array.isArray(value.srcsetReferenced) && value.srcsetReferenced.length > 0
+        ? '\nReferenced via srcset only (' + String(value.srcsetReferenced.length) + ') — these are LOADS, not leftovers:\n  - ' + value.srcsetReferenced.join('\n  - ')
+        : '')
+      + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
+      + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
+      + '\nNEXT: read_ui_block({ name: "' + value.name + '" })'
+      + (value.backup === undefined ? '' : '\nOVERWROTE THE PREVIOUS VERSION (overwrite: true). The old one is kept byte for byte at: ' + value.backup)
+  }
+
   ctx.tools.register(defineTool({
     name: CREATE_TOOL,
     description: CREATE_DESCRIPTION,
@@ -2977,38 +3019,15 @@ export function apply(ctx, config) {
               }
             }
           },
-          warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' }
+          warning: { type: 'string', description: 'One advisory line when the block is past limits.softWarnBytes. Not an error: the block is written.' },
+          text: {
+            type: 'string',
+            required: true,
+            description: 'The build account as text, verbatim — the same string this tool renders: path, entry, files, skipped, the hygiene rewrite, the ::dsh-ui reference line to paste, and NEXT. A run_code program receives this value and not the rendered text, so print this field; the reference line exists nowhere else.'
+          },
         }
       },
-      render: (args, value) => [{
-        type: 'text',
-        text: 'UI block: ' + value.path + '\nAbsolute path: ' + value.absolutePath + '\nEntry: ' + value.entry + (value.fromDir === undefined ? '' : '\nBuilt from: ' + value.fromDir)
-          + (value.requested === undefined ? '' : '\nRENAMED — "' + value.requested + '" is already taken, so this one was written as "' + value.name + '". Use the NEW name everywhere: read_ui_block({ name: "' + value.name + '" }) and the ::dsh-ui ' + value.name + ':: line.')
-          + '\nFiles (loaded ' + String(value.files.length) + ', ' + String(value.totalBytes) + ' bytes; block text ' + String(value.blockBytes) + ' bytes):\n'
-          + value.files.map((file) => '  - ' + file.path + ' (' + String(file.bytes) + ' bytes' + (file.from === undefined ? '' : ', from ' + file.from) + ')').join('\n')
-          + (Array.isArray(value.hygiene) && value.hygiene.length > 0
-            ? '\nFIXED ' + String(value.hygiene.length) + ' element(s) that used a raw-text tag as a container: '
-              + value.hygiene[0].from + ' → ' + value.hygiene[0].to
-              + (value.hygiene.length > 1 ? '\n  ' + value.hygiene.slice(1).map((row) => row.from + ' → ' + row.to).join('\n  ') : '')
-              + ' (otherwise its children would render as plain text). Original material untouched; this rewrite happens at build time.'
-            : '')
-          + (Array.isArray(value.skipped) && value.skipped.length > 0
-            ? '\nSkipped (' + String(value.skipped.length) + '):\n' + value.skipped.map((item) => '  - ' + item.path + ' (' + String(item.bytes) + ' bytes, ' + item.reason + (item.detail === undefined ? '' : ': ' + item.detail) + (item.via === 'srcset' ? '; referenced via srcset' : '') + ')').join('\n')
-            : '')
-          + (Array.isArray(value.skipped) && value.skipped.some((item) => BUDGET_REASONS.has(item.reason))
-            ? '\n' + DEGRADED_TEXT
-            : '')
-          + (Array.isArray(value.referencedSkipped) && value.referencedSkipped.length > 0
-            ? '\nReferenced but skipped — those 404 inside the block, the page still renders:\n' + value.referencedSkipped.map((line) => '  - ' + line).join('\n')
-            : '')
-          + (Array.isArray(value.srcsetReferenced) && value.srcsetReferenced.length > 0
-            ? '\nReferenced via srcset only (' + String(value.srcsetReferenced.length) + ') — these are LOADS, not leftovers:\n  - ' + value.srcsetReferenced.join('\n  - ')
-            : '')
-          + (value.warning === undefined ? '' : '\nNOTE: ' + value.warning)
-          + '\nNOT VISIBLE TO THE USER YET. Reference it in the same message with a line of its own (canvas size optional as res=WxH):\n  ::dsh-ui ' + value.name + '::'
-          + '\nNEXT: read_ui_block({ name: "' + value.name + '" })'
-          + (value.backup === undefined ? '' : '\nOVERWROTE THE PREVIOUS VERSION (overwrite: true). The old one is kept byte for byte at: ' + value.backup)
-      }]
+      render: (args, value) => [{ type: 'text', text: value.text === undefined ? createText(value) : value.text }]
     },
     execute: async (args) => {
       const blockName = assertName(args.name)
@@ -3047,7 +3066,7 @@ export function apply(ctx, config) {
         if (!sameBytes) finalName = basename(freeNamePath(blocksDir(), blockName, EXT)).slice(0, -EXT.length)
       }
       const written = await writeBlock(finalName, assembled.text)
-      return {
+      const value = {
         path: blockPath(finalName),
         // The absolute path on disk: 'path' is the spelling the reference line and read_ui_block
         // take, and it is NOT a filesystem path (~/.dsh is wrong here — DSH_HOME decides).
@@ -3066,6 +3085,7 @@ export function apply(ctx, config) {
         ...hygiene === undefined || hygiene.length === 0 ? {} : { hygiene },
         ...assembled.warning === undefined ? {} : { warning: assembled.warning },
       }
+      return { ...value, text: createText(value) }
     },
     presentCall: (args) => {
       const files = Array.isArray(args.files) ? args.files : []
@@ -3083,6 +3103,17 @@ export function apply(ctx, config) {
       }
     }
   }))
+
+  /**
+   * read_ui_block's rendered text. One function because the value carries the SAME
+   * string in its `text` field: run_code hands a program the value and never the
+   * rendered content (the PNG still arrives as an attachment, the words did not).
+   */
+  function readText(value) {
+    return '<path>' + value.path + '</path>\n<type>image</type>\n<content>PNG image, ' + value.width + 'x' + value.height + ' px, ' + value.bytes + ' bytes; rendered with ' + value.tokens + ' theme tokens, skin: ' + value.scheme + '</content>'
+      + (value.measurements === undefined ? '' : '\n<measurements>\n' + value.measurements + '\n</measurements>')
+      + (value.note === undefined ? '' : '\nNOTE: ' + value.note)
+  }
 
   ctx.tools.register(defineTool({
     name: READ_TOOL,
@@ -3125,6 +3156,11 @@ export function apply(ctx, config) {
           // Not the page's own colours: `scheme` is the skin the CLIENT renders blocks in (render.tokens().scheme), so a light page painted in the dark canvas still reports "dark".
           scheme: { type: 'string', required: true, description: 'The skin the client rendered this block in (window.__dshPageBlock.render.tokens().scheme: "dark" or "light"). It describes the CANVAS the block was wrapped in, NOT the captured page\'s own colours — a light page rendered in the dark skin still reads "dark" here.' },
           note: { type: 'string', required: true, description: 'The block file\'s absolute path on disk (<DSH_HOME>\\ui-blocks\\<name>.uiblock). When the requested height was clamped to the first screen, the same string also says both numbers and how to get the whole page.' },
+          text: {
+            type: 'string',
+            required: true,
+            description: 'The render account as text, verbatim — the same string this tool renders: the PNG size, bytes, theme-token count, skin, and any probe measurements or clamp note. A run_code program receives this value and not the rendered text (the image still arrives as an attachment), so print this field.'
+          },
           measurements: {
             type: 'string',
             description: 'One line per probed selector: match count, then the first match box. Present only when probe was passed.'
@@ -3144,12 +3180,7 @@ export function apply(ctx, config) {
           }
         }
       },
-      render: (args, value) => [{
-        type: 'text',
-        text: '<path>' + value.path + '</path>\n<type>image</type>\n<content>PNG image, ' + value.width + 'x' + value.height + ' px, ' + value.bytes + ' bytes; rendered with ' + value.tokens + ' theme tokens, skin: ' + value.scheme + '</content>'
-          + (value.measurements === undefined ? '' : '\n<measurements>\n' + value.measurements + '\n</measurements>')
-          + (value.note === undefined ? '' : '\nNOTE: ' + value.note)
-      }, { type: 'image', attachment: value.image }]
+      render: (args, value) => [{ type: 'text', text: value.text === undefined ? readText(value) : value.text }, { type: 'image', attachment: value.image }]
     },
     execute: async (args, exec) => {
       const blockName = assertName(args.name)
@@ -3184,7 +3215,7 @@ export function apply(ctx, config) {
       // Where the block actually is, in full: 'path' is the reference-line spelling, and a
       // model that treats it as a disk path goes hunting in ~/.dsh (one globbed all of C: for 30 s).
       const blockAbsolute = join(blocksDir(), blockName + EXT)
-      return {
+      const value = {
         path: blockPath(blockName),
         width: shot.width,
         height: shot.height,
@@ -3202,6 +3233,7 @@ export function apply(ctx, config) {
           ...image.name === undefined ? {} : { name: String(image.name) }
         }
       }
+      return { ...value, text: readText(value) }
     },
     presentCall: (args) => ({
       card: 'generic',
@@ -3333,10 +3365,17 @@ export function apply(ctx, config) {
             type: 'json',
             required: true,
             description: 'The material index: files grouped by type (html/css/images/fonts/other) with bytes, the totals, report.dropped split into really-lost versus moved-to-assets (dropped / movedToAssets), sheetsFailed (stylesheets that could not be read), and "dangling" — every reference the captured documents make to something that was NOT captured (where, line, ref, resolved path).'
+          },
+          text: {
+            type: 'string',
+            required: true,
+            description: 'The capture account as text, verbatim — the same string this tool renders: where the material landed, the index groups, the @keyframes line, template placeholders, report.dropped, dangling references, and the next calls. A run_code program receives this value and not the rendered text, so print this field.'
           }
         }
       },
-      render: (args, value) => [{ type: 'text', text: captureText(value) }]
+      // The field is the source; a value built by hand (a self-check) has none, and
+      // the same function answers for it — one wording, two entrances.
+      render: (args, value) => [{ type: 'text', text: value.text === undefined ? captureText(value) : value.text }]
     },
     execute: async (args) => {
       const instance = String(args.instance === undefined || args.instance === null ? '' : args.instance).trim()
@@ -3384,7 +3423,7 @@ export function apply(ctx, config) {
         throw new Error(CAPTURE_TOOL + ': the extension answered but sent no files, so there is nothing to build a block from. Directory: ' + done.dir + '.')
       }
       const index = await indexMaterial(done.dir, done.files, report)
-      return {
+      const value = {
         dir: done.dir,
         files: done.files.map((file) => ({ path: file.path, bytes: file.bytes, from: join(done.dir, file.path) })),
         report,
@@ -3392,6 +3431,12 @@ export function apply(ctx, config) {
         fromDir: done.dir,
         index
       }
+      // The rendered text travels in the VALUE as well, built by the one function
+      // that owns it. Reason: a run_code program receives the tool's value and
+      // never its rendered content (dsh-tools/lib/types/ptc.js:454), so a capture
+      // taken from inside a script used to arrive with summary/dir/report only —
+      // every account line (@keyframes, placeholders, dropped, dangling) invisible.
+      return { ...value, text: captureText(value) }
     }
   }))
 

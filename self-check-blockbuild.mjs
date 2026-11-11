@@ -32,6 +32,9 @@ const home = await mkdtemp(join(tmpdir(), 'dsh-blockbuild-home-'))
 process.env.DSH_HOME = home
 
 const { apply, blockBuild, timeline } = await import('./index.js')
+// The validator the registry runs on every output: an undeclared field is a
+// ToolOutputError in production while a direct execute() call stays green.
+const { validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools')
 
 let n = 0
 /** One synchronous assertion group; any throw fails the whole file. */
@@ -173,6 +176,20 @@ await ta('absolutePath is the real file under this DSH_HOME, and the render name
   const text = create.output.render({}, value).map((part) => part.text).join('\n')
   assert.match(text, /^UI block: ui-blocks\/abs-probe\.uiblock$/m, 'the path line is unchanged')
   assert.ok(text.includes('Absolute path: ' + value.absolutePath), 'the rendered text names the absolute path too: ' + JSON.stringify(text.split('\n').slice(0, 3)))
+})
+
+console.log('--- 2a-2. the build account is in the VALUE too (run_code sees the value, not the render) ---')
+await ta('create_ui_block returns its rendered text as `text`, reference line included', async () => {
+  const value = await create.execute({ name: 'text-probe', fromDir: site })
+  assert.equal(typeof value.text, 'string', 'the value carries the text')
+  assert.equal(create.output.render({}, value).map((part) => part.text).join('\n'), value.text,
+    'the rendered content is that same string — one source, no drift')
+  assert.match(value.text, /^NOT VISIBLE TO THE USER YET\./m)
+  assert.ok(value.text.includes('::dsh-ui text-probe::'), 'the delivery line a script would otherwise never see')
+  // additionalProperties:false is the trap: a field outside the schema makes every
+  // real call throw, and only the registry validator catches that.
+  assert.deepEqual(validateJsonSchemaValue(create.output.schema, value, 'value'), [],
+    'the value satisfies its own output contract — otherwise every real call throws')
 })
 
 console.log('--- 2b. srcset-only material is loaded, never reported as unreferenced ---')
