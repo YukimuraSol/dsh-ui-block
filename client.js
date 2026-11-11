@@ -2291,7 +2291,16 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       var TIP_ID = 'dshpb-tip';
       var TIP_GAP = 8;     // the shell's bubble sits 8px above the button
       var TIP_MARGIN = 8;  // and never closer than 8px to a viewport edge
+      // Dwell before the pointer earns a bubble (user call, 2026-11-11, 4th
+      // round: "一碰就弹" is noise in a row this dense). One number, one place:
+      // 800ms — under 400 a sweep still pops, over 1500 reads as "no response".
+      // The existing 150ms fade follows it, so a committed bubble is complete
+      // at ~950ms. Keyboard focus never waits (see attachTip).
+      var TIP_DELAY_MS = 800;
       var tipNode = null;
+      var tipTimer = 0;       // the pending dwell, if any
+      var tipPendingFor = null;  // the button that dwell belongs to
+      var tipShownFor = null;    // the button the visible bubble belongs to
       function tipEl() {
         if (tipNode && tipNode.parentNode) return tipNode;
         tipNode = document.createElement('span');
@@ -2301,11 +2310,34 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         document.body.appendChild(tipNode);
         return tipNode;
       }
+      // Every exit path (mouseleave, blur, click, scroll, resize, dispose) comes
+      // through here, so a pending dwell can never outlive its hover.
       function hideTip() {
+        if (tipTimer) { window.clearTimeout(tipTimer); tipTimer = 0; }
+        tipPendingFor = null;
+        tipShownFor = null;
         if (tipNode) tipNode.style.display = 'none';
+      }
+      // The pointer path: wait TIP_DELAY_MS, and only then commit. Each button
+      // keeps its own count — the timer is cleared the moment that hover ends,
+      // so crossing four icons in a row accumulates nothing.
+      function showTipAfterDwell(button, text) {
+        // Already up for this same button: re-entering does not re-pop it.
+        if (tipShownFor === button && tipNode && tipNode.style.display !== 'none') return;
+        // Already counting for this same button (a click's focus lands here):
+        // do not restart the clock.
+        if (tipTimer && tipPendingFor === button) return;
+        if (tipTimer) window.clearTimeout(tipTimer);
+        tipPendingFor = button;
+        tipTimer = window.setTimeout(function () {
+          tipTimer = 0;
+          tipPendingFor = null;
+          showTip(button, text);
+        }, TIP_DELAY_MS);
       }
       function showTip(button, text) {
         var node = tipEl();
+        tipShownFor = button;
         if (node.textContent !== text) node.textContent = text;
         node.style.display = 'inline-flex';
         var rect = button.getBoundingClientRect();
@@ -2328,9 +2360,17 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       // Hover/focus hint for one banner button; aria-describedby points at it.
       function attachTip(button, text) {
         button.setAttribute('aria-describedby', TIP_ID);
-        button.addEventListener('mouseenter', function () { showTip(button, text); });
+        button.addEventListener('mouseenter', function () { showTipAfterDwell(button, text); });
         button.addEventListener('mouseleave', hideTip);
-        button.addEventListener('focus', function () { showTip(button, text); });
+        // Keyboard focus is intent, not a sweep, so it skips the dwell. A pointer
+        // that lands on the button focuses it too (mousedown), and that one must
+        // NOT get the bubble for free — hence the :hover test. Leaving it out
+        // would make every click flash the hint before its own click handler
+        // hides it.
+        button.addEventListener('focus', function () {
+          if (button.matches(':hover')) showTipAfterDwell(button, text);
+          else showTip(button, text);
+        });
         button.addEventListener('blur', hideTip);
         // A click that opens something (the resolution menu, the picker) means the
         // hint has done its job; leaving it up would cover what it opened.
@@ -3136,6 +3176,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         window.clearInterval(timer);
         window.removeEventListener('resize', onResize);
         window.removeEventListener('scroll', hideTip, true);
+        if (tipTimer) { window.clearTimeout(tipTimer); tipTimer = 0; }
+        tipPendingFor = null;
+        tipShownFor = null;
         if (tipNode && tipNode.parentNode) tipNode.parentNode.removeChild(tipNode);
         tipNode = null;
         document.removeEventListener('pointerdown', onDown, true);

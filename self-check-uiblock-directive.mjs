@@ -1087,10 +1087,23 @@ t('icon only: no visible word; every hint comes from the row own bubble', () => 
   assert.match(source, /if \(top - h < TIP_MARGIN\) \{ side = 'bottom'; top = rect\.bottom \+ TIP_GAP; \}/)
   // 出现/消失/关联：hover 与 focus 都出，mouseleave 与 blur 都收，aria 指向同一个节点。
   assert.match(source, /button\.setAttribute\('aria-describedby', TIP_ID\)/)
-  assert.match(source, /button\.addEventListener\('mouseenter', function \(\) \{ showTip\(button, text\); \}\)/)
+  assert.match(source, /button\.addEventListener\('mouseenter', function \(\) \{ showTipAfterDwell\(button, text\); \}\)/)
   assert.match(source, /button\.addEventListener\('mouseleave', hideTip\)/)
-  assert.match(source, /button\.addEventListener\('focus', function \(\) \{ showTip\(button, text\); \}\)/)
   assert.match(source, /button\.addEventListener\('blur', hideTip\)/)
+  // 2026-11-11 第四轮（用户原话）：「悬停后先等一会儿再显示提示文字，不要一碰就弹」。
+  // 延迟只准有一个来源：常量 TIP_DELAY_MS = 800，且只声明一次；鼠标走 dwell，
+  // 键盘 focus 走即时（无障碍：键盘用户不该等）。
+  assert.equal((source.match(/var TIP_DELAY_MS = 800;/g) || []).length, 1, 'TIP_DELAY_MS must be declared exactly once, as 800')
+  assert.match(source, /tipTimer = window\.setTimeout\(function \(\) \{[\s\S]{0,140}\}, TIP_DELAY_MS\);/, 'the dwell timer must pass the constant, not a literal')
+  assert.doesNotMatch(source, /\}, 800\);/, 'the delay is inlined somewhere instead of using TIP_DELAY_MS')
+  // 取消：所有出口（mouseleave / blur / click / scroll / resize / dispose）共用 hideTip，
+  // 它必须顺手清掉未到点的定时器，否则划过 800ms 的气泡还会自己冒出来。
+  assert.match(source, /function hideTip\(\) \{\n\s+if \(tipTimer\) \{ window\.clearTimeout\(tipTimer\); tipTimer = 0; \}/, 'hideTip must cancel the pending dwell')
+  assert.match(source, /window\.addEventListener\('scroll', hideTip, true\)/, 'scrolling must still take the hint down (and cancel the dwell)')
+  // 键盘 focus 立即显示；指针落上来的 focus（点击）仍留在 dwell 里，不许白得一次弹出。
+  assert.match(source, /if \(button\.matches\(':hover'\)\) showTipAfterDwell\(button, text\);\n\s+else showTip\(button, text\);/, 'keyboard focus must show at once')
+  // 已在显示时再次 mouseenter 不重复弹：dwell 入口先看 tipShownFor。
+  assert.match(source, /if \(tipShownFor === button && tipNode && tipNode\.style\.display !== 'none'\) return;/, 'an already-visible bubble must be kept, not re-popped')
   assert.doesNotMatch(source, /dshpb-pick-tip/, 'the old 3s home-made tooltip is back')
   assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
   // 用户定稿（2026-11-11 晚，真机看过后）：块头那四个控件同高、无边框、透明底，
