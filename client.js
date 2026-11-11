@@ -1173,13 +1173,7 @@ window.__ModuleLoader__.load({
       '.dshpb-pick-on{background:transparent}',
       '.dshpb-pick-on path{stroke:#22d3ee;stroke-width:1.5}',
       '.dshpb-pickbox{position:fixed;z-index:2147483000;pointer-events:none;display:none;',
-      'border:2px solid #4d6bfe;background:rgba(77,107,254,.12)}',
-      // Delayed hover hint (2026-10-10). The native title tooltip has no
-      // controllable delay, so the pick icon carries its own one-line tip.
-      '.dshpb-pick-tip{position:fixed;z-index:2147483001;display:none;pointer-events:none;',
-      'max-width:280px;padding:5px 9px;border-radius:8px;background:var(--dsw-alias-bg-layer-1);',
-      'border:.5px solid var(--dsw-alias-border-l1);box-shadow:var(--dsw-shadow-lv3);',
-      'color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12);white-space:nowrap}'
+      'border:2px solid #4d6bfe;background:rgba(77,107,254,.12)}'
     ].join('');
 
     // ── canvas picker (2026-10-10) ─────────────────────────────────────────────
@@ -2188,18 +2182,20 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         var pickButton = document.createElement('button');
         pickButton.type = 'button';
         pickButton.className = 'dshpb-btn dshpb-pick';
-        // No title attribute on purpose: the native tooltip's delay is not
-        // controllable and would double up with the delayed hint below.
         pickButton.setAttribute('aria-pressed', 'false');
         pickButton.setAttribute('aria-label', '在画布内选取元素');
+        // Hover explanation = the browser's OWN title tooltip, the same mechanism
+        // as the size button beside it (user call, 2026-11-11). The row must not
+        // mix two kinds of hover hint: the home-made one that used to live here
+        // showed up after a 3s delay, so the same gesture felt different on every
+        // icon. Delay and look are now the platform's everywhere.
+        // The text names the action first, then says how it works — a tooltip that
+        // only repeats the icon name tells the pointer nothing.
+        pickButton.title = '在画布内选取元素（点元素插入到输入框 · 滚轮切层 · 方向键导航 · 再点退出）';
         pickButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M2.5 2.5l5 11 1.8-4.2 4.2-1.8z"/></svg>';
-        pickButton.addEventListener('mouseenter', function () { schedulePickTip(pickButton); });
-        pickButton.addEventListener('mouseleave', cancelPickTip);
-        pickButton.addEventListener('blur', cancelPickTip);
         pickButton.addEventListener('click', function (event) {
           event.preventDefault();
           event.stopPropagation();
-          cancelPickTip();
           armPick(state);
         });
         // Replay. One-shot animations copy the site honestly and then sit on
@@ -2207,16 +2203,21 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // second later. This button reloads the entry instead of changing that
         // timing: the loop stays a one-shot, the user decides when it runs.
         // Not on a demo block — the transport already has 重新开始.
-        // Icon only (user call, 2026-11-11): no visible word, no title tooltip,
-        // and the same 24x16 box as the picker, sitting BETWEEN 分辨率 and
-        // 选取元素. The name survives in aria-label; "重放动画" is what a screen
-        // reader says, which is also why the word never reaches the screen.
+        // Icon only (user call, 2026-11-11): no visible word, and the same 24x16
+        // box as the picker, sitting BETWEEN 分辨率 and 选取元素. The name lives
+        // in aria-label (what a screen reader says) and in title (what the pointer
+        // gets): one hover mechanism for the whole row — the browser's own
+        // tooltip, the same one the size button beside it already uses.
         var replayButton = null;
         if (!state.demoSpec) {
           replayButton = document.createElement('button');
           replayButton.type = 'button';
           replayButton.className = 'dshpb-btn dshpb-replay';
           replayButton.setAttribute('aria-label', '重放动画');
+          // Names the action, then says what it does: "replay" alone reads like a
+          // media control, and what this really does is throw the document away
+          // and parse it again.
+          replayButton.title = '重放动画（重新加载画布内容，等同刷新）';
           replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
           replayButton.addEventListener('click', function (event) {
             event.preventDefault();
@@ -2345,8 +2346,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       // The picker only ever ends by clicking the icon again — Enter and Escape are
       // deliberately NOT bound, so the mode never eats a key the page may want.
       var pickBox = null;
-      var pickTip = null;
-      var pickTipTimer = 0;
       var seatRef = { sessionId: null, actions: null };
       var seatDispose = null;
       var seatTried = false;
@@ -2361,34 +2360,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         return pickBox;
       }
       function hidePickBox() { if (pickBox) pickBox.style.display = 'none'; }
-
-      // The pick icon's own hint: 3s of dwell, one line, no toast, no popup.
-      var PICK_TIP_TEXT = '点元素插入到输入框 · 滚轮切层 · 方向键导航 · 再点退出';
-      function cancelPickTip() {
-        window.clearTimeout(pickTipTimer);
-        pickTipTimer = 0;
-        if (pickTip) pickTip.style.display = 'none';
-      }
-      function showPickTip(button) {
-        if (!pickTip || !pickTip.parentNode) {
-          pickTip = document.createElement('div');
-          pickTip.className = 'dshpb-pick-tip';
-          pickTip.setAttribute('role', 'tooltip');
-          document.body.appendChild(pickTip);
-        }
-        pickTip.textContent = PICK_TIP_TEXT;
-        var rect = button.getBoundingClientRect();
-        pickTip.style.display = 'block';
-        var below = rect.bottom + 6;
-        var top = below + pickTip.offsetHeight > window.innerHeight - 8
-          ? Math.max(8, rect.top - pickTip.offsetHeight - 6) : below;
-        pickTip.style.left = Math.max(8, Math.round(rect.right - pickTip.offsetWidth)) + 'px';
-        pickTip.style.top = Math.round(top) + 'px';
-      }
-      function schedulePickTip(button) {
-        cancelPickTip();
-        pickTipTimer = window.setTimeout(function () { pickTipTimer = 0; showPickTip(button); }, 3000);
-      }
 
       /** Apply one scoped input event to one session, exactly as dsh-element-chip does. */
       function pickEmit(sessionId, event, payload) {
@@ -3071,9 +3042,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         for (var p = 0; p < live.length; p += 1) disarmPick(live[p], true);
         if (pickBox && pickBox.parentNode) pickBox.parentNode.removeChild(pickBox);
         pickBox = null;
-        cancelPickTip();
-        if (pickTip && pickTip.parentNode) pickTip.parentNode.removeChild(pickTip);
-        pickTip = null;
         if (typeof seatDispose === 'function') seatDispose();
         seatDispose = null;
         observer.disconnect();

@@ -996,7 +996,8 @@ await ta('the @keyframes line carries one-shot vs infinite and the dangling name
 // 用户定稿（同日晚）：按钮就是「重新渲染」，像真刷新一样——不向块里发消息、不留
 // dsh:replay 契约（重载会把旧文档整个换掉，换之前的消息没有接收方）。
 // 这一节钉住不能漂的东西：按钮在 buildControls 里且夹在分辨率与选区之间、纯图标
-// 无 title、重载走 srcdoc 重写或 src 重设、不发消息、sandbox 没被放宽。
+// （没有可见文字，悬停解释文案走浏览器原生 title）、重载走 srcdoc 重写或 src 重设、
+// 不发消息、sandbox 没被放宽。
 // ---------------------------------------------------------------------------
 console.log('--- 20. the replay button reloads the block like F5, and sends nothing ---')
 const fnAt = (name) => source.indexOf('function ' + name + '(')
@@ -1055,11 +1056,18 @@ t('the sandbox is not widened, and a demo block gets no replay button', () => {
   assert.match(source, /frame\.setAttribute\('sandbox', 'allow-same-origin'\)/)
   assert.match(source, /iframe\.setAttribute\('sandbox', 'allow-same-origin'\)/)
 })
-t('icon only: no visible word, no title tooltip, the name lives in aria-label', () => {
+t('icon only: no visible word; the hover hint is the browser native title', () => {
   assert.match(controlsBody, /aria-label', '重放动画'/, 'the accessible name is gone')
-  // 「重播」不许出现在可见界面上：没有 title（悬停会显示文字），也没有 textContent。
-  assert.doesNotMatch(controlsBody, /replayButton\.title/, 'a title tooltip would print 重播 on hover')
+  // 「重放」不许出现在按钮上：没有 textContent。悬停解释文案改走浏览器原生 title
+  // （用户定稿 2026-11-11 晚）：块头四颗同一套机制，延迟与样式由平台决定。
   assert.doesNotMatch(controlsBody, /replayButton\.textContent/, 'visible text on the replay button')
+  assert.match(controlsBody, /replayButton\.title = '重放动画（重新加载画布内容，等同刷新）'/,
+    'the replay hover hint must be the native title, naming the action and what it does')
+  // 选取元素同样挂原生 title；插件不再自造浮层（旧的自定义 tip 已整个删掉）。
+  assert.match(controlsBody, /pickButton\.title = '在画布内选取元素（点元素插入到输入框 · 滚轮切层 · 方向键导航 · 再点退出）'/,
+    'the pick hover hint must be the native title')
+  assert.doesNotMatch(source, /dshpb-pick-tip/, 'the home-made tooltip is back')
+  assert.doesNotMatch(source, /setAttribute\('role', 'tooltip'\)/, 'a hand-rolled role=tooltip node is back')
   assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
   // 用户定稿（2026-11-11 晚，真机看过后）：块头那四个控件同高、无边框、透明底，
   // 照最右边「复制路径」那个 24×24 的样子做。分辨率 / 重放 / 选取元素共用同一条
