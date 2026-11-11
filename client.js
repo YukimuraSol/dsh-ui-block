@@ -1167,6 +1167,16 @@ window.__ModuleLoader__.load({
       '.dshpb-pick svg,.dshpb-replay svg{display:block;width:14px;height:14px;overflow:visible}',
       '.dshpb-pick path,.dshpb-replay path{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.5;',
       'stroke-linecap:round;stroke-linejoin:round}',
+      // The copy glyph (2026-11-11, 5th round: this button is ours now) is a <path>
+      // plus two <rect> sheets — same 14px box and same stroke as its two neighbours,
+      // so the row still reads as one icon set.
+      '.dshpb-copy svg{display:block;width:14px;height:14px;overflow:visible}',
+      '.dshpb-copy path,.dshpb-copy rect{fill:none;stroke:var(--dsw-alias-label-secondary);stroke-width:1.5;',
+      'stroke-linecap:round;stroke-linejoin:round}',
+      // The shell's own copy icon, stood down inside OUR card only. The class is
+      // applied to that one node by identity; !important beats the inline
+      // display:none the same code sets, so a re-render cannot quietly revive it.
+      '.md-code-block.dshpb-active .dshpb-shellcopy{display:none!important}',
       // The replay glyph is a broken circle with an arrowhead and a play triangle
       // in the middle: "play this again", not "reload the page".
       '.dshpb-replay path.dshpb-tri{fill:var(--dsw-alias-label-secondary);stroke:none}',
@@ -2249,6 +2259,20 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
             replayBlock(state);
           });
         }
+        // The copy icon is OURS now (see the block further down): same 24x24 box,
+        // no border, same hover fill as the other three, and the same attachTip.
+        var copyButton = document.createElement('button');
+        copyButton.type = 'button';
+        copyButton.className = 'dshpb-btn dshpb-copy';
+        copyButton.setAttribute('aria-label', COPY_LABEL);
+        copyButton.innerHTML = COPY_ICON;
+        // Wording follows the label: 复制路径, then 已复制 for COPIED_HOLD_MS.
+        attachTip(copyButton, function () { return copyButton.getAttribute('aria-label') || COPY_LABEL; });
+        copyButton.addEventListener('click', function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          copyRefPath(state, copyButton);
+        });
         var note = document.createElement('span');
         note.className = 'dshpb-note';
         note.textContent = '未声明，使用默认';
@@ -2257,6 +2281,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // group, so neither the size button's x nor the copy-path button moves.
         if (replayButton !== null) controls.appendChild(replayButton);
         controls.appendChild(pickButton);
+        // Rightmost, where the shell's copy icon used to be: the row reads
+        // 尺寸 -> 重放 -> 选取 -> 复制, so neither of the other three moves.
+        controls.appendChild(copyButton);
         // Demo transport goes leftmost: it is the only part of a demo block a
         // pointer can reach, because the frame never takes the pointer.
         buildTransport(state, controls);
@@ -2267,6 +2294,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         state.resButton = resButton;
         state.pickButton = pickButton;
         state.replayButton = replayButton;
+        state.copyButton = copyButton;
         state.note = note;
         // A rebuilt banner must not silently un-light an armed picker.
         if (state.pick) {
@@ -2274,6 +2302,11 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           pickButton.setAttribute('aria-pressed', 'true');
         }
         updateControls(state);
+        // Ours are in place; now stand the shell's copy icon down. The .dshpb-ctl
+        // wrapper is what tells our four apart from theirs, so this runs last.
+        if (OWN_COPY_BUTTON) {
+          try { hideShellCopyButton(state); } catch (e) { /* someone else's DOM: leave it be */ }
+        }
       }
 
       // ── the banner's hover hint (2026-11-11, second pass) ────────────────────
@@ -2336,6 +2369,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         }, TIP_DELAY_MS);
       }
       function showTip(button, text) {
+        // A hint whose wording the shell owns (the copy button says 已复制 after a
+        // click) passes a function, read at commit time, not at attach time.
+        if (typeof text === 'function') text = text();
         var node = tipEl();
         tipShownFor = button;
         if (node.textContent !== text) node.textContent = text;
@@ -2375,6 +2411,92 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // A click that opens something (the resolution menu, the picker) means the
         // hint has done its job; leaving it up would cover what it opened.
         button.addEventListener('click', hideTip);
+      }
+
+      // ── the 4th icon: we render our own copy button (2026-11-11, 5th round) ──────
+      // Why not use the shell's: the banner is the shell's own CodeBlock, so its copy
+      // icon comes from primitives' `CodeToolbar` — a <button> inside a `Tooltip` whose
+      // `delayMs` defaults to 0. CodeBlock's props (code/lang/…/copyLabel/copiedLabel/
+      // toolbarLabels/wrap) cannot reach that prop, and the bubble is portaled to
+      // document.body, so no scoped CSS can delay it either. Every route to the shell's
+      // bubble therefore ends up either patching React's own event delegation (failed
+      // in practice: the same-node listeners at document still ran) or a global rule
+      // that would slow every tooltip in the app.
+      // So: our card gets its OWN fourth button, rendered here like the other three —
+      // same attachTip, same 800ms, same #dshpb-tip node — and the shell's one is
+      // hidden inside this card only (SHELL_COPY_HIDDEN class, node-identity matched).
+      // Nothing global is intercepted: a chat code block elsewhere keeps the shell's
+      // instant bubble because we never touch anything outside state.header.
+      // If the shell ever changes the banner's DOM, the hide stops matching and the
+      // symptom is visible and harmless: two copy buttons, not a silent slowdown.
+      // OWN_COPY_BUTTON = false drops both halves and leaves the shell's button alone.
+      var OWN_COPY_BUTTON = true;
+      var COPIED_HOLD_MS = 1600;
+      var COPY_ICON = '<svg viewBox="0 0 13 13" aria-hidden="true">' +
+        '<rect x="2" y="4.2" width="6.8" height="6.8" rx="1.4"/>' +
+        '<path d="M4.4 4.2V3.2c0-.9.7-1.6 1.6-1.6h3.2c.9 0 1.6.7 1.6 1.6v3.2c0 .9-.7 1.6-1.6 1.6h-1"/></svg>';
+      var COPIED_ICON = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M2.6 6.9l2.7 2.7 5.1-6"/></svg>';
+      /**
+       * The shell's copy button inside THIS banner, found by identity, not by class:
+       * it is the only <button> left in the header that is not inside our .dshpb-ctl
+       * (buildControls already removed the shell's wrap toggle).
+       */
+      function shellCopyButton(header) {
+        if (!header || !header.querySelectorAll) return null;
+        var all = header.querySelectorAll('button');
+        var found = null;
+        for (var i = 0; i < all.length; i += 1) {
+          if (!all[i].closest('.dshpb-ctl')) found = all[i];
+        }
+        return found;
+      }
+      /**
+       * Hide the shell's copy icon inside this banner. Kept in the DOM (React owns it;
+       * removing it would fight the reconciler) — display:none via a class the shell
+       * never writes, plus aria-hidden/tabIndex so it leaves the a11y tree too.
+       * ponytail: a re-render that rewrites style/class would un-hide it, so a
+       * MutationObserver re-asserts on that one node. Ceiling: one observer per block;
+       * if the shell ever remounts the whole banner, buildControls runs again anyway.
+       */
+      function hideShellCopyButton(state) {
+        var button = shellCopyButton(state.header);
+        if (!button) return;
+        var assert = function () {
+          if (!button.isConnected) { if (state.copyObserver) state.copyObserver.disconnect(); return; }
+          if (button.style.display !== 'none') button.style.display = 'none';
+          if (!button.classList.contains('dshpb-shellcopy')) button.classList.add('dshpb-shellcopy');
+          if (button.getAttribute('aria-hidden') !== 'true') button.setAttribute('aria-hidden', 'true');
+          if (button.tabIndex !== -1) button.tabIndex = -1;
+        };
+        assert();
+        if (state.hiddenCopy !== button) {
+          if (state.copyObserver) state.copyObserver.disconnect();
+          state.hiddenCopy = button;
+          state.copyObserver = new MutationObserver(assert);
+          state.copyObserver.observe(state.header, { subtree: true, childList: true, attributes: true, attributeFilter: ['style', 'class'] });
+        }
+      }
+      /** Write the block's reference path, then show 已复制 for COPIED_HOLD_MS. */
+      function copyRefPath(state, button) {
+        var restore = function () {
+          if (state.copyTimer) { window.clearTimeout(state.copyTimer); state.copyTimer = 0; }
+          button.setAttribute('aria-label', COPY_LABEL);
+          button.innerHTML = COPY_ICON;
+        };
+        var settle = function (ok, why) {
+          if (state.copyTimer) window.clearTimeout(state.copyTimer);
+          button.setAttribute('aria-label', ok ? COPIED_LABEL : '复制失败');
+          button.innerHTML = ok ? COPIED_ICON : COPY_ICON;
+          state.copyTimer = window.setTimeout(restore, COPIED_HOLD_MS);
+          // A failed write must never be silent: the label is the bubble's wording,
+          // and the toast says it out loud.
+          if (!ok) showToast('复制失败' + (why ? '：' + why : ''));
+        };
+        var text = state.refPath || '';
+        try {
+          if (!navigator.clipboard || !navigator.clipboard.writeText) { settle(false, '此环境不允许写剪贴板'); return; }
+          navigator.clipboard.writeText(text).then(function () { settle(true); }, function (e) { settle(false, (e && e.message) || '写剪贴板被拒绝'); });
+        } catch (e) { settle(false, (e && e.message) || '写剪贴板抛错'); }
       }
 
       // Map-viewport gestures. The iframe itself is pointer-events:none, so
