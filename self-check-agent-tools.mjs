@@ -305,7 +305,16 @@ await checkAsync('the account is IN the value as `text`: a run_code program sees
       dropped: [],
       keyframesByFile: { 'shared/app.css': 3, 'pages/current/page.css': 0 },
       animationCount: 5,
-      infiniteCount: 1
+      infiniteCount: 1,
+      // 迭代次数 + 抓取前被页面摘掉的节点：这两笔账只在这个 text 里，磁盘上没有，
+      // 所以这里验的是「经 text 字段到达」——run_code 程序拿到 value，看不到 render。
+      oneShotAnimations: 4,
+      infiniteAnimations: 1,
+      danglingAnimationNames: 1,
+      danglingAnimationNameSample: ['ghostFrames'],
+      removedNodes: [
+        { tag: 'div', id: 'loader', cls: 'lwrap', bytes: 120, outerHTMLHead: '<div class="lwrap" id="loader"></div>' }
+      ]
     }
   })
   const value = await pending
@@ -316,6 +325,13 @@ await checkAsync('the account is IN the value as `text`: a run_code program sees
   assert.equal(render('capture_page', {}, value), value.text, 'the rendered content is that same string')
   assert.match(value.text, /@keyframes: 3 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 5 declarations, 1 with infinite/)
   assert.match(value.text, /THESE LINES ARE NOT ON DISK/, 'the text says where those lines do NOT live, so nothing greps for them')
+  // 抓取前被摘掉的节点：一行点名 + 一句可照做的指引（说清楚这是推断）。
+  assert.match(value.text, /^1 node\(s\) were removed from the DOM before this capture: div#loader\.lwrap\./m)
+  assert.match(value.text, /you may put it back inside the block and drive it with a CSS animation/)
+  assert.match(value.text, /say in your diff that this is inferred/)
+  // 动画是循环还是一次性：两个数 + dangling，漏掉 infinite 就是「块看起来静态」的那次事故。
+  assert.match(value.text, /4 play once \(finite iterations\), 1 loop forever \(infinite\)/)
+  assert.match(value.text, /1 animation-name reference\(s\) point at @keyframes that are NOT in this capture \(ghostFrames\)/)
   assert.deepEqual(validateJsonSchemaValue(tool('capture_page').output.schema, value, 'value'), [],
     'the value satisfies its own output contract — otherwise every real call throws')
 })

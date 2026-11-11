@@ -39,6 +39,11 @@
   /** 单次取字节上限：后台同值，超了当场报原因，不把 40 MB 的图灌进消息通道。 */
   var MAX_FETCH_BYTES = 12 * 1024 * 1024;
   var SECTION_MAX_BYTES = 2 * 1024 * 1024; // 块格式单段上限（DSH 侧默认值）
+  // 「抓取前就被摘掉的节点」（观察器见 removed-watch.js）：最多列 20 条，每条带
+  // 序列化后前 300 字。20 条之外只报个数——清单是给模型判断「要不要在块里复刻」用的，
+  // 不是全量审计；一条 outerHTML 长起来可以是几十 KB。
+  var REMOVED_MAX = 20;
+  var REMOVED_HEAD = 300;
 
   // ---- frame 盲区 ---------------------------------------------------------
   // 正文装在 iframe 里的页面（实测教务页就是），顶层文档抓下来是一片空：扩展只注入
@@ -469,16 +474,77 @@
    * @font-face 与 @keyframes 统一提到 shared/app.css，page.css 里一条都没有。它 grep/read
    * 三轮，最后靠 web_fetch 原站 HTML 才对上。数的是落盘后的原文，所以和块里的字节同一口径。
    */
+  // animation 关键字表：这些词出现在 shorthand 里都不是动画名。
+  var ANIM_KEYWORDS = {
+    normal: 1, reverse: 1, alternate: 1, 'alternate-reverse': 1, forwards: 1, backwards: 1, both: 1,
+    none: 1, running: 1, paused: 1, infinite: 1, linear: 1, ease: 1, 'ease-in': 1, 'ease-out': 1,
+    'ease-in-out': 1, 'step-start': 1, 'step-end': 1, initial: 1, inherit: 1, unset: 1, revert: 1,
+    // auto 是 duration/delay 在新语法里的值，不是动画名。实测 s6 的
+    // `@media (prefers-reduced-motion){*{animation:auto ease 0s 1 normal none running none}}`
+    // 被当成 dangling 报了一个 "auto"——那条 reset 的动画名其实是 none。
+    auto: 1, 'revert-layer': 1
+  };
+  /**
+   * 一层 animation（逗号分隔的一层）里的动画名。取第一个不是数字/时间/关键字/函数的词。
+   * 口径只在 animation 与 animation-name 上调用——其余长属性（duration/timing/delay…）没有名字。
+   */
+  function animationNameOf(layer) {
+    var toks = String(layer || '').trim().split(/\s+/);
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i].replace(/^[,(]+/, '').replace(/[),]+$/, '');
+      if (!t) continue;
+      if (/^[-+]?[0-9]*\.?[0-9]+(?:e[-+]?[0-9]+)?$/.test(t)) continue; // iteration-count
+      if (/^[0-9.]+m?s$/i.test(t)) continue;                             // 时间
+      if (ANIM_KEYWORDS[t.toLowerCase()]) continue;                      // 方向/填充/播放态/缓动
+      if (/^[a-z-]+\(/i.test(t)) continue;                               // steps(4, / cubic-bezier(
+      if (!/^-?[_a-zA-Z][_a-zA-Z0-9-]*$/.test(t)) continue;
+      return t;
+    }
+    return '';
+  }
+  /** @keyframes 的名单（countAnimations 只给条数，算 dangling 要名字）。 */
+  function keyframeNames(text) {
+    var out = [], re = /@keyframes\s+([^\s{]+)/g, m;
+    while ((m = re.exec(String(text || ''))) !== null) out.push(m[1]);
+    return out;
+  }
+  /**
+   * 一份 CSS 原文里有几条 @keyframes、几条 animation 声明、其中几条带 infinite。
+   *
+   * 真实事故（57.5 s）：模型在 pages/current/page.css 里找 @keyframes 找不到——第 7 步把
+   * @font-face 与 @keyframes 统一提到 shared/app.css，page.css 里一条都没有。它 grep/read
+   * 三轮，最后靠 web_fetch 原站 HTML 才对上。数的是落盘后的原文，所以和块里的字节同一口径。
+   *
+   * 迭代次数（oneShot / infinite）按**声明条数**算，不按层算：一条 shorthand 写成
+   * `animation: a 2s, b 3s` 是 1 条声明 2 层，口径与 animationCount 一致。
+   * 没有写 iteration-count 的声明默认 1 次 = 有限（oneShot）；写了 infinite 的才算无限。
+   *
+   * 真实事故（动画「静态」）：模型照抄了 loop 用的 @keyframes，却把迭代次数漏成一次，
+   * 每条只播 7 s、可见运动 238–420 ms——所以这两个数必须能被模型看见。
+   */
   function countAnimations(text) {
     var s = String(text || '');
     var keyframes = (s.match(/@keyframes[\s{]/g) || []).length;
     var declarations = 0, infinite = 0;
-    var re = /(?:^|[;{])\s*animation(?:-[a-z]+)*\s*:([^;}]*)/g, m;
+    var names = [];
+    // 每条声明单记一笔，dangling 的分类要在两份文件合起来之后做（@keyframes 全在 app.css）。
+    var decls = [];
+    var re = /(?:^|[;{])\s*(animation(?:-[a-z]+)*)\s*:([^;}]*)/g, m;
     while ((m = re.exec(s)) !== null) {
       declarations++;
-      if (/\binfinite\b/.test(m[1])) infinite++;
+      var prop = m[1], body = m[2];
+      var declNames = [];
+      // 只有 shorthand 与 animation-name 带名字；其余长属性当名字扫会扫出 duration 之类。
+      if (prop === 'animation' || prop === 'animation-name') {
+        body.split(',').forEach(function (layer) {
+          var n = animationNameOf(layer);
+          if (n) { names.push(n); declNames.push(n); }
+        });
+      }
+      if (/\binfinite\b/.test(body)) infinite++;
+      decls.push({ infinite: /\binfinite\b/.test(body), names: declNames });
     }
-    return { keyframes: keyframes, animations: declarations, infinite: infinite };
+    return { keyframes: keyframes, animations: declarations, infinite: infinite, oneShot: declarations - infinite, names: names, decls: decls };
   }
 
   // ---- @font-face / @keyframes 去重 ---------------------------------------
@@ -1246,10 +1312,50 @@
     // 「删掉它等于一张空图、不影响版式」的替换元素。src 取不到字节时只有这些可以整
     // 个摘掉；其余元素（含 <avatar src> 这类指令元素）必须留下——它们的内容是可见的。
     var REPLACED_TAG = { img: 1, source: 1, track: 1, input: 1, video: 1, audio: 1, embed: 1, object: 1, iframe: 1, frame: 1 };
-    var removedNodes = 0;
+    // 抽取时从**副本**里摘掉的死标签条数。它和下面 report.removedNodes（页面自己的 JS
+    // 在抓取前摘掉的节点）是两件事，名字以前混用过：旧 report 的 removedNodes 就是这个数，
+    // 于是「加载层消失」被读成了「2 个节点没了」。现在各归各名。
+    var deadTagsStripped = 0;
     Array.prototype.slice.call(clone.querySelectorAll(deadTags.join(','))).forEach(function (n) {
-      if (n.parentNode) { n.parentNode.removeChild(n); removedNodes++; }
+      if (n.parentNode) { n.parentNode.removeChild(n); deadTagsStripped++; }
     });
+    // 「抓取前就已经不在 DOM 里的节点」：页面自己（框架）在加载完成后把加载层 / 骨架层 /
+    // 提示条摘掉，抓取这一刻它们早就没了——抽取函数只能在当下的 DOM 上工作，看不见过去。
+    // 真实事故：panel.solyukimura.top 的 .lwrap / .lbox 就这么消失的，旧 report 里那句
+    // removedNodes: 2 还是「抽取时摘掉的 <script>/<style>」，模型没有任何依据判断要不要
+    // 在块里把它放回去，于是复刻出来是静态的。
+    // 观察器（removed-watch.js，manifest 里 document_start 注入）把被摘掉的元素压进一个有界环，
+    // 这里只取最近的那几条并序列化。**只报，不放回去**：要不要复刻是模型在块里该做的决定。
+    var removedItems = [];
+    var removedTruncated = 0;
+    var removedObserved = false;
+    try {
+      var removedWatch = (typeof globalThis !== 'undefined' ? globalThis : win).__dshRemovedWatch;
+      if (removedWatch && removedWatch.rows) {
+        removedObserved = true;
+        var removedTotal = typeof removedWatch.total === 'function' ? Number(removedWatch.total()) : removedWatch.rows.length;
+        // 新的在前：最贴近抓取那一刻被摘掉的那个，通常正是加载/骨架层。
+        for (var ri = removedWatch.rows.length - 1; ri >= 0 && removedItems.length < REMOVED_MAX; ri--) {
+          var row = removedWatch.rows[ri];
+          var gone = row && row.el;
+          if (!gone) continue;
+          var goneHtml = '';
+          try { goneHtml = String(gone.outerHTML || ''); } catch (e) { goneHtml = ''; }
+          removedItems.push({
+            tag: String(row.tag || ''),
+            id: String(row.id || ''),
+            cls: String(row.cls || ''),
+            bytes: utf8Len(goneHtml),
+            outerHTMLHead: goneHtml.slice(0, REMOVED_HEAD)
+          });
+        }
+        removedTruncated = Math.max(0, removedTotal - removedItems.length);
+      }
+    } catch (e) {
+      removedObserved = false;
+      removedItems = [];
+      removedTruncated = 0;
+    }
     // srcset / imagesrcset 不在这里删：它们是响应式图的档位表，删了等于主动丢掉最大一档，
     // 交给下面 pickSrcsetMax 取最大候选（见「nm === 'srcset'」分支与第 6 步回写）。
     var BAD_ATTR = { integrity: 1, nonce: 1, crossorigin: 1, loading: 1, decoding: 1, referrerpolicy: 1 };
@@ -1664,6 +1770,25 @@
     keyframesByFile[PAGE_CSS] = pageAnim.keyframes;
     animationsByFile[APP_CSS] = appAnim.animations;
     animationsByFile[PAGE_CSS] = pageAnim.animations;
+    // 引用不到已收集 keyframes 的动画名：产物里那些声明永远不会跑。名单要跨两份文件算
+    // ——@keyframes 全被提到 shared/app.css，动画名却可能写在 page.css 的规则里。
+    var knownKeyframes = {};
+    keyframeNames(appCssText).concat(keyframeNames(pageCssText2)).forEach(function (n) { knownKeyframes[n] = 1; });
+    // 按**声明**分类，三个桶互斥：一条声明里只要有一个动画名在产物里找不到，它就永远跑不起来，
+    // 只记进 dangling（既不算循环也不算一次性）。这样 oneShot + infinite + dangling = animationCount，
+    // 前提是没有一条声明既 infinite 又找不到名字（那种归 dangling，infiniteCount 仍算它——
+    // infiniteCount 的口径是「文本里有 infinite 的声明数」，两者不冲突）。
+    var oneShotN = 0, infiniteN = 0, danglingN = 0;
+    var danglingNames = [];
+    appAnim.decls.concat(pageAnim.decls).forEach(function (d) {
+      var missing = (d.names || []).filter(function (n) { return !knownKeyframes[n]; });
+      if (missing.length) {
+        danglingN++;
+        missing.forEach(function (n) { if (danglingNames.indexOf(n) < 0) danglingNames.push(n); });
+        return;
+      }
+      if (d.infinite) infiniteN++; else oneShotN++;
+    });
 
     var title = doc.title || opts.title || '';
     var entryHtml = [
@@ -1731,6 +1856,17 @@
       animationsByFile: animationsByFile,
       animationCount: appAnim.animations + pageAnim.animations,
       infiniteCount: appAnim.infinite + pageAnim.infinite,
+      // 动画能不能看出「在动」，取决于迭代次数：同一条 @keyframes，配 infinite 是转圈，
+      // 配默认的 1 次就是「播一遍就停」。模型手写替代动画时漏掉 infinite 的代价是整块看起来静态
+      // （实测每条只播 7 s、可见运动 238–420 ms），所以这两个数必须能被模型看见。
+      // 口径：按**声明条数**，没写 iteration-count 的算有限（默认 1 次），与 animationCount 同口径。
+      // 三个桶互斥：会跑一次、会一直循环、永远跑不起来（名字找不到）。和 animationCount 同口径，
+      // 没有一条既 infinite 又找不到名字时 oneShot + infinite + dangling = animationCount。
+      oneShotAnimations: oneShotN,
+      infiniteAnimations: infiniteN,
+      // 引用了产物里根本没有的 @keyframes 的声明条数（那条声明永远不会跑），名单另列。
+      danglingAnimationNames: danglingN,
+      danglingAnimationNameSample: danglingNames.slice(0, 10),
       // 站内自定义属性：原样写出去的条数 / 丢掉的（只有宿主皮肤 --dsw-* 与解析不了的空值）
       customPropsKept: st.customPropsKept,
       customPropsDropped: st.customPropsDropped,
@@ -1778,7 +1914,12 @@
       // 原尺寸与是否降采样。素材库索引与验收都读这一份，不用再猜。
       assets: assetLog,
       srcsetPicked: srcsetPickedUrls,
-      removedNodes: removedNodes,
+      // 抓取那一刻**已经不在 DOM 里**的节点（页面自己的 JS 摘掉的），新的在前，最多 20 条。
+      // 每条 {tag, id, cls, bytes, outerHTMLHead}；outerHTMLHead 是序列化后前 300 字——
+      // 复刻加载/骨架层时这就是那句「它原来长什么样」的唯一来源。
+      // 旧版这里是个数字，数的是抽取时从副本里摘掉的死标签条数，现在叫 deadTagsStripped。
+      removedNodes: removedItems,
+      deadTagsStripped: deadTagsStripped,
       ancestors: ancestors,
       degrade: degrade,
       // frame 盲区：扩展只注入顶层文档，正文装在 iframe 里时抓到的就是空壳。
@@ -1820,6 +1961,10 @@
       report.atRulesUnsupported = { count: st.rulesUnsupported, items: Object.keys(unsupportedKinds).map(function (k) { return unsupportedKinds[k]; }) };
     }
     if (droppedTruncated > 0) report.droppedTruncated = droppedTruncated;
+    // 观察器记的比 20 条多：剩下的只报个数（口径与 droppedTruncated 一致）。
+    if (removedTruncated > 0) report.removedNodesTruncated = removedTruncated;
+    // 没有这个字段 = 观察器跑了；有 = 这一页加载时扩展还没装上/还没更新，抓不到「抓取前消失」的账。
+    if (!removedObserved) report.removedNodesNotObserved = true;
     // includes 已废：传了就记一个布尔 true（口径与其它布尔字段一致——没有这个字段 = 没传），
     // 具体传了什么写在 degrade 那条说明里。产物恒定是 entry + 两份 CSS + 资源落点。
     if (includesIgnored.length) report.includesIgnored = true;
@@ -1832,7 +1977,7 @@
   // （验收脚本用）——不给就没有第二条路能在不重抓页面的前提下验「这条到底算不算占位」。
   globalThis.dshPageCapture = {
     extract: extract, dedupeAtRules: dedupeAtRules,
-    isTemplatePlaceholder: isTemplatePlaceholder, countAnimations: countAnimations,
+    isTemplatePlaceholder: isTemplatePlaceholder, countAnimations: countAnimations, keyframeNames: keyframeNames,
     version: '0.1.0'
   };
 })();

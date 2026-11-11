@@ -35,6 +35,43 @@
 - 拍不到时（权限、窗口被遮挡、截图配额）**不重试、不阻塞**：`report.screenshot.error` 照实写一行，抓取照常完成；
   返回文本里是 `REFERENCE VIEWPORT unavailable: <reason>`，不静默。
 
+## 抓取前就被页面摘掉的节点（report.removedNodes）
+
+抓取发生在**页面加载完之后**的某一刻。加载层、骨架层、入场覆盖层这类东西，页面自己的 JS 在这之前就摘掉了——抓取那一刻它们在 DOM 里根本不存在。实测 panel.solyukimura.top：入场靠 JS 加 `.in`，覆盖层 `.lwrap`/`.lbox` 抓取时已经没了；块照静态页做出来，模型连「原来有这么一层」都不知道。
+
+做法：`removed-watch.js` 由 `manifest.json` 以 `content_scripts` + `run_at: document_start` 注入（`<all_urls>`，只顶层文档），装一个 `MutationObserver`，把**被摘掉的元素节点**压进一个有界环（最多 40 条引用，只存引用不算 outerHTML——摘除时序列化等于给页面每次 DOM 操作加一笔）。抓取时 `extractor.js` 读 `globalThis.__dshRemovedWatch`（内容脚本与 `chrome.scripting.executeScript` 同在扩展的 ISOLATED world，共用一个 `globalThis`），序列化最近的那些：
+
+```
+report.removedNodes = [{ tag, id, cls, bytes, outerHTMLHead }, …]   // 新的在前，最多 20 条
+report.removedNodesTruncated = n                                    // 环里还有 n 条没列出
+report.removedNodesNotObserved = true                               // 这一页加载时观察器还没装（扩展旧版/刚装）
+```
+
+- `outerHTMLHead` 是序列化后**前 300 字**；`bytes` 是整段序列化的 UTF-8 字节数。要复刻加载层，先从这 300 字里把它长什么样读出来。
+- 只报，**不把节点塞回页面**：要不要在块里复刻、用什么动画，是模型在块里该做的决定。`capture_page` 的返回文本因此写一行 `N node(s) were removed from the DOM before this capture: p1, p2, p3`，并给一句「若是加载/骨架层，可以在块里显示并用 CSS 动画模拟，**但必须在差异里说明这是推断**」。
+- 死标签（`script`/`style`/`link`/`meta`/`iframe`/… ）不记：它们本来就没有版式形态可复刻。抽取时从副本里摘掉的死标签条数另有字段 `report.deadTagsStripped`——旧版把它错记成 `removedNodes` 那个数字，两者别混。
+- 代价与边界：装了这个扩展就会在**每个页面**（含非抓取页面）注入一个观察器，只推环、不做任何 DOM 操作；页面在扩展安装/更新**之前**就已打开的，这一页没有观察器（`removedNodesNotObserved`），重载一次页面即恢复。
+
+## 动画的账：会循环、只播一次、还是根本跑不起来
+
+`countAnimations()` 数的是**落盘后那两份 CSS 原文**（不是抽取时的规则条数——`@keyframes` 全被提到 `shared/app.css`）。同一份 counts 同时进 `report` 与 `capture_page` 的文本：
+
+| 字段 | 口径 |
+| --- | --- |
+| `animationCount` | `animation` / `animation-*` 声明条数（一条 shorthand 里逗号分隔的多层算 1 条） |
+| `infiniteCount` | 原文里带 `infinite` 的声明条数（旧的、只管字面） |
+| `oneShotAnimations` | 迭代次数有限、且动画名在产物里找得到的声明条数（没写 `iteration-count` 的默认 1 次，算有限） |
+| `infiniteAnimations` | 会真的无限循环的声明条数（有名字且找得到，否则归 dangling） |
+| `danglingAnimationNames` | 引用的 `animation-name` 在产物里**没有任何 @keyframes** 的声明条数；名字另列在 `danglingAnimationNameSample`（最多 10 个） |
+
+三个桶互斥：`oneShotAnimations + infiniteAnimations + danglingAnimationNames = animationCount`（除非一条声明既写了 `infinite` 又引用了不存在的 keyframes——那种归 dangling，而 `infiniteCount` 仍按字面算它）。
+
+为什么非要分这三个数：实测那次复刻，模型照抄了 loop 用的 `@keyframes`，却把迭代次数漏成一次，每条只播 7 s、可见运动 238–420 ms，整块看起来是静态的。文本里那行现在长这样：
+
+```
+  @keyframes: 26 in shared/app.css, 0 in pages/current/page.css; animations: 49 declarations, 12 with infinite — 37 play once (finite iterations), 12 loop forever (infinite); every animation-name resolves to a captured @keyframes
+```
+
 ## 配
 
 | 项 | 默认 | 说明 |

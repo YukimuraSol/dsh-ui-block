@@ -6,6 +6,9 @@
   "permissions": ["activeTab", "scripting", "storage", "tabs"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["removed-watch.js"], "run_at": "document_start", "all_frames": false }
+  ],
   "action": { "default_title": "dsh-page-capture 选项" },
   "options_ui": { "page": "options.html", "open_in_tab": true },
   "minimum_chrome_version": "116"

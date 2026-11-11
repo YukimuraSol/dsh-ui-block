@@ -7,3 +7,8 @@ dist/
 out/
 accept_out/
 *.vsix
+# local handover notes (never committed) and extension-capture self-check artifacts
+交接-*.md
+extension-capture/out-selfcheck-var*/
+extension-capture/removed-watch.js
+

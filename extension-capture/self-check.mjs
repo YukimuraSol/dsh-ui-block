@@ -288,6 +288,47 @@ const PLACEHOLDER_PAGE = '<!doctype html><html><head><meta charset="utf-8"><titl
   '<p class="ph-anim">动画</p><p class="ph-plain">第二条</p>' +
   '</main></body></html>';
 
+
+// ---- 夹具：抓取前就被页面自己摘掉的节点 -------------------------------------
+// 真实事故：panel.solyukimura.top 的加载覆盖层 .lwrap/.lbox 靠 JS 加 .in 才消失，抓取发生在
+// 加载之后——那一刻 DOM 里根本没有它们。旧 report 只有 removedNodes: 2，而那 2 还是抽取时
+// 从副本里摘掉的 <script>/<style>，模型没有任何依据判断要不要在块里把加载层放回去。
+// 这里用真观察器（removed-watch.js）演同一条路径：页面自己的脚本在加载后 remove() 掉它。
+const REMOVED_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>removed before capture</title>' +
+  '<style>html,body{margin:0}main{padding:24px}' +
+  '.lwrap{position:fixed;inset:0;background:rgba(12,16,24,.72);display:flex;align-items:center;justify-content:center}' +
+  '.lbox{width:220px;height:120px;border-radius:12px;background:#1b2233;color:#cfe1ff;display:flex;align-items:center;justify-content:center;font:14px/1 system-ui}' +
+  '.lwrap.in{opacity:0;pointer-events:none}</style></head><body>' +
+  '<div class="lwrap" id="loader"><div class="lbox">loading</div></div>' +
+  '<main><h1>加载覆盖层</h1><p>这一页的加载层在加载完成后被页面自己摘掉。</p></main>' +
+  '<script>window.addEventListener("load", function () { setTimeout(function () {' +
+    // 先摘 .lbox 再摘 .lwrap：两次摘除各记一条，且「新的在前」这条顺序才有东西可验。
+    'var b = document.querySelector(".lbox"); if (b) b.remove();' +
+    'var a = document.getElementById("loader"); if (a) a.remove();' +
+  '}, 30) })<' + '/script></body></html>';
+// 上限 20 条：25 个骨架块被摘掉 → 列 20 条，removedNodesTruncated 记 5。
+const REMOVED_MANY_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>many removed</title>' +
+  '<style>html,body{margin:0}main{padding:24px}.skel{height:18px;margin:6px 0;background:#eee}</style>' +
+  '</head><body><main><h1>骨架层</h1><div id="skels"></div></main>' +
+  '<script>var box = document.getElementById("skels");' +
+  'for (var i = 0; i < 25; i++) { var d = document.createElement("div"); d.className = "skel s" + i; d.textContent = "skeleton"; box.appendChild(d) }' +
+  'window.addEventListener("load", function () { setTimeout(function () {' +
+  'while (box.firstChild) box.removeChild(box.firstChild)' +
+  '}, 30) })<' + '/script></body></html>';
+
+// ---- 夹具：动画迭代次数（一条 infinite、一条有限、一条指向不存在的 @keyframes）----
+// 真实事故：模型照抄了 loop 用的 @keyframes，却把迭代次数漏成一次，整块看起来静态
+// （每条只播 7 s、可见运动 238-420 ms）。三个数必须正好是 1/1/1，口径才说得清。
+const ANIM_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>animation iteration counts</title>' +
+  '<style>html,body{margin:0}main{padding:24px}' +
+  '@keyframes spinX{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}' +
+  '@keyframes pulseX{0%{opacity:.4}100%{opacity:1}}' +
+  '.a-loop{animation:spinX 1.2s linear infinite}' +
+  '.a-once{animation:pulseX 2s ease-in-out}' +
+  '.a-ghost{animation:missingFrames 1s linear}</style></head><body><main><h1>动画计数</h1>' +
+  '<div class="a-loop">loop</div><div class="a-once">once</div><div class="a-ghost">ghost</div>' +
+  '</main></body></html>';
+
 // ---- 缺陷 B 夹具：一页多张大图，把内嵌总量顶过预算 → 必须有条目从 data: 改判成文件 ----
 const SPILL_PAGE = '<!doctype html><html><head><meta charset="utf-8"><title>inline budget spill</title>' +
   '<style>html,body{margin:0}main{padding:24px}.shot{display:block;width:180px;height:180px;margin:8px 0}</style>' +
@@ -527,6 +568,9 @@ async function main() {
       '/sheets.html': { mime: 'text/html', bytes: Buffer.from(sheetsPage(port2), 'utf8') },
       '/spill.html': { mime: 'text/html', bytes: Buffer.from(SPILL_PAGE, 'utf8') },
       '/placeholder.html': { mime: 'text/html', bytes: Buffer.from(PLACEHOLDER_PAGE, 'utf8') },
+      '/removed.html': { mime: 'text/html', bytes: Buffer.from(REMOVED_PAGE, 'utf8') },
+      '/removed-many.html': { mime: 'text/html', bytes: Buffer.from(REMOVED_MANY_PAGE, 'utf8') },
+      '/anim.html': { mime: 'text/html', bytes: Buffer.from(ANIM_PAGE, 'utf8') },
       // 带查询串的字体：请求时服务端按 ? 截过的 key 找这一条，真字节照发。
       '/static/iconfont.woff': { mime: 'font/woff', bytes: Buffer.alloc(3 * 1024, 0x43) },
     });
@@ -1074,6 +1118,84 @@ async function main() {
       /@keyframes: 1 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 2 declarations, 1 with infinite/.test(phText),
       '那一行=' + JSON.stringify(phText.split(NL).filter((l) => /@keyframes:/.test(l))) +
         '；report 里的数=' + JSON.stringify({ kf: pr.keyframesByFile, an: pr.animationsByFile, c: pr.animationCount, i: pr.infiniteCount }));
+
+
+    // ---- 15m. 抓取前被摘掉的节点：report.removedNodes 是可追溯的清单 ----------
+    // 观察器在真机上由 manifest 的 content_scripts / run_at=document_start 注入；这里用
+    // Page.addScriptToEvaluateOnNewDocument 演同一个时机（新文档一建立就装），页面自己的
+    // 脚本随后才摘掉节点——抽取函数在抓取那一刻读的是观察器留下的历史。
+    const watchSrc = readFileSync(path.join(HERE, 'removed-watch.js'), 'utf8');
+    const watchReg = await s.send('Page.addScriptToEvaluateOnNewDocument', { source: watchSrc });
+    let rmRun;
+    let manyRun;
+    try {
+      await cdp.navigate(s, hostA + '/removed.html', { settle: 400 });
+      const injRm = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+      if (injRm.exceptionDetails) throw new Error('removed 页注入 extractor 失败：' + JSON.stringify(injRm.exceptionDetails));
+      await installBgSeam(s, cdp);
+      rmRun = await runExtract(s, { origin: hostA + '/removed.html' });
+      await cdp.navigate(s, hostA + '/removed-many.html', { settle: 400 });
+      const injMany = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+      if (injMany.exceptionDetails) throw new Error('removed-many 页注入 extractor 失败：' + JSON.stringify(injMany.exceptionDetails));
+      await installBgSeam(s, cdp);
+      manyRun = await runExtract(s, { origin: hostA + '/removed-many.html' });
+    } finally {
+      // 后面还有夹具要用同一台浏览器：这个「新文档就装观察器」的脚本必须摘掉，
+      // 否则别的夹具的 report 会多出与它们无关的 removedNodes。
+      if (watchReg && watchReg.identifier) {
+        await s.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: watchReg.identifier }).catch(() => {});
+      }
+    }
+    const rmItems = Array.isArray(rmRun.report.removedNodes) ? rmRun.report.removedNodes : [];
+    const rmHead = rmItems.map((it) => ({ tag: it.tag, id: it.id, cls: it.cls, bytes: it.bytes, head: String(it.outerHTMLHead).slice(0, 60) }));
+    assert('移除节点夹具：页面加载后 remove() 掉的 .lwrap/.lbox 进 report.removedNodes —— 清单（不是数字），newest first，每条带 tag/id/cls/bytes/outerHTMLHead(≤300)',
+      Array.isArray(rmRun.report.removedNodes) && rmItems.length === 2 &&
+        rmItems[0].tag === 'div' && rmItems[0].cls === 'lwrap' && rmItems[0].id === 'loader' &&
+        rmItems[0].outerHTMLHead.indexOf('<div class="lwrap" id="loader">') === 0 &&
+        rmItems[1].tag === 'div' && rmItems[1].cls === 'lbox' && rmItems[1].outerHTMLHead.indexOf('<div class="lbox">loading</div>') === 0 &&
+        rmItems.every((it) => typeof it.outerHTMLHead === 'string' && it.outerHTMLHead.length <= 300 && Number(it.bytes) >= it.outerHTMLHead.length) &&
+        rmRun.report.removedNodesTruncated === undefined && rmRun.report.removedNodesNotObserved === undefined &&
+        typeof rmRun.report.deadTagsStripped === 'number',
+      'report.removedNodes=' + JSON.stringify(rmHead) + '；removedNodesTruncated=' + String(rmRun.report.removedNodesTruncated) +
+        '；removedNodesNotObserved=' + String(rmRun.report.removedNodesNotObserved) + '；deadTagsStripped=' + rmRun.report.deadTagsStripped);
+    const rmText = textOf(rmRun, path.join(HERE, 'out-selfcheck-removed'), 'fixture-removed').text;
+    const rmLine = rmText.split(NL).filter((l) => /were removed from the DOM before this capture/.test(l));
+    assert('移除节点夹具：capture_page 文本一行点名被移除的节点（tag.cls），并给「可在块里模拟、但必须在差异里说明这是推断」的指引',
+      rmLine.length === 1 && /^2 node\(s\) were removed from the DOM before this capture: div#loader\.lwrap, div\.lbox\. Each entry has tag \/ id \/ cls \/ bytes/.test(rmLine[0]) &&
+        /say in your diff that this is inferred/.test(rmText) && /drive it with a CSS animation/.test(rmText),
+      '那一行=' + JSON.stringify(rmLine) + '；指引行=' +
+        JSON.stringify(rmText.split(NL).filter((l) => /this is inferred/.test(l))));
+    const manyItems = Array.isArray(manyRun.report.removedNodes) ? manyRun.report.removedNodes : [];
+    assert('移除节点夹具：超过 20 条只列 20 条，剩下的记在 removedNodesTruncated（25 摘掉 → 20 列 + 5 未列）',
+      manyItems.length === 20 && Number(manyRun.report.removedNodesTruncated) === 5 &&
+        manyItems.every((it) => it.cls.indexOf('skel') === 0),
+      '列出的 ' + manyItems.length + ' 条（最新那条 cls=' + (manyItems[0] || {}).cls + '）；removedNodesTruncated=' + String(manyRun.report.removedNodesTruncated));
+
+    // ---- 15n. 动画迭代次数：oneShot / infinite / dangling 三个数 ---------------
+    // 真实事故：模型照抄了 loop 的 @keyframes 却漏了 infinite，每条只播一次 7 s、可见运动
+    // 238–420 ms，整块看起来静态。三个数各为 1 才说明口径分得清（一条 infinite、一条有限、
+    // 一条指向产物里不存在的 @keyframes）。
+    await cdp.navigate(s, hostA + '/anim.html', { settle: 300 });
+    const injAnim = await s.send('Runtime.evaluate', { expression: srcText, returnByValue: false });
+    if (injAnim.exceptionDetails) throw new Error('anim 页注入 extractor 失败：' + JSON.stringify(injAnim.exceptionDetails));
+    await installBgSeam(s, cdp);
+    const animRun = await runExtract(s, { origin: hostA + '/anim.html' });
+    const ar = animRun.report;
+    assert('动画夹具：一条 infinite、一条有限、一条指向不存在的 @keyframes → oneShotAnimations / infiniteAnimations / danglingAnimationNames 各 1',
+      ar.animationCount === 3 && ar.infiniteCount === 1 &&
+        ar.oneShotAnimations === 1 && ar.infiniteAnimations === 1 &&
+        ar.danglingAnimationNames === 1 && JSON.stringify(ar.danglingAnimationNameSample) === '["missingFrames"]' &&
+        ar.oneShotAnimations + ar.infiniteAnimations + ar.danglingAnimationNames === ar.animationCount,
+      'animationCount=' + ar.animationCount + ' infiniteCount=' + ar.infiniteCount +
+        ' oneShotAnimations=' + ar.oneShotAnimations + ' infiniteAnimations=' + ar.infiniteAnimations +
+        ' danglingAnimationNames=' + ar.danglingAnimationNames + ' sample=' + JSON.stringify(ar.danglingAnimationNameSample));
+    const animText = textOf(animRun, path.join(HERE, 'out-selfcheck-anim'), 'fixture-anim').text;
+    const animLine = animText.split(NL).filter((l) => /@keyframes:/.test(l));
+    assert('动画夹具：文本那行后面带上两个数（有限 / 无限）与 dangling 数',
+      animLine.length === 1 &&
+        /@keyframes: 2 in shared\/app\.css, 0 in pages\/current\/page\.css; animations: 3 declarations, 1 with infinite — 1 play once \(finite iterations\), 1 loop forever \(infinite\); 1 animation-name reference\(s\) point at @keyframes that are NOT in this capture \(missingFrames\)/.test(animLine[0]) &&
+        /A looping animation stays infinite in your copy/.test(animText),
+      '那一行=' + JSON.stringify(animLine));
 
     // ---- 15l. 变量作用域：站内变量原样保留、逐元素生效 ------------------------
     // 真实事故（pintia 考试页）：「保存」按钮在真站是 rgb(62,126,234)，抓下来是

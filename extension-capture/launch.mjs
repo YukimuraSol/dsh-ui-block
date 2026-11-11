@@ -266,6 +266,9 @@ async function main() {
 
   const args = [
     '--headless=new',
+    // 本机实测：不加 --no-sandbox，无头 Chromium 起来就退，调试端口一直不应答
+    // （与 tools/cdp.mjs 里同一条实测结论、同一个参数）。
+    '--no-sandbox',
     '--disable-gpu',
     '--no-first-run',
     '--no-default-browser-check',
