@@ -2075,22 +2075,29 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           var win = state.frame.contentWindow;
           if (win) { win.postMessage({ type: 'dsh:replay' }, '*'); posted = true; }
         } catch (e) { posted = false; /* a frame that never loaded has no window */ }
-        if (state.urlMode) {
-          // Assigning the same src again is not a guaranteed navigation: the
-          // counter makes it a different URL, and nothing else reads it.
-          state.replays = (state.replays || 0) + 1;
-          var url = entryUrl(state);
-          state.frame.setAttribute('src', url + (url.indexOf('?') < 0 ? '?' : '&') + 'replay=' + state.replays);
-          return { posted: posted, mode: 'url', replays: state.replays };
-        }
-        // srcdoc: remove then write it back, so this really is a re-parse
-        // (re-setting an identical value is not relied upon). Both happen in
-        // one task, so nothing repaints in between; buildSrcdoc reads the live
-        // token sheet, exactly like the first paint did.
-        var html = buildSrcdoc(state, tokenCache);
-        state.frame.removeAttribute('srcdoc');
-        state.frame.setAttribute('srcdoc', html);
-        return { posted: posted, mode: 'srcdoc' };
+        // The reload goes one task later ON PURPOSE. postMessage only queues the
+        // message; tearing the document down in the same tick would throw it
+        // away before the block ever saw it. Queued first, delivered first.
+        var reload = function () {
+          if (!state.frame || !state.frame.isConnected) return;
+          if (state.urlMode) {
+            // Assigning the same src again is not a guaranteed navigation: the
+            // counter makes it a different URL, and nothing else reads it.
+            state.replays = (state.replays || 0) + 1;
+            var url = entryUrl(state);
+            state.frame.setAttribute('src', url + (url.indexOf('?') < 0 ? '?' : '&') + 'replay=' + state.replays);
+            return;
+          }
+          // srcdoc: remove then write it back, so this really is a re-parse
+          // (re-setting an identical value is not relied upon). Both happen in
+          // one task, so nothing repaints in between; buildSrcdoc reads the live
+          // token sheet, exactly like the first paint did.
+          var html = buildSrcdoc(state, tokenCache);
+          state.frame.removeAttribute('srcdoc');
+          state.frame.setAttribute('srcdoc', html);
+        };
+        window.setTimeout(reload, 0);
+        return { posted: posted, mode: state.urlMode ? 'url' : 'srcdoc' };
       }
       function relayout(state) {
         applySize(state);
@@ -2557,7 +2564,14 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       }
       /** True for text the page must never read: a code block or a text editor. */
       function isPageChrome(node) {
-        return node.closest('[contenteditable="true"], [data-lexical-editor], pre, code') !== null;
+        if (node.closest('[contenteditable="true"], [data-lexical-editor], pre, code') !== null) return true;
+        // A paragraph whose whole text sits inside an inline <code> (or a <pre>)
+        // is markup that QUOTES a directive line, not one that asks for a block:
+        // that is the same intent as a fence, so it gets the same answer. Text
+        // like `文字 <code>::dsh-ui x::</code> 文字` already failed the parser;
+        // this closes the case where the code element is the only content, whose
+        // textContent still equals the line exactly.
+        return node.querySelector('code, pre') !== null;
       }
       /** Drop a state's window-level gesture listeners (safe to call twice). */
       function unbindPan(state) {

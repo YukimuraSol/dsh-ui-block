@@ -200,6 +200,19 @@ HTML Element: <button id="lbtn" class="cta" data-role="primary">实时按钮</bu
 - `«` / `»` / 反斜杠按 element-picker 的规则转义，保证第一个裸闭合书名号永远是 token 结尾。
 - **Styles 行已删**（与 element-picker 同步，token 现在是 3 行）。
 
+## 重播按钮（2026-11-11）
+
+**问题**：块里的动画是**一次性**的（`iterations=1`），播完停在终态，用户任何时候看都是静态的。**不改成循环**——那等于改原站的效果。
+
+分辨率与选区图标**右边**再一颗 13×13 图标：断开的圆 + 箭头 + 一个实心小三角（「再播一遍」，不是「刷新整页」）。按一下做两件事：
+
+1. 先往块里 `postMessage({ type: 'dsh:replay' })`（`targetOrigin: '*'`，消息里没有秘密）；有监听者可以在这时复位自己的状态，没有就什么也不发生。
+2. 一个任务之后（`setTimeout(…, 0)`）重新加载 entry：srcdoc 块 `removeAttribute('srcdoc')` 再写回；分段块重设 `src`，带一个只这一下用的 `replay=N` 参数。块里所有 CSS 动画与过渡从头播，**时序一个字节都不改**。
+
+重载必须晚于消息：同一个 tick 里换文档会把这条消息连同旧文档一起丢掉（实测踩过，`setTimeout(…, 0)` 之后正常）。演示块不挂这颗按钮（已有 播放 / 暂停 / 重新开始），尺寸、缩放、sandbox 都不动。
+
+**消息现在到不了块里的脚本**：块是 script-inert 的（iframe `sandbox="allow-same-origin"`、文档 CSP `script-src 'none'`），块内 `<script>` 不执行。这条消息是「将来块能带脚本」时的接口，不是重播的依赖——现在真正让动画重播的是重新加载 entry。测试接缝：`window.__dshPageBlock.replay(i)`。
+
 ## 演示块：宿主驱动的时间轴（2026-11-09，路线 1）
 
 **效果：** 块文件里多一份 `<!-- @@file demo.json -->` 段（内容是 `{ snapshots, timeline }`）时，这个块变成**演示块**：块本身仍是纯数据（沙箱不变、帧仍 `pointer-events:none`），由插件在外层把时间轴演给块看——光标、高亮、合成点击、切页（换快照）、逐字输入都由宿主完成。

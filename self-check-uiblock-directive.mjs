@@ -988,6 +988,101 @@ await ta('the @keyframes line carries one-shot vs infinite and the dangling name
   assert.match(rmTextOut, /animations: 3 declarations, 1 with infinite — 2 play once \(finite iterations\), 1 loop forever \(infinite\); 1 animation-name reference\(s\) point at @keyframes that are NOT in this capture \(missingFrames\), so those declarations never run/)
   assert.match(rmTextOut, /A looping animation stays infinite in your copy/)
 })
+// ---------------------------------------------------------------------------
+// 20. 重播按钮：一次性动画不改成循环，按一下把 entry 重新加载一遍。
+// 真实诉求（2026-11-11）：块里的动画 getAnimations() 全部 running 但 iterations=1，
+// 播完停在终态，用户任何时候看都是静态的。修法不是把动画改成 infinite（那是改原站
+// 效果），而是在卡片外壳上加一颗重播按钮：先发 dsh:replay 消息，再重新加载 entry。
+// 这一节钉住四条不能漂的东西：按钮在 buildControls 里、消息在重载之前、重载延后一个
+// 任务（同一个 tick 换文档会把消息丢掉）、sandbox 没被放宽成 allow-scripts。
+// ---------------------------------------------------------------------------
+console.log('--- 20. the replay button reloads the entry after one dsh:replay message ---')
+const fnAt = (name) => source.indexOf('function ' + name + '(')
+const sliceBetween = (from, to) => {
+  const a = source.indexOf(from)
+  if (a < 0) return ''
+  const b = source.indexOf(to, a + from.length)
+  return b < 0 ? source.slice(a) : source.slice(a, b)
+}
+const replayBody = sliceBetween('function replayBlock(state) {', 'function relayout(state) {')
+const controlsBody = sliceBetween('function buildControls(state) {', '// Map-viewport gestures.')
+t('replayBlock() exists and replayBlock is reachable from the banner controls', () => {
+  assert.ok(fnAt('replayBlock') > 0, 'no replayBlock() in client.js')
+  assert.match(controlsBody, /replayButton\.className = 'dshpb-btn dshpb-replay'/)
+  assert.match(controlsBody, /replayBlock\(state\)/, 'the button does not call replayBlock')
+  assert.match(controlsBody, /controls\.appendChild\(replayButton\)/, 'the button is built but never mounted')
+})
+t('the message goes out BEFORE the reload, and the reload waits one task', () => {
+  const post = replayBody.indexOf("postMessage({ type: 'dsh:replay' }")
+  const defer = replayBody.indexOf('window.setTimeout(reload, 0)')
+  assert.ok(post > 0, 'no dsh:replay postMessage')
+  assert.ok(defer > post, 'the reload is not queued after the message')
+  assert.match(replayBody, /postMessage\(\{ type: 'dsh:replay' \}, '\*'\)/)
+  // 同一个 tick 里换文档会把这条消息连同旧文档一起丢掉：重载必须在 reload 闭包里延后。
+  const reloadFn = replayBody.indexOf('var reload = function ()')
+  assert.ok(reloadFn > 0 && reloadFn < defer, 'the reload must live in the deferred closure')
+})
+t('both document kinds reload, and nothing else about the block changes', () => {
+  // srcdoc：去掉再写回去，保证真的重新解析
+  assert.match(replayBody, /removeAttribute\('srcdoc'\)/)
+  assert.match(replayBody, /setAttribute\('srcdoc', html\)/)
+  // 服务端地址：同一个 src 再赋一次不保证重新导航，所以带一个只这一下用的计数
+  assert.match(replayBody, /'replay=' \+ state\.replays/)
+  // 不给块的渲染加任何参数
+  assert.doesNotMatch(replayBody, /state\.res =|state\.zoom =|setAttribute\('width'|setAttribute\('height'/)
+})
+t('the sandbox is not widened, and a demo block gets no replay button', () => {
+  assert.match(replayBody, /if \(state\.demoSpec\) return null/)
+  assert.match(controlsBody, /if \(!state\.demoSpec\) \{/)
+  // allow-scripts 只允许出现在注释里（文档在讲「为什么不能加」），代码里一次都不许有：
+  // 与 allow-same-origin 同时给等于没有沙箱，块里的脚本就能摸到聊天页。
+  assert.doesNotMatch(source, /setAttribute\(\s*'sandbox'\s*,\s*'[^']*allow-scripts/)
+  const sandboxes = source.match(/setAttribute\('sandbox'/g) || []
+  assert.equal(sandboxes.length, 2, 'both canvases (block iframe + player iframe) declare a sandbox')
+  assert.match(source, /frame\.setAttribute\('sandbox', 'allow-same-origin'\)/)
+  assert.match(source, /iframe\.setAttribute\('sandbox', 'allow-same-origin'\)/)
+})
+t('the icon and the tooltip say "replay", not "reload the page"', () => {
+  assert.match(controlsBody, /aria-label', '重播块内动画'/)
+  assert.match(controlsBody, /replayButton\.title = '重播：重新加载画布，让动画与过渡从头再播一遍（不改成循环）'/)
+  assert.match(controlsBody, /dshpb-tri/, 'the play triangle inside the circle is what tells it apart from a refresh')
+  assert.match(source, /\.dshpb-pick,\.dshpb-replay\{padding:1px 5px/)
+  assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
+})
+t('the test seam calls the same function the button does', () => {
+  assert.match(source, /replay: function \(index\) \{ var s = live\[index \|\| 0\]; if \(!s\) return null; return replayBlock\(s\); \}/)
+})
+t('create_ui_block says the banner has a replay button and what the message means', () => {
+  const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
+  assert.match(create, /REPLAY: the card\\'s banner carries one more button/)
+  assert.match(create, /sends \{ type: "dsh:replay" \} into the block and then loads the entry again/)
+  assert.match(create, /a one-shot animation stays one-shot/)
+  // 块仍然是 script-inert 的：描述必须说「别依赖块内脚本」，否则模型会写出跑不起来的代码。
+  assert.match(create, /script-inert by default/)
+})
+
+// ---------------------------------------------------------------------------
+// 21. 引用了指令的那段代码不算指令：段落里只要出现 <code> / <pre> 就不渲染。
+// 反向用例（既有缺陷，2026-11-11 报出）：整段只有一个行内代码、内容正好是
+// ::dsh-ui x:: 时，textContent 去掉反引号后仍逐字匹配 → 被渲染成块。围栏里不会
+// （closest 命中 pre），行内还有别的字也不会（整行不是指令）——只有「唯一内容是
+// 行内代码」这一格漏了。判据放进 isPageChrome()，sweep() 与 refIndexIn() 同用，
+// 所以两边的座位编号不会因此错位。
+// ---------------------------------------------------------------------------
+console.log('--- 21. a directive quoted in inline code is not a directive ---')
+const chromeBody = sliceBetween('function isPageChrome(node) {', '/** Drop a state')
+t('isPageChrome rejects an ancestor code block AND a code element inside the paragraph', () => {
+  assert.ok(chromeBody.length > 0, 'isPageChrome() not found')
+  assert.match(chromeBody, /node\.closest\('\[contenteditable="true"\], \[data-lexical-editor\], pre, code'\) !== null\) return true/)
+  assert.match(chromeBody, /return node\.querySelector\('code, pre'\) !== null/)
+})
+t('both readers use it, so a skipped paragraph is skipped in the index too', () => {
+  const sweepBody = sliceBetween('function sweep() {', 'function chatNodeOf(')
+  assert.match(sweepBody, /if \(isPageChrome\(node\)\) continue/)
+  const indexBody = sliceBetween('function refIndexIn(host, lineNode) {', 'function pinOf(')
+  assert.match(indexBody, /if \(isPageChrome\(node\)\) continue/)
+})
+
 rmSync(home, { recursive: true, force: true })
 
 console.log('\nself-check-uiblock-directive: ' + n + ' assertions passed')
