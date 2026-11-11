@@ -538,6 +538,61 @@
       walkUp = walkUp.parentElement;
     }
 
+    // 1.9) 取字节的两个通道先就位：跨域样式表要在第 2 步之前取回来（规则管道本身是同步的）。
+    // 内容脚本跑在页面里，取跨域图片/字体受页面 CORS 限制（logo、app-fold.svg、
+    // no-application.png 就是这么 Failed to fetch 的）；service worker 带 all_urls 主机权限，
+    // 同样的 URL 在那里 fetch 是 200，所以字节一律走这条路取。
+    /**
+     * 取字节：交给扩展后台的 service worker（background.js 的 'dsh-capture-fetch'），它带
+     * all_urls 主机权限，跨域资源不受页面 CORS 限制——页面里 fetch 拿不到的 logo/svg/png
+     * 就是死在这一步。没有后台可用时（离线自检的宿主页面）退回页面自身的 fetch。
+     * maxBytes：走后台时的单条上限；缺省沿用 MAX_FETCH_BYTES，样式表那条按 16MB 传。
+     */
+    var bgFetch = function (absu, maxBytes) {
+      var capture = globalThis.dshPageCapture;
+      if (capture && typeof capture.fetchBytes === 'function') return Promise.resolve(capture.fetchBytes(absu, { maxBytes: maxBytes || 0 }));
+      if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        return new Promise(function (res, rej) {
+          try {
+            chrome.runtime.sendMessage({ type: 'dsh-capture-fetch', url: absu, maxBytes: maxBytes || 0 }, function (r) {
+              var err = chrome.runtime.lastError;
+              if (err) { rej(new Error('后台没有应答：' + err.message)); return; }
+              if (!r) { rej(new Error('后台没有应答')); return; }
+              if (r.ok === false) { rej(new Error(String(r.error || '后台取字节失败'))); return; }
+              res(r);
+            });
+          } catch (e) { rej(new Error('调后台失败：' + String(e && e.message || e))); }
+        });
+      }
+      return null;
+    };
+
+    var fetchOne = async function (absu, maxBytes) {
+      var cap = Number(maxBytes) > 0 ? Number(maxBytes) : MAX_FETCH_BYTES;
+      if (absu.slice(0, 5).toLowerCase() === 'data:') {
+        var meta = splitDataUri(absu);
+        if (!meta) throw new Error('坏 data: URI');
+        var bytes;
+        if (meta.base64 !== null) bytes = fromBase64(meta.base64);
+        else bytes = new TextEncoder().encode(decodeURIComponent(absu.slice(absu.indexOf(',') + 1)));
+        return { bytes: bytes, mime: meta.mime, rawLen: meta.bytes, via: 'data' };
+      }
+      var fromBg = bgFetch(absu, cap);
+      if (fromBg) {
+        var r = await fromBg;
+        var u8 = (r && r.bytes instanceof Uint8Array) ? r.bytes : fromBase64(String((r && r.base64) || ''));
+        if (!u8 || !u8.length) throw new Error('后台回的是空字节');
+        if (u8.length > cap) throw new Error('超过单条上限 ' + Math.round(cap / 1048576) + 'MB');
+        return { bytes: u8, mime: String((r && r.mime) || '').split(';')[0].trim() || guessMime(absu), rawLen: u8.length, via: 'background' };
+      }
+      var f = (win.fetch ? win.fetch.bind(win) : fetch);
+      var res = await f(absu, { credentials: 'include' });
+      if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
+      var buf = new Uint8Array(await res.arrayBuffer());
+      var ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
+      return { bytes: buf, mime: ct || guessMime(absu), rawLen: buf.length, via: 'page' };
+    };
+
     // 2) 命中样式表：规则原文，死选择器丢掉（整条列表一个都不匹配就丢这条规则）
     var STATE = /:(hover|focus-visible|focus-within|focus|active|visited|target|checked|indeterminate|disabled|enabled|read-only|read-write|placeholder-shown|default|required|optional|valid|invalid|in-range|out-of-range|user-invalid|user-valid|autofill|open|popover-open|modal|fullscreen|picture-in-picture|playing|paused|muted|seeking|buffering|stalled|defined|link|any-link|local-link|scope)\b/gi;
     var PSEUDO_EL = /::?(before|after|marker|placeholder|selection|first-line|first-letter|backdrop|file-selector-button|cue|highlight)\b/gi;
@@ -633,17 +688,148 @@
         }
       }
     };
+    // ---- 跨域样式表：字节从后台取回来，自己解析 ------------------------------
+    // 同源策略挡的是页面脚本（读 sheet.cssRules 抛 SecurityError），不挡扩展后台：它带
+    // all_urls 主机权限，fetch(href) 就是 200。拿回正文后用 CSSStyleSheet.replaceSync 解析成
+    // 一张真表，选择器重写、层叠顺序、死选择器探针全走原管道——只记一条 dropped 等于放弃
+    // 这张表里的版式（真实事故：pure-drawer.css 里的 position/transform 没固化，抽屉停在
+    // x=-334，它的 .drawer-header 正好盖住左上角图标位）。
+    var MAX_IMPORT_DEPTH = 3;
+    var bgSheets = new Map();   // 原 sheet → { sheets: [CSSStyleSheet…] }（按层叠顺序排好）
+    var bgSheetLog = [];        // report.sheetsFetchedViaBackground.items
+
+    /**
+     * 摘掉 CSS 注释再做 @import / url() 扫描。实测（真·跨域夹具）：注释里写着「@import url(...)」
+     * 的一句说明，会被当成真的 @import 去取——多一次无谓的 fetch、多一条 404、多一行 dropped。
+     * 引号里的注释起始符不算注释（content:"/*" 这种），所以按字符走，认得字符串与反斜杠转义。
+     */
+    var stripCssComments = function (css) {
+      var s = String(css), out = '', i = 0, quote = '';
+      while (i < s.length) {
+        var ch = s.charAt(i), nx = s.charAt(i + 1);
+        if (quote) {
+          out += ch;
+          if (ch === '\\' && i + 1 < s.length) { out += nx; i += 2; continue; }
+          if (ch === quote) quote = '';
+          i++;
+          continue;
+        }
+        if (ch === '"' || ch === "'") { quote = ch; out += ch; i++; continue; }
+        if (ch === '/' && nx === '*') {
+          var end = s.indexOf('*/', i + 2);
+          i = end < 0 ? s.length : end + 2;
+          continue;
+        }
+        out += ch; i++;
+      }
+      return out;
+    };
+
+    /** 跨域表里的相对 url() / @import 按它自己的地址解析，别拿页面的 base 当基准。 */
+    var rebaseCss = function (text, sheetUrl) {
+      var rebase = function (u) {
+        var t = String(u).trim();
+        if (!t || t.charAt(0) === '#' || /^(data:|https?:|\/\/|blob:|about:)/i.test(t)) return t;
+        return absUrl(t, sheetUrl) || t;
+      };
+      return String(text)
+        .replace(/(@import\s+(?:url\(\s*)?)(['"])([^'"]+)\2/gi, function (m, head, q, u) { return head + q + rebase(u) + q; })
+        .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (m, q, u) { return 'url(' + q + rebase(u) + q + ')'; });
+    };
+
+    /** 解析一张表：@import 已经摘掉（replaceSync 不允许正文里带 @import）。 */
+    var parseCssText = function (text) {
+      if (typeof CSSStyleSheet === 'undefined') return null;
+      try { var sh = new CSSStyleSheet(); sh.replaceSync(String(text)); return sh; } catch (e) { return null; }
+    };
+
+    /** 取一张跨域表的正文：失败重试一次即止（网络抖一下不该整张表作废）。 */
+    var fetchSheetText = async function (href) {
+      var last = null;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+          var got = await fetchOne(href, MAX_ASSET_BYTES);
+          if (got.rawLen > MAX_ASSET_BYTES) throw new Error('超单条上限 ' + MAX_ASSET_MB);
+          var text = new TextDecoder('utf-8').decode(got.bytes);
+          return { text: text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text, bytes: got.rawLen };
+        } catch (e) { last = e; }
+      }
+      throw last;
+    };
+
+    /**
+     * 取回一张跨域表：@import 先递归展开（最多 MAX_IMPORT_DEPTH 层，成环即止），再解析本文。
+     * 返回按层叠顺序排好的 CSSStyleSheet 数组；一张都没取到就返回空（调用方退回 dropped）。
+     */
+    var loadRemoteSheet = async function (href, depth, chain) {
+      chain = chain || [];
+      if (chain.indexOf(href) >= 0) { drop('@import 成环，不再取：' + href); return []; }
+      if (depth > MAX_IMPORT_DEPTH) { drop('@import 超过 ' + MAX_IMPORT_DEPTH + ' 层，不再取：' + href); return []; }
+      var got;
+      try { got = await fetchSheetText(href); } catch (e) {
+        drop('读不到样式表（跨域）：' + href + '（后台取字节失败：' + String((e && e.message) || e).slice(0, 90) + '）');
+        return [];
+      }
+      bgSheetLog.push({ href: href, bytes: got.bytes });
+      var text = rebaseCss(stripCssComments(got.text), href);
+      var imports = [];
+      text = text.replace(/@import\s+(?:url\(\s*)?(?:\"([^\"]*)\"|'([^']*)'|([^'\")\s;]+))\s*\)?([^;]*);/gi, function (m, a, b, c) {
+        var u = a || b || c || '';
+        if (u) imports.push(u);
+        return '';
+      });
+      var out = [];
+      // @import 带来的表在层叠上排在本文之前（CSS 规定 @import 必须在最前面）
+      for (var i = 0; i < imports.length; i++) {
+        var absu = absUrl(imports[i], href) || imports[i];
+        var sub = /^https?:/i.test(absu) ? await loadRemoteSheet(absu, depth + 1, chain.concat([href])) : [];
+        for (var j = 0; j < sub.length; j++) out.push(sub[j]);
+      }
+      var own = parseCssText(text);
+      if (own) out.push(own);
+      else drop('跨域样式表取回后解析不了，已退回：' + href);
+      return out;
+    };
+
+    /** 页面上读不到 cssRules 的那些样式表逐张取回来（只对 http/https 取）。 */
+    var prefetchCrossOrigin = async function (list) {
+      for (var i = 0; i < list.length; i++) {
+        var sh = list[i];
+        if (!sh || bgSheets.has(sh) || seen.indexOf(sh) >= 0) continue;
+        var href = String(sh.href || '');
+        if (!href || !/^https?:/i.test(href)) continue;
+        var readable = true;
+        try { readable = !!sh.cssRules; } catch (e) { readable = false; }
+        if (readable) continue;
+        var got = await loadRemoteSheet(absUrl(href, base) || href, 0, []);
+        if (got.length) bgSheets.set(sh, { sheets: got });
+      }
+    };
+
     var walkSheet = function (sheet) {
       if (!sheet || seen.indexOf(sheet) >= 0) return;
       seen.push(sheet);
       var rules;
-      try { rules = sheet.cssRules; } catch (e) { st.sheetsFailed++; drop('读不到样式表（跨域）：' + (sheet.href || 'inline')); return; }
+      try { rules = sheet.cssRules; } catch (e) {
+        // 跨域：后台取回的那份已经解析好放在 bgSheets 里，按这条样式表原来的位置接进管道。
+        var bg = bgSheets.get(sheet);
+        if (!bg) {
+          st.sheetsFailed++;
+          // 取字节时已经记过一条（同一条 href），别让 report 里同一张表出现两行
+          var plain = '读不到样式表（跨域）：' + (sheet.href || 'inline');
+          if (!dropped.some(function (d) { return d.indexOf(plain) === 0; })) drop(plain);
+          return;
+        }
+        for (var b = 0; b < bg.sheets.length; b++) { st.sheets++; walkRules(bg.sheets[b].cssRules); }
+        return;
+      }
       if (!rules) return;
       st.sheets++;
       walkRules(rules);
     };
     var sheets = Array.prototype.slice.call(doc.styleSheets || []);
     if (doc.adoptedStyleSheets) sheets = sheets.concat(Array.prototype.slice.call(doc.adoptedStyleSheets));
+    await prefetchCrossOrigin(sheets);
     for (var si = 0; si < sheets.length; si++) walkSheet(sheets[si]);
 
     // 3) 元素计算样式：给子树每个元素挂 data-dsh-el，把关键属性固化成规则
@@ -698,6 +884,7 @@
         for (var lx = 0; lx < lkEls.length; lx++) { if (lkEls[lx].sheet) sheetList.push(lkEls[lx].sheet); }
         if (sroot.adoptedStyleSheets) sheetList = sheetList.concat(Array.prototype.slice.call(sroot.adoptedStyleSheets));
       } catch (e) { drop('读不到 shadow root 的样式表：' + String((e && e.message) || e)); }
+      await prefetchCrossOrigin(sheetList);
       var keptBefore = st.rulesKept;
       probeRoot = sroot;
       shadowPrefix = '[data-dsh-shadow="' + shadowHosts[hs].scope + '"]';
@@ -912,54 +1099,7 @@
       String(stv).replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (m, q, u) { addUrl(u); return m; });
     });
 
-    /**
-     * 取字节：交给扩展后台的 service worker（background.js 的 'dsh-capture-fetch'），它带
-     * all_urls 主机权限，跨域资源不受页面 CORS 限制——页面里 fetch 拿不到的 logo/svg/png
-     * 就是死在这一步。没有后台可用时（离线自检的宿主页面）退回页面自身的 fetch。
-     */
-    var bgFetch = function (absu) {
-      var capture = globalThis.dshPageCapture;
-      if (capture && typeof capture.fetchBytes === 'function') return Promise.resolve(capture.fetchBytes(absu));
-      if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
-        return new Promise(function (res, rej) {
-          try {
-            chrome.runtime.sendMessage({ type: 'dsh-capture-fetch', url: absu }, function (r) {
-              var err = chrome.runtime.lastError;
-              if (err) { rej(new Error('后台没有应答：' + err.message)); return; }
-              if (!r) { rej(new Error('后台没有应答')); return; }
-              if (r.ok === false) { rej(new Error(String(r.error || '后台取字节失败'))); return; }
-              res(r);
-            });
-          } catch (e) { rej(new Error('调后台失败：' + String(e && e.message || e))); }
-        });
-      }
-      return null;
-    };
-
-    var fetchOne = async function (absu) {
-      if (absu.slice(0, 5).toLowerCase() === 'data:') {
-        var meta = splitDataUri(absu);
-        if (!meta) throw new Error('坏 data: URI');
-        var bytes;
-        if (meta.base64 !== null) bytes = fromBase64(meta.base64);
-        else bytes = new TextEncoder().encode(decodeURIComponent(absu.slice(absu.indexOf(',') + 1)));
-        return { bytes: bytes, mime: meta.mime, rawLen: meta.bytes, via: 'data' };
-      }
-      var fromBg = bgFetch(absu);
-      if (fromBg) {
-        var r = await fromBg;
-        var u8 = (r && r.bytes instanceof Uint8Array) ? r.bytes : fromBase64(String((r && r.base64) || ''));
-        if (!u8 || !u8.length) throw new Error('后台回的是空字节');
-        if (u8.length > MAX_FETCH_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(MAX_FETCH_BYTES / 1048576) + 'MB');
-        return { bytes: u8, mime: String((r && r.mime) || '').split(';')[0].trim() || guessMime(absu), rawLen: u8.length, via: 'background' };
-      }
-      var f = (win.fetch ? win.fetch.bind(win) : fetch);
-      var res = await f(absu, { credentials: 'include' });
-      if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status : '?'));
-      var buf = new Uint8Array(await res.arrayBuffer());
-      var ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
-      return { bytes: buf, mime: ct || guessMime(absu), rawLen: buf.length, via: 'page' };
-    };
+    // （bgFetch / fetchOne 已提到第 1.9 步：跨域样式表要在规则管道跑起来之前取回来。）
 
     var kbOf = function (n) { return Math.round(n / 1024) + 'KB'; };
 
@@ -1327,6 +1467,9 @@
     // 空壳标记：只在这一种情况下出现（与 hiddenTab / includesIgnored 同一口径——
     // 没有这个字段 = 没发生），调用方看到它就该把「正文在框里」直接说出来。
     if (frameShell) report.frameShell = true;
+    // 跨域样式表：页面读不到 cssRules 的那几张，字节是从扩展后台取回来的（每张一条账）。
+    // 没有这个字段 = 这一页没有跨域样式表，或一张都没取回来（那就还是 dropped 里那条）。
+    if (bgSheetLog.length) report.sheetsFetchedViaBackground = { count: bgSheetLog.length, items: bgSheetLog };
     // includes 已废：传了就记一个布尔 true（口径与其它布尔字段一致——没有这个字段 = 没传），
     // 具体传了什么写在 degrade 那条说明里。产物恒定是 entry + 两份 CSS + 资源落点。
     if (includesIgnored.length) report.includesIgnored = true;

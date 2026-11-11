@@ -138,10 +138,27 @@ assets/*                   超内嵌上限 1.4MB 的二进制、超 2000px 且�
           → { ok: true, base64, mime, bytes } | { ok: false, error }
 ```
 
-- 单次上限 12MB、单请求 25 秒超时，超了当场回原因，由 extractor 写进 `report.dropped`；
+- 单次上限 12MB（跨域样式表那条按 16MB 传，见下一节）、单请求 25 秒超时，超了当场回原因，由 extractor 写进 `report.dropped`；
 - 后台并发 4（extractor 侧并发 3，取字节和重编码都在页面里跑，贪多反而抖）；
 - 取字节期间每 20 秒摸一次扩展 API（`chrome.runtime.getPlatformInfo`）重置空闲计时器，不让 MV3 的 30 秒回收把一轮抓取截断；
 - 没有后台可用时（例如离线自检的宿主页面）退回页面自身的 `fetch`，通道记 `page`。
+
+## 跨域样式表：字节也从后台取，按原位置接回管道
+
+页面读不到 `sheet.cssRules` 的样式表（跨域，抛 SecurityError）过去只记一条 `dropped`，等于这张表里的版式整张丢掉——真实事故是 `pure-drawer.css` 里的 `position/left/transform` 没固化，抽屉停在 `x=-334`，它的 `.drawer-header` 正好盖住左上角图标位（一块空白灰块）。
+
+现在的做法：
+
+1. extractor 先扫一遍 `document.styleSheets`（含 shadow root 里的 `<link>` 与 `adoptedStyleSheets`），挑出读不到 `cssRules` 的那几张；
+2. 同一个 `href` 走上面那条后台通道取回**文本**（service worker 带 `all_urls` 主机权限，CORS 不拦它）；
+3. 取回的正文用 `CSSStyleSheet.replaceSync` 解析成一张真表，**在那条 `<link>` 原来的位置**接进规则管道——选择器重写、死选择器探针、层叠顺序全走原来那条路，不挪到末尾；
+4. 表里的相对 `url()` 与 `@import` 按这张表自己的地址解析；`@import` 递归展开，并按 CSS 规定排在本文之前。
+
+护栏：单条 16MB、`@import` 最多 3 层（成环即止）、只取 `http(s)`、失败重试一次即止。取不到就退回原来那条 `dropped`，**抓取照常完成**（`ok: true`，不因为一张样式表把整次抓取拖死）。
+
+正文先摘掉注释再扫 `@import`：注释里写着 `@import url(...)` 的一句说明，曾经被当成真的 import 去取（多一次 fetch、多一条 404、多一行 `dropped`，实测于真实浏览器的跨域夹具）。
+
+`report.sheetsFetchedViaBackground = { count, items: [{ href, bytes }] }`——没有这个字段 = 这一页没有跨域样式表，或一张都没取回来（那就还是 `dropped` 里那条）。
 
 ## 雪碧图与 srcset
 

@@ -50,6 +50,7 @@ const TABS_FULL_MS = 10000
 // 内容脚本跑在页面里，取跨域图片/字体受页面的 CORS 限制（logo、app-fold.svg、
 // no-application.png 就是这么 Failed to fetch 的）。service worker 带 all_urls 主机
 // 权限，同样的 URL 在这里 fetch 是 200，所以字节一律走这条路取。
+// 缺省单条上限。调用方可以按条指定（extractor 取跨域样式表时传 16MB，沿用抓取的单文件上限）。
 const FETCH_MAX_BYTES = 12 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 25000
 const FETCH_CONCURRENCY = 4
@@ -79,16 +80,17 @@ function bytesToBase64(u8) {
   return btoa(s)
 }
 
-async function fetchBytesOnce(url) {
+async function fetchBytesOnce(url, maxBytes) {
+  const cap = Number(maxBytes) > 0 ? Number(maxBytes) : FETCH_MAX_BYTES
   const ctl = new AbortController()
   const limit = setTimeout(function () { try { ctl.abort() } catch (e) {} }, FETCH_TIMEOUT_MS)
   try {
     const res = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow', signal: ctl.signal })
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const declared = Number(res.headers.get('content-length') || 0)
-    if (declared > FETCH_MAX_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(FETCH_MAX_BYTES / 1048576) + 'MB（' + Math.round(declared / 104857.6) / 10 + 'MB）')
+    if (declared > cap) throw new Error('超过单次取字节上限 ' + Math.round(cap / 1048576) + 'MB（' + Math.round(declared / 104857.6) / 10 + 'MB）')
     const buf = new Uint8Array(await res.arrayBuffer())
-    if (buf.length > FETCH_MAX_BYTES) throw new Error('超过单次取字节上限 ' + Math.round(FETCH_MAX_BYTES / 1048576) + 'MB')
+    if (buf.length > cap) throw new Error('超过单次取字节上限 ' + Math.round(cap / 1048576) + 'MB')
     const mime = String(res.headers.get('content-type') || '').split(';')[0].trim()
     return { ok: true, base64: bytesToBase64(buf), mime: mime, bytes: buf.length, via: 'background' }
   } catch (e) {
@@ -100,9 +102,9 @@ async function fetchBytesOnce(url) {
   }
 }
 
-function queueFetch(url) {
+function queueFetch(url, maxBytes) {
   return new Promise(function (resolve, reject) {
-    fetchPending.push({ url: url, resolve: resolve, reject: reject })
+    fetchPending.push({ url: url, maxBytes: Number(maxBytes) || 0, resolve: resolve, reject: reject })
     pumpFetch()
   })
 }
@@ -112,7 +114,7 @@ function pumpFetch() {
     const job = fetchPending.shift()
     fetchActive++
     keepAlive(true)
-    fetchBytesOnce(job.url).then(job.resolve, function (e) { job.reject(e) }).finally(function () {
+    fetchBytesOnce(job.url, job.maxBytes).then(job.resolve, function (e) { job.reject(e) }).finally(function () {
       fetchActive--
       keepAlive(false)
       pumpFetch()
@@ -620,7 +622,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
       return false
     }
     keepAlive(true)
-    queueFetch(url).then(
+    queueFetch(url, msg.maxBytes).then(
       function (r) { reply(r); keepAlive(false) },
       function (e) { reply({ ok: false, error: String((e && e.message) || e) }); keepAlive(false) }
     )

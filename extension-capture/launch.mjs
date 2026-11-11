@@ -43,6 +43,8 @@ function argValue(name, fallback) {
 
 const baseUrlArg = argValue('base-url', '')
 const pageArg = argValue('url', '')
+// 视口尺寸：抓下来的 px 全是绑在这个宽度上的（见 README「参考截图」），所以它必须能指定。
+const sizeArg = argValue('window-size', '')
 if (baseUrlArg === true) { console.error('--base-url 需要一个值，例如 --base-url=http://127.0.0.1:4000'); process.exit(2) }
 if (pageArg === true) { console.error('--url 需要一个值，例如 --url=https://example.com'); process.exit(2) }
 
@@ -273,6 +275,9 @@ async function main() {
     '--enable-unsafe-extension-debugging',
     '--remote-allow-origins=*'
   ]
+  // 例如 --window-size=1440x900：不传就是 Chrome 自己的默认窗口（约 1418x689，抓下来所有 px 都绑那个宽度）
+  const size = typeof sizeArg === 'string' && /^\d+x\d+$/i.test(sizeArg) ? sizeArg : ''
+  if (size !== '') args.push('--window-size=' + size)
   if (page !== '') args.push(page)
 
   const child = spawn(chrome, args, { detached: true, stdio: 'ignore', windowsHide: true })
@@ -289,6 +294,7 @@ async function main() {
     userDataDir: profile,
     captureDir: captureDir,
     extensionId: extensionId,
+    windowSize: size === '' ? 'chrome-default' : size,
     extensionVersion: String(manifest.version || ''),
     command: [quote(chrome)].concat(args.map(quote)).join(' ')
   }

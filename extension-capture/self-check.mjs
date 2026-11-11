@@ -34,7 +34,7 @@ function pickCdp() {
 //   反例3  噪声 PNG 超内嵌上限（落 assets/，证明 ../../ 前缀）
 //          + 1.5MB 假 woff2（字体不能降采样 → 落 assets/，证明 ../ 前缀）
 //   跨域    logo（另一台主机，必须走后台取字节）、358x20870 长条图、srcset 三档
-function buildFixture(P) {
+async function buildFixture(P) {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1200">' +
     '<rect width="2400" height="1200" fill="#4a7bd0"/><circle cx="1200" cy="600" r="420" fill="#d9a441"/></svg>';
 
@@ -175,6 +175,27 @@ function buildFixture(P) {
     'font-size:18px;border:0;position:fixed;right:24px;bottom:24px;z-index:9999;display:block}</style>' +
     '<button class="kf-fab" id="kfbtn">客服</button>';
 
+  // 跨域样式表夹具：页面在 hostA，这张表在 hostB（服务端不发 CORS 头）——页面脚本读
+  // sheet.cssRules 会抛 SecurityError，只有「后台取字节 + 自己解析」这一条路能拿到规则。
+  // 形状照 pure-drawer.css：一条定位/变换规则 + 一条 @import（递归一层）。
+  const waitLoad = (el) => new Promise((res) => {
+    el.addEventListener('load', res);
+    el.addEventListener('error', res);
+    setTimeout(res, 5000);
+  });
+  const remote = document.createElement('link');
+  remote.rel = 'stylesheet';
+  remote.id = 'remotecss';
+  remote.href = P.css;
+  document.head.appendChild(remote);
+  // 反例：同一台跨域主机上 404 的表 —— 取不到就必须退回 dropped，且不许让整次抓取失败
+  const remoteBad = document.createElement('link');
+  remoteBad.rel = 'stylesheet';
+  remoteBad.id = 'remotecssbad';
+  remoteBad.href = P.cssMissing;
+  document.head.appendChild(remoteBad);
+  await Promise.all([waitLoad(remote), waitLoad(remoteBad)]);
+
   return { rules: document.styleSheets[0] ? document.styleSheets[0].cssRules.length : 0, noiseBytes: Math.round(noise.length * 0.75) };
 }
 
@@ -182,6 +203,18 @@ function buildFixture(P) {
 // 故意不发任何 CORS 头：页面里 fetch 会被浏览器拦住，只有「后台取字节」这条路能拿到，
 // 这正是 3080 上 logo / app-fold.svg / no-application.png 失败的那一类 URL。
 const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#1f6feb"/><circle cx="12" cy="12" r="7" fill="#f0f6ff"/></svg>';
+
+// 跨域样式表夹具：形状照真实的 pure-drawer.css —— 定位/变换规则写在表里，页面读 cssRules
+// 抛 SecurityError。只记一条 dropped 等于把这张表里的版式整张丢掉；这里要求它被取回来、
+// 解析、进产物。第一份表再 @import 第二份（护栏：@import 递归上限 3 层）。
+const REMOTE_CSS = [
+  '/* 注释里的 @import url("bogus-in-comment.css") 不是 import：不许去取 */',
+  '@import url("imported.css");',
+  '#probe{position:relative;left:-8px;transform:translate3d(-100%, 0, 0);z-index:41}',
+  '#target{letter-spacing:.04em}',
+  '.dead-in-remote{color:#123456}',
+].join('\n');
+const REMOTE_IMPORTED_CSS = '#tagline{opacity:.99;letter-spacing:.02em}';
 
 // 真·长条图（358x20870）：在页面里用 canvas 造，交给本地服务发出去。
 // 这张图如果被「单边超 2000px 就重编码」，会压成 34x2000，等于毁掉。
@@ -366,6 +399,8 @@ async function main() {
     const logoBytes = Buffer.from(LOGO_SVG, 'utf8');
     const started = await startServer({
       '/logo.svg': { mime: 'image/svg+xml', bytes: logoBytes },
+      '/styles/drawer.css': { mime: 'text/css', bytes: Buffer.from(REMOTE_CSS, 'utf8') },
+      '/styles/imported.css': { mime: 'text/css', bytes: Buffer.from(REMOTE_IMPORTED_CSS, 'utf8') },
       '/sprite.png': { mime: 'image/png', bytes: spriteBytes },
       '/q100.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(100, '#a0c4ff'), 'utf8') },
       '/q300.svg': { mime: 'image/svg+xml', bytes: Buffer.from(squareSvg(300, '#9bf6ff'), 'utf8') },
@@ -390,7 +425,8 @@ async function main() {
     const hostA = 'http://127.0.0.1:' + started.port;
     const hostB = 'http://localhost:' + started.port;   // 同服务、不同主机名 = 另一个源
     const P = { logo: hostB + '/logo.svg', sprite: hostA + '/sprite.png', w100: hostA + '/q100.svg', w300: hostA + '/q300.svg', w900: hostA + '/q900.svg',
-      p400: hostA + '/p400.svg', p800: hostA + '/p800.svg', p1200: hostA + '/p1200.svg' };
+      p400: hostA + '/p400.svg', p800: hostA + '/p800.svg', p1200: hostA + '/p1200.svg',
+      css: hostB + '/styles/drawer.css', cssMissing: hostB + '/styles/nope.css' };
     console.log('[server] ' + hostA + ' 已就绪：sprite.png ' + spriteBytes.length + ' B（358x20870），logo.svg ' + logoBytes.length + ' B，srcset 三档 100w/300w/900w');
 
     await cdp.navigate(s, hostA + '/blank.html');
@@ -434,6 +470,9 @@ async function main() {
     const byPath = new Map(files.map((f) => [f.path, f]));
     const entry = byPath.get('entry.html');
     const allText = files.map((f) => String(f.content)).join(NL);
+    // 两份 CSS 的合并正文：定位属性固化、死选择器、跨域取回的规则都在这上面查。
+    const cssText = ['shared/app.css', 'pages/current/page.css']
+      .map((p) => (byPath.get(p) ? String(byPath.get(p).content) : '')).join('\n');
 
     // ---- 1. files 数量 > 0 ------------------------------------------------
     assert('files 数量 > 0', files.length > 0, files.length + ' 个：' + files.map((f) => f.path).join(', '));
@@ -505,6 +544,39 @@ async function main() {
         ? (logoRow.url + ' → ' + logoRow.bytes + ' B（服务端 ' + logoBytes.length + ' B），通道 ' + logoRow.via + '，落点 ' + logoRow.kind + '；页面直连：' + pageFetch)
         : '资源清单里没有 logo.svg（dropped ' + report.dropped.length + ' 条）');
 
+    // ---- 9b. 跨域样式表：后台取回字节 → 按原位置解析进产物 -----------------
+    // 真实事故：pure-drawer.css 跨域读不到 cssRules，里面那两条 position/transform 规则没
+    // 固化，抽屉停在 x=-334、它的 .drawer-header 正好盖住左上角图标位。现在字节由后台取回，
+    // 规则照原管道（同一条探针、同一条 cleanDecls）进 page.css，@import 递归展开。
+    const bgSheets = report.sheetsFetchedViaBackground || { count: 0, items: [] };
+    const bgHrefs = (bgSheets.items || []).map((it) => String(it.href || ''));
+    const drawerBytes = Buffer.byteLength(REMOTE_CSS, 'utf8');
+    const importedBytes = Buffer.byteLength(REMOTE_IMPORTED_CSS, 'utf8');
+    const sheetDrop = (report.dropped || []).filter((d) => d.indexOf('读不到样式表（跨域）') >= 0);
+    const probeRule = (new RegExp('#probe\\{[^}]*\\}')).exec(cssText) || [''];
+    const taglineRule = (new RegExp('#tagline\\{[^}]*\\}')).exec(cssText) || [''];
+    assert('跨域样式表经后台取回并解析：规则进产物、@import 递归一层（注释里的 @import 不算）、死选择器照旧丢、不再记 dropped',
+      bgSheets.count === 2 && bgHrefs.length === 2 &&
+        bgHrefs[0] === P.css && bgHrefs[1] === hostB + '/styles/imported.css' &&
+        bgSheets.items[0].bytes === drawerBytes && bgSheets.items[1].bytes === importedBytes &&
+        /transform:\s*translate3d\(-100%/.test(probeRule[0]) && /z-index:\s*41/.test(probeRule[0]) &&
+        /opacity:\s*0\.99/.test(taglineRule[0]) &&
+        cssText.indexOf('.dead-in-remote') < 0 &&
+        !(report.dropped || []).some((d) => d.indexOf('bogus-in-comment') >= 0) &&
+        !sheetDrop.some((d) => d.indexOf('drawer.css') >= 0) &&
+        report.sheetsFailed === 1,
+      'report.sheetsFetchedViaBackground=' + JSON.stringify(bgSheets) +
+        '；#probe 规则=' + (probeRule[0] || '（缺）') + '；@import 带来的 #tagline 规则=' + (taglineRule[0] || '（缺）') +
+        '；跨域读不到的 dropped ' + sheetDrop.length + ' 条' + (sheetDrop.length ? '：' + sheetDrop.join(' | ') : '') +
+        '；report.sheetsFailed=' + report.sheetsFailed);
+
+    // ---- 9c. 取回失败：退回现状（dropped），抓取照旧完成 --------------------
+    const badDrop = (report.dropped || []).find((d) => d.indexOf('读不到样式表（跨域）') >= 0 && d.indexOf('nope.css') >= 0);
+    assert('跨域样式表取回失败：退回 dropped 那条，整次抓取仍 ok（files 完整、字节账对得上）',
+      !!badDrop && !bgHrefs.some((h) => h.indexOf('nope.css') >= 0) &&
+        files.length > 0 && report.bytes === sum,
+      'dropped 那条=' + JSON.stringify(badDrop) + '；files ' + files.length + ' 个 / report.bytes ' + report.bytes + ' / 实测 ' + sum + ' B');
+
     // ---- 10. 358x20870 长条图：原尺寸落文件，不降采样 ---------------------
     const sprRow = (report.assets || []).find((a) => String(a.url).indexOf('/sprite.png') >= 0);
     const sprFile = sprRow && sprRow.path ? byPath.get(sprRow.path) : null;
@@ -570,8 +642,6 @@ async function main() {
     // 真实事故：抽屉样式表 pure-drawer.css 跨域取不到，position/left/transform 全在里面，
     // 抓下来抽屉落回文档流、把整页往下压 450px。定位必须固化成元素规则；
     // 默认值（static / auto / none / 单位矩阵）不许写，否则平白胖一圈。
-    const cssText = ['shared/app.css', 'pages/current/page.css']
-      .map((p) => (byPath.get(p) ? String(byPath.get(p).content) : '')).join('\n');
     const ruleOf = (id) => {
       const tag = (new RegExp('<[a-z]+[^>]*id="' + id + '"[^>]*>', 'i').exec(entry.content) || [''])[0];
       const key = (/data-dsh-el="(e\d+)"/.exec(tag) || [])[1] || '';
@@ -803,6 +873,9 @@ async function main() {
     console.log('  origin / title    ' + report.origin + ' / ' + report.title);
     console.log('  规则              总 ' + report.rulesTotal + ' · 命中 ' + report.rulesKept + ' · 死选择器丢 ' + report.rulesDead + ' · 空规则丢 ' + report.rulesEmpty);
     console.log('  样式表 / 动画       ' + report.sheets + ' 张 / @keyframes ' + report.keyframes + ' / @font-face ' + report.fontFaces);
+  console.log('  跨域样式表       后台取回 ' + (report.sheetsFetchedViaBackground ? report.sheetsFetchedViaBackground.count : 0) +
+    ' 张，读不到 ' + report.sheetsFailed + ' 张' +
+    (report.sheetsFetchedViaBackground ? '：' + report.sheetsFetchedViaBackground.items.map((i) => i.href + ' ' + i.bytes + 'B').join(' | ') : ''));
     console.log('  变量              解析 ' + report.varsResolved + ' 个自定义属性；丢声明 ' + report.declarationsDropped + ' 条、自定义属性 ' + report.customPropsDropped + ' 条');
     console.log('  元素              子树 ' + report.elements + ' 个，固化 ' + report.computedRules + ' 条计算样式规则');
     console.log('  资源              内嵌 ' + report.assetsInlined + ' · 落 assets/ ' + report.assetsSpilled);
