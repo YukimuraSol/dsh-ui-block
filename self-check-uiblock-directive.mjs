@@ -1009,11 +1009,14 @@ const sliceBetween = (from, to) => {
 }
 const replayBody = sliceBetween('function replayBlock(state) {', 'function relayout(state) {')
 const controlsBody = sliceBetween('function buildControls(state) {', '// Map-viewport gestures.')
-t('replayBlock() exists and replayBlock is reachable from the banner controls', () => {
-  assert.ok(fnAt('replayBlock') > 0, 'no replayBlock() in client.js')
+t('reloadBlock() exists and is exactly what the banner button calls', () => {
+  assert.ok(fnAt('reloadBlock') > 0, 'no reloadBlock() in client.js')
   assert.match(controlsBody, /replayButton\.className = 'dshpb-btn dshpb-replay'/)
-  assert.match(controlsBody, /replayBlock\(state\)/, 'the button does not call replayBlock')
+  assert.match(controlsBody, /reloadBlock\(state\)/, 'the button does not call reloadBlock')
   assert.match(controlsBody, /controls\.appendChild\(replayButton\)/, 'the button is built but never mounted')
+  // 只有一条调用路径：点击处理里不许再有第二个动作。
+  const onClick = controlsBody.slice(controlsBody.indexOf("replayButton.addEventListener('click'"))
+  assert.doesNotMatch(onClick.slice(0, 400), /replayBlock\(|player\.restart\(/, 'the click handler grew a second branch')
 })
 t('the replay icon sits BETWEEN the size button and the picker, not after it', () => {
   // 用户定稿（2026-11-11）：不要独立的按钮/分组，插进已有的 span.dshpb-ctl 里，
@@ -1045,11 +1048,11 @@ t('both document kinds reload, and nothing else about the block changes', () => 
   // 不给块的渲染加任何参数
   assert.doesNotMatch(replayBody, /state\.res =|state\.zoom =|setAttribute\('width'|setAttribute\('height'/)
 })
-t('the sandbox is not widened, and a demo block is no longer special-cased', () => {
-  // replayBlock 仍然拒绝演示块（它的画面归播放器，重载会和时间轴抢状态）；
-  // 但「有没有这颗按钮」不再看 demoSpec——一套头，两种动作。
-  assert.match(replayBody, /if \(state\.demoSpec\) return null/)
-  assert.doesNotMatch(controlsBody, /if \(!state\.demoSpec\)/, 'the replay button went back behind a demo branch')
+t('the sandbox is not widened, and no header path asks which kind of block this is', () => {
+  // 2026-11-12：两种块合成一种。文档那半边对任何块都成立（有时间轴的块由
+  // reloadBlock 走播放器重建，到不了这里），所以它不许再问「是不是演示块」。
+  assert.doesNotMatch(replayBody, /demoSpec|hasTimeline/, 'the document reload still branches on the kind of block')
+  assert.doesNotMatch(controlsBody, /demoSpec/, 'a control still branches on the kind of block')
   // allow-scripts 只允许出现在注释里（文档在讲「为什么不能加」），代码里一次都不许有：
   // 与 allow-same-origin 同时给等于没有沙箱，块里的脚本就能摸到聊天页。
   assert.doesNotMatch(source, /setAttribute\(\s*'sandbox'\s*,\s*'[^']*allow-scripts/)
@@ -1059,7 +1062,8 @@ t('the sandbox is not widened, and a demo block is no longer special-cased', () 
   assert.match(source, /el\.setAttribute\('sandbox', 'allow-same-origin'\)/)
 })
 t('icon only: no visible word; every hint comes from the row own bubble', () => {
-  assert.match(controlsBody, /aria-label', '重放动画'/, 'the accessible name is gone')
+  // 2026-11-12：文案固定为「重新加载」，不再按块的类型分叉（用户口径：一套控件、一种文案）。
+  assert.match(controlsBody, /aria-label', '重新加载'/, 'the accessible name is gone')
   // 「重放」不许出现在按钮上：没有 textContent。
   assert.doesNotMatch(controlsBody, /replayButton\.textContent/, 'visible text on the replay button')
   // 用户真机反馈（2026-11-11 晚，第二轮）：「尺寸的悬停直接没了」——挂了原生 title
@@ -1068,10 +1072,9 @@ t('icon only: no visible word; every hint comes from the row own bubble', () => 
   // 反的。所以三颗一起改成与「复制路径」同款的自绘气泡，title 一个都不许留。
   assert.doesNotMatch(controlsBody, /\.title = /, 'a native title is back on the banner row')
   assert.match(controlsBody, /attachTip\(resButton, '画布分辨率（点开可改，含自定义 W×H）'\)/)
-  // 一颗按钮两种说明：普通块说「重新加载」，演示块说「从第 1 步重来」。
-  assert.match(controlsBody, /attachTip\(replayButton, function \(\) \{/)
-  assert.match(controlsBody, /'重新开始演示（从第 1 步重来）'/)
-  assert.match(controlsBody, /'重新加载画布内容（等同刷新）'/)
+  // 一颗按钮一种说明（2026-11-12）：气泡是常量，不是按类型返回的函数。
+  assert.match(controlsBody, /attachTip\(replayButton, '重新加载（重新解析画布内容，等同刷新）'\)/)
+  assert.doesNotMatch(controlsBody, /重新开始演示/, 'the demo-only wording is back')
   assert.match(controlsBody, /attachTip\(pickButton, '在画布内选取元素 · 点元素插入输入框 · 滚轮切层 · 再点退出'\)/)
   // 气泡本体钉的是外壳 span._bubble 的实测值（out/probe/tooltip-bubble/report-shell.json）：
   // bg rgb(67,69,74)、白字、13px/20px、radius 8、padding 3px 7px、z 1100、无阴影、固定定位。
@@ -1126,12 +1129,13 @@ t('icon only: no visible word; every hint comes from the row own bubble', () => 
   assert.match(source, /\.dshpb-replay path\.dshpb-tri\{fill:var\(--dsw-alias-label-secondary\);stroke:none\}/)
 })
 t('the test seam calls the same function the button does', () => {
-  assert.match(source, /replay: function \(index\) \{ var s = live\[index \|\| 0\]; if \(!s\) return null; return replayBlock\(s\); \}/)
+  assert.match(source, /replay: function \(index\) \{ var s = live\[index \|\| 0\]; if \(!s\) return null; return reloadBlock\(s\); \}/)
 })
 t('create_ui_block says the button reloads like F5 and names the capture boundary', () => {
   const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
-  assert.match(create, /REPLAY: the card\\'s banner carries one more icon/)
-  assert.match(create, /loads the block\\'s content again, exactly like pressing F5/)
+  assert.match(create, /REPLAY: the card\\'s banner carries one icon/)
+  assert.match(create, /RELOAD = parse the content again/)
+  assert.match(create, /exactly like pressing F5/)
   assert.match(create, /a one-shot animation stays one-shot/)
   assert.doesNotMatch(create, /dsh:replay/, 'the tool description still promises a message that is never sent')
   // 边界必须写进描述：刷新救不了「靠 JS 加 class 的入场动画」，那是抓取的边界。
@@ -1215,7 +1219,7 @@ await ta('a name that really is not there lists the ones that are', async () => 
 })
 t('create_ui_block tells the model how to point at the entry', () => {
   const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
-  assert.match(create, /the ENTRY document has no section name of its own/)
+  assert.match(create, /The ENTRY document has no section name of its own/)
   assert.match(create, /point at it as "entry\.html", "index\.html"/)
   assert.match(create, /an error that lists the available ones/)
 })
@@ -1248,9 +1252,12 @@ t('a layer is only shown once its document is ready (fonts included), 800ms fall
   assert.match(source, /const READY_TIMEOUT_MS = 800/, 'the 800ms fallback must be one constant')
   assert.match(readyBody, /if \(Date\.now\(\) >= deadline\) \{ finish\(rec\); return; \}/, 'the fallback must still swap instead of stalling the timeline')
 })
-t('a demo block autoplays and loops, and the header has no transport row', () => {
-  const paintDemoBody = sliceBetween('function paintDemo(state) {', 'function armAutoplay(state) {')
-  assert.match(paintDemoBody, /state\.player\.play\(\)/, 'a demo block must start by itself')
+t('a block with a timeline autoplays and loops, and the header has no transport row', () => {
+  const startBody = sliceBetween('function startPlayer(state, previous) {', 'function paintDemo(state) {')
+  assert.ok(startBody.length > 0, 'startPlayer() not found')
+  assert.match(startBody, /player\.play\(\)/, 'a block with a timeline must start by itself')
+  const paintDemoBody = sliceBetween('function paintDemo(state) {', 'function degradeToEntry(state, why) {')
+  assert.match(paintDemoBody, /startPlayer\(state, null\)/, 'paintDemo must go through startPlayer')
   assert.match(source, /const loopEnabled = timeline\.loop !== false/)
   assert.match(source, /if \(loopEnabled\) \{ resetPlayback\(\); return; \}/, 'the timeline must restart itself at the end')
   assert.doesNotMatch(source, /buildTransport|data-dshpb-demo/, 'the transport row is back')
@@ -1273,6 +1280,111 @@ t('a hidden layer keeps its animations paused, a shown one starts at 0', () => {
   assert.match(swap, /else freezeLayer\(r\);/, 'the hidden layers are frozen')
   assert.match(swap, /phaseMs/, 'the swap must record the animation phase it showed')
   assert.match(source, /const MAX_ANIM = 300/)
+})
+
+// ---------------------------------------------------------------------------
+// 24. 只有一种块（2026-11-12）：内容模型 = 快照集合 + 可选时间轴，静态只是零步骤；
+//     ⟲ 一律 = 重新解析；预加载按时间轴排程；某份快照没拿到就降级，不许把 404 画上去。
+// ---------------------------------------------------------------------------
+console.log('--- 24. one kind of block: static is the zero-step case ---')
+t('readSpec() always returns a spec, and the no-timeline answer is the entry document', () => {
+  assert.ok(fnAt('readSpec') > 0, 'no readSpec() in client.js')
+  assert.equal(fnAt('readDemo'), -1, 'readDemo() is still there: the old two-kind reader survived')
+  const entry = sliceBetween('function entrySpec() {', 'function hasTimeline(spec) {')
+  assert.match(entry, /return \{ snapshots: \{ '': '' \}, timeline: \{ steps: \[\] \} \};/, 'the degenerate spec must be one snapshot (the entry) and zero steps')
+  const read = sliceBetween('function readSpec(body) {', 'function blockUrl(state, rel) {')
+  assert.ok((read.match(/return entrySpec\(\);/g) || []).length >= 3, 'every unreadable body must degrade to entrySpec()')
+  assert.doesNotMatch(read, /return null/, 'readSpec must never answer null again')
+})
+t('the one parameter every caller reads is "are there steps?"', () => {
+  const has = sliceBetween('function hasTimeline(spec) {', 'function readSpec(body) {')
+  assert.match(has, /spec\.timeline\.steps\.length > 0/)
+  assert.match(source, /if \(!state\.degraded && hasTimeline\(state\.spec\)\) \{ paintDemo\(state\); return; \}/, 'paint() must read the parameter')
+  assert.doesNotMatch(source, /demoSpec/, 'the retired demoSpec field is back')
+  assert.equal(fnAt('demoRestart'), -1, 'demoRestart (timeline-only restart) must stay deleted')
+})
+t('a zero-step player schedules nothing and never advances', () => {
+  assert.match(source, /const hasSteps = steps\.length > 0;/)
+  assert.match(source, /const duration = timeline\.duration \|\| \(hasSteps \? Math\.max\(0, \.\.\.steps\.map\(\(s\) => s\.at\)\) \+ 1500 : 0\);/, 'a zero-step player has no duration to run down')
+  const playBody = sliceBetween('    play() {', '    pause() {')
+  assert.match(playBody, /if \(!hasSteps\) \{/, 'play() must accept zero steps')
+  assert.match(playBody, /state\.playing = false;/, 'a zero-step player must not run')
+  const zero = playBody.slice(playBody.indexOf('if (!hasSteps)'), playBody.indexOf('if (state.playing)'))
+  assert.doesNotMatch(zero, /requestAnimationFrame/, 'a zero-step player must not schedule a frame')
+})
+t('lead is 2 x the last measured load, clamped to 250-2000ms', () => {
+  assert.match(source, /const LEAD_MIN = 250;/)
+  assert.match(source, /const LEAD_MAX = 2000;/)
+  assert.match(source, /const leadMs = \(\) => Math\.min\(LEAD_MAX, Math\.max\(LEAD_MIN, Math\.round\(\(lastLoadMs \|\| 0\) \* 2\)\)\);/)
+  assert.match(source, /if \(rec\.startedAt\) lastLoadMs = Math\.max\(0, Math\.round\(rec\.readyAt - rec\.startedAt\)\);/, 'the player must measure what a load really cost')
+})
+t('the timeline schedules the loads; opening a block does not load every snapshot', () => {
+  assert.doesNotMatch(source, /for \(const key of Object\.keys\(snapshots\)\) \{\n\s+try \{ makeLayer\(key\)/, 'the eager all-at-open load is back')
+  const schedule = sliceBetween('function scheduleLoads() {', 'function failLayer(rec, why) {')
+  assert.ok(schedule.length > 0, 'scheduleLoads() not found')
+  assert.match(schedule, /if \(s\.at - lead > state\.t\) continue;/, 'a step must start loading lead ms before its time')
+  assert.match(schedule, /loads\.push\(/, 'the schedule must leave a load record')
+  assert.match(sliceBetween('function tick(now) {', 'function reloadLayer(key) {'), /scheduleLoads\(\);/, 'tick() must drive the schedule')
+})
+t('the layer pool is capped at 3 and evicts the least recently used', () => {
+  assert.match(source, /const MAX_LAYERS = 3;/)
+  const room = sliceBetween('function makeRoom(key) {', 'function scheduleLoads() {')
+  assert.match(room, /while \(layers\.size >= MAX_LAYERS\)/)
+  assert.match(room, /if \(r\.key === activeKey \|\| r\.key === wantKey\) continue;/, 'the visible layer must never be evicted')
+  assert.match(room, /victim\.el\.remove\(\);/)
+})
+t('a step that is not ready keeps the previous frame instead of blanking', () => {
+  const fireSwitch = sliceBetween("      case 'switch': {", "      case 'move': {")
+  assert.ok(fireSwitch.length > 0, 'the switch step is missing')
+  assert.match(fireSwitch, /if \(!rec \|\| !rec\.ready\)/, 'a late step must be detected')
+  assert.match(fireSwitch, /delayed\.push\(/, 'a late step must be recorded')
+  assert.match(fireSwitch, /继续显示当前这一帧/, 'the warning must say what happens')
+  const wantBody = sliceBetween('function want(key) {', 'function setCursor(x, y, instant) {')
+  assert.match(wantBody, /if \(!rec\) rec = loadLayer\(key\);/, 'a snapshot that was not preloaded must still be fetchable when its step comes')
+})
+t('a snapshot that did not arrive never reaches the canvas', () => {
+  const settleBody = sliceBetween('function settle(rec, deadline) {', 'function finish(rec) {')
+  assert.match(settleBody, /type !== 'text\/html'/, 'a non-HTML answer (the host 404/415 body) must be refused')
+  const fail = sliceBetween('function failLayer(rec, why) {', 'function settle(rec, deadline) {')
+  assert.match(fail, /rec\.failed = true;/)
+  assert.match(fail, /onFail && onFail\(/, 'the failure must be offered to the caller for degradation')
+  const degrade = sliceBetween('function degradeToEntry(state, why) {', 'function armAutoplay(state) {')
+  assert.match(degrade, /state\.frame\.style\.display = '';/, 'degrading must put the entry document back on the canvas')
+  assert.match(sliceBetween('function startPlayer(state, previous) {', 'function paintDemo(state) {'), /info\.first && !info\.onScreen/, 'only a first snapshot with nothing on screen degrades')
+})
+t('reloadBlock rebuilds the player and keeps the old layers until the new first frame', () => {
+  const reload = sliceBetween('function reloadBlock(state) {', '      /**\n       * The document half of')
+  assert.ok(reload.length > 0, 'reloadBlock() not found')
+  assert.match(reload, /if \(!hasTimeline\(state\.spec\)\) return replayBlock\(state\);/, 'a zero-step block reloads its document')
+  assert.match(reload, /startPlayer\(state, previous\);/, 'a timeline block must rebuild its player')
+  const start = sliceBetween('function startPlayer(state, previous) {', 'function paintDemo(state) {')
+  assert.match(start, /if \(previous\) \{ try \{ previous\.destroy\(\); \} catch \(e\)/, 'the old player is destroyed only after the new frame is up')
+  assert.match(start, /if \(shown \|\| !next \|\| next\.snapshot === null\) return;/, 'the handover waits for the first swap')
+})
+t('the tool description carries the same model: loop, zero steps, scheduled loading', () => {
+  const create = hostSource.slice(hostSource.indexOf('const CREATE_DESCRIPTION = ['))
+  assert.match(create, /THE CONTENT MODEL — ONE SHAPE FOR EVERY BLOCK/)
+  assert.match(create, /zero steps, the same model with nothing to schedule/)
+  assert.match(create, /LOOPING IS THE BLOCK\\'S OWN PROPERTY/)
+  assert.match(create, /LOADING IS SCHEDULED ALONG THE TIMELINE/)
+  assert.match(create, /the canvas is never blanked/)
+  assert.match(create, /keeps its ENTRY DOCUMENT on screen/)
+})
+t('the vendored player is the plugin directory copy, byte for byte but for one token', () => {
+  // 到标记行本身为止（标记带 4 格缩进，切在 '// [/vendored-player]' 会把那 4 格算进去）
+  const vendored = source.slice(source.indexOf('// player.mjs —'), source.indexOf('    // [/vendored-player]'))
+  const disk = readFileSync(join(here, 'tools', 'player.mjs'), 'utf8')
+  assert.equal(vendored, disk.replace('export function createPlayer', 'function createPlayer'), 'the embedded player drifted from tools/player.mjs')
+})
+t('a loop that ends on its own first snapshot still starts its clock', () => {
+  // 实测踩到的：末步与第 1 步是同一份快照时（A→B→A），want() 不会触发交换，
+  // 只靠「交换即起表」会让第二轮永远停在 t=0、playing 却还是 true。
+  assert.match(source, /function startClock\(\) \{/, 'the clock start must be one named step')
+  const swap = sliceBetween('function swapTo(rec) {', 'function want(key) {')
+  assert.match(swap, /startClock\(\);/, 'swapTo() must start the clock through it')
+  const reset = sliceBetween('function resetPlayback() {', 'function tick(now) {')
+  assert.match(reset, /if \(key === activeKey\) \{/, 'resetPlayback() must notice the first frame is already on screen')
+  assert.match(reset, /startClock\(\);/, 'and start the clock itself instead of waiting for a swap that will not happen')
 })
 
 rmSync(home, { recursive: true, force: true })

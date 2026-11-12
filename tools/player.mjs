@@ -1,15 +1,27 @@
 // player.mjs — 宿主侧时间轴播放器（路线 1：块只当素材，外面演）
-// 用法：createPlayer({ snapshots, timeline, mount }) → { play, pause, seek, restart, destroy, state }
+// 用法：createPlayer({ snapshots, timeline, mount, onState, onFail })
+//         → { play, pause, seek, restart, destroy, state, frameInfo }
 // 快照是纯数据 HTML，用 blob: 装进同源 iframe；播放器在 iframe 之上画光标/高亮/涟漪，
 // 并直接改 iframe 里的 DOM（同源）来演示“填字 / 按下”。
 //
+// 内容模型（2026-11-12）：块 = 快照集合 + 可选时间轴。**零步骤是被接受的一种输入**，
+// 不是“另一种块”：steps.length === 0 时这里不排任何定时器、不推进，停在第 1 帧。
+// 于是调用方读的是参数（有没有时间轴），而不是块属于哪一类。
+//
 // 双缓冲（2026-11-11）。用户口径：浏览器里点链接就是硬切，不许我们“帮他画过渡”。
 // 所以这里做的只有一件事——**下一份文档画好之前，不把旧内容撤掉**：
-//   · 每份快照各自一个 iframe，开场全部导航一次；切步骤只改「显示哪一层」，永不重新导航；
+//   · 每份快照各自一个 iframe，切步骤只改「显示哪一层」，永不重新导航；
 //   · 就绪判据 = load 之后 readyState complete + document.fonts.status loaded，超时 800ms 兜底；
 //   · 就绪的那一刻在 requestAnimationFrame 里一次交换（opacity 直接 1/0，没有 transition/animation，
 //     没有淡入淡出）——硬切，只是把这次硬切挪到内容完整的那一刻；
 //   · 容器不写死底色：底色由每份快照自己的 body 背景色补上，取不到就保持透明。
+//
+// 按时间轴排程装快照（2026-11-12）。时间轴是写好的，所以“什么时候要哪一份”事先就知道：
+//   · 第 1 步打开就装；第 i 步在 (at − lead) 起装，lead = clamp(2 × 上一份实际加载耗时, 250, 2000ms)；
+//   · 到点还没就绪 → 继续显示上一帧、推迟切换，就绪后立刻切，并记一条告警（不留空画布）；
+//   · 层池上限 3，同一份快照复用，超了淘汰最久未用（正在显示/正要显示的除外）；
+//   · 装进后台层的动画一律 pause()，切过去 currentTime = 0 再 play()：只提前加载，不提前播。
+//   · 一份快照没拿到（404 / 非 HTML）：这一层永不上画布，告警一条，画面上留着上一帧。
 
 const STYLE_ID = 'snap-player-style';
 
@@ -67,16 +79,22 @@ function resolveTarget(doc, to) {
   return null;
 }
 
-export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) {
+export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null, onFail = null }) {
   if (!mount) throw new Error('createPlayer: mount 必填');
   ensureStyle();
 
   const steps = [...(timeline.steps || [])].sort((a, b) => a.at - b.at).map((s, i) => ({ ...s, _i: i }));
+  // 零步骤 = 静态（退化情形）：同一台机器，不推进而已。
+  const hasSteps = steps.length > 0;
   const loopEnabled = timeline.loop !== false;
-  const duration = timeline.duration || Math.max(0, ...steps.map((s) => s.at)) + 1500;
+  const duration = timeline.duration || (hasSteps ? Math.max(0, ...steps.map((s) => s.at)) + 1500 : 0);
   const READY_TIMEOUT_MS = 800;
   // 隐藏层上不许让动画偷跑：最多管这么多条，超了如实记下来（不假装全管住）。
   const MAX_ANIM = 300;
+  // 预加载提前量：钳在 250–2000ms；层池上限 3（淘汰最久未用）。
+  const LEAD_MIN = 250;
+  const LEAD_MAX = 2000;
+  const MAX_LAYERS = 3;
 
   // 快照两种形态，接口不变（仍是"换一份已抓快照"）：
   //   HTML 字符串  → 装进 blob:
@@ -108,6 +126,12 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
   const state = { t: 0, playing: false, snapshot: null, fired: 0 };
   const layers = new Map();
   const switches = [];
+  const loads = [];         // 每次“开始装”：哪一步、什么时刻
+  const delayed = [];       // 到点还没就绪的切换（推迟，不是空画布）
+  const failures = [];      // 没拿到的快照
+  const requested = new Set();  // 本轮已经排过程的快照
+  const warnedSteps = new Set();
+  let lastLoadMs = 0;           // 上一份快照的实际加载耗时（lead 的来源）
   const undo = [];
   const originals = new Map();
   const hiddenOriginals = new Map();
@@ -123,7 +147,7 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
   const doc = () => { try { const rec = activeKey === null ? null : layers.get(activeKey); return rec ? rec.el.contentDocument : null; } catch { return null; } };
   const recOf = (key) => layers.get(key) || null;
 
-  // ── 双缓冲：一层一快照，开场各自导航一次 ─────────────────────────────────────
+  // ── 双缓冲：一层一快照，每层导航一次 ─────────────────────────────────────────
   function makeLayer(key) {
     const el = document.createElement('iframe');
     el.className = 'snap-frame';
@@ -132,7 +156,7 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     el.setAttribute('data-snap', key);
     // 沙箱不变：可被同源读取，绝不执行脚本。
     el.setAttribute('sandbox', 'allow-same-origin');
-    const rec = { key, el, ready: false, bg: '', decideAt: 0, readyAt: 0 };
+    const rec = { key, el, ready: false, failed: false, bg: '', decideAt: 0, readyAt: 0, startedAt: performance.now(), usedAt: performance.now() };
     el.addEventListener('load', () => settle(rec, Date.now() + READY_TIMEOUT_MS));
     el.src = srcFor(key);
     mount.insertBefore(el, overlay);
@@ -140,14 +164,92 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     return rec;
   }
 
+  // 第 1 步要的那份快照：时间轴里第一个 switch，否则快照集合里的第一份。
+  function firstKey() {
+    const first = steps.find((s) => s.do === 'switch');
+    return first ? first.snapshot : (Object.keys(snapshots)[0] || null);
+  }
+
+  // lead = 2 × 上一份的实际加载耗时，钳在 250–2000ms。
+  const leadMs = () => Math.min(LEAD_MAX, Math.max(LEAD_MIN, Math.round((lastLoadMs || 0) * 2)));
+
+  /** 装一份快照进层。名字不在集合里、或层装不下，都只告警，不抛。 */
+  function loadLayer(key) {
+    const have = recOf(key);
+    if (have) return have;
+    if (!(key in snapshots)) {
+      const why = '不在快照集合里（有：' + Object.keys(snapshots).join(', ') + '）';
+      failures.push({ key, why, at: Math.round(performance.now() - t0) });
+      console.warn('[player] 时间轴要的 "' + key + '" ' + why);
+      onFail && onFail({ key, why, first: key === firstKey(), onScreen: activeKey !== null });
+      return null;
+    }
+    if (!makeRoom(key)) return null;
+    try { return makeLayer(key); } catch (e) {
+      const why = String((e && e.message) || e);
+      failures.push({ key, why, at: Math.round(performance.now() - t0) });
+      console.warn('[player] 快照 "' + key + '" 装不进层：' + why);
+      onFail && onFail({ key, why, first: key === firstKey(), onScreen: activeKey !== null });
+      return null;
+    }
+  }
+
+  /** 层池上限 MAX_LAYERS：超了淘汰最久未用的（正在显示、正要显示的都不淘汰）。 */
+  function makeRoom(key) {
+    if (layers.has(key)) return true;
+    while (layers.size >= MAX_LAYERS) {
+      let victim = null;
+      for (const r of layers.values()) {
+        if (r.key === activeKey || r.key === wantKey) continue;
+        if (!victim || r.usedAt < victim.usedAt) victim = r;
+      }
+      if (!victim) return false;   // 全是活层：宁可不预装，也不拆正在用的
+      victim.el.remove();
+      layers.delete(victim.key);
+    }
+    return true;
+  }
+
+  /** 每一帧核对一次：哪一步快到点了，就把它的快照装起来（只提前加载，不提前播）。 */
+  function scheduleLoads() {
+    if (!hasSteps) return;
+    const lead = leadMs();
+    for (const s of steps) {
+      if (s.do !== 'switch') continue;
+      if (s.at - lead > state.t) continue;
+      if (recOf(s.snapshot) || requested.has(s.snapshot)) continue;
+      requested.add(s.snapshot);
+      loads.push({ key: s.snapshot, stepAt: s.at, startedAt: Math.round(performance.now() - t0), lead });
+      loadLayer(s.snapshot);
+    }
+  }
+
+  /**
+   * 一份快照没拿到（404 / 没装成）：这一层永远不上画布——错误文档不许顶到画上。
+   * 画面上继续留上一帧；画布上还什么都没有时，交给 onFail 决定怎么降级。
+   */
+  function failLayer(rec, why) {
+    if (rec.failed) return;
+    rec.failed = true;
+    rec.ready = false;
+    rec.why = why;
+    failures.push({ key: rec.key, why, at: Math.round(performance.now() - t0) });
+    console.warn('[player] 快照 "' + rec.key + '" 没拿到（' + why + '）：保持上一帧，不把错误文档挂到画布上');
+    readyWaiters.delete(rec.key);
+    onFail && onFail({ key: rec.key, why, first: rec.key === firstKey(), onScreen: activeKey !== null });
+  }
+
   function settle(rec, deadline) {
-    if (rec.ready) return;
-    let complete = false, fonts = true;
+    if (rec.ready || rec.failed) return;
+    let complete = false, fonts = true, type = '';
     try {
       const d = rec.el.contentDocument;
+      type = d ? String(d.contentType || '') : '';
       complete = !!d && d.readyState === 'complete' && !!d.body;
       fonts = !d || !d.fonts || d.fonts.status === 'loaded';
     } catch { complete = false; }
+    // 拿回来的不是 HTML，就不是这份快照：宿主的 404/415 是 text/plain 正文。
+    if (complete && type && type !== 'text/html') { failLayer(rec, 'content-type ' + type); return; }
     if (complete && fonts) { finish(rec); return; }
     if (Date.now() >= deadline) { finish(rec); return; }   // 兜底：宁可慢一帧，也不许卡住时间轴
     laterReady(16, () => settle(rec, deadline));
@@ -174,9 +276,11 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
   }
 
   function finish(rec) {
-    if (rec.ready) return;
+    if (rec.ready || rec.failed) return;
     rec.ready = true;
     rec.readyAt = performance.now();
+    // 下一份的 lead 就取自这一次实际花了多久。
+    if (rec.startedAt) lastLoadMs = Math.max(0, Math.round(rec.readyAt - rec.startedAt));
     sampleBg(rec);
     freezeLayer(rec);
     const waiters = readyWaiters.get(rec.key);
@@ -204,6 +308,16 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     });
   }
 
+  // 起表只在「第一帧真的上屏」那一刻发生，所以循环与重来都不会先播一帧错的画面。
+  // ponytail: 回到第 1 步时那一层可能已经在屏幕上（末步正好也是第 1 步的快照），
+  // 没有交换可以等——那时候由 resetPlayback() 直接调这里，不然表会一直停在 0。
+  function startClock() {
+    if (!wantPlay) return;
+    wantPlay = false;
+    last = 0;
+    raf = requestAnimationFrame(tick);
+  }
+
   // 切换 = 换显示哪一层，一帧内 1/0，没有任何过渡。
   function swapTo(rec) {
     if (!rec || !rec.ready || rec.key === activeKey) return;
@@ -220,24 +334,40 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
       }
       activeKey = rec.key;
       state.snapshot = rec.key;
+      rec.usedAt = performance.now();
       if (rec.bg) mount.style.background = rec.bg;
       ring.classList.remove('show');
       const appliedAt = performance.now();
       // 相位证据：交换这一刻新层动画的当前时间（≈0 才说明它没偷跑）
       let phaseMs = null;
       try { const first = layerAnims(rec)[0]; phaseMs = first ? Math.round(Number(first.currentTime) || 0) : null; } catch { phaseMs = null; }
-      switches.push({ key: rec.key, costMs: Math.round(appliedAt - decideAt), applyAt: Math.round(appliedAt - t0), phaseMs, anims: rec.animCount === undefined ? null : rec.animCount, animCapped: !!rec.animCapped });
+      switches.push({
+        key: rec.key,
+        costMs: Math.round(appliedAt - decideAt),
+        applyAt: Math.round(appliedAt - t0),
+        phaseMs,
+        anims: rec.animCount === undefined ? null : rec.animCount,
+        animCapped: !!rec.animCapped,
+        // 排程账：这一层什么时候开始装、装了多久、它的那一步在哪一刻（核对 lead ≥ loadMs 用）
+        loadStartAt: rec.startedAt ? Math.round(rec.startedAt - t0) : null,
+        loadMs: rec.startedAt && rec.readyAt ? Math.round(rec.readyAt - rec.startedAt) : null,
+        stepAt: rec.stepAt === undefined ? null : rec.stepAt
+      });
       if (switches.length > 24) switches.shift();
-      if (wantPlay) { wantPlay = false; last = 0; raf = requestAnimationFrame(tick); }
+      startClock();
       onState && onState(publicState());
     });
   }
 
+  // 要某一层出面。没有提前装到的，现在装：切过去自然晚一点，页面不会空。
   function want(key) {
-    if (!(key in snapshots)) return false;
     wantKey = key;
-    const rec = recOf(key);
+    let rec = recOf(key);
+    if (!rec) rec = loadLayer(key);
     if (!rec) return false;
+    requested.add(key);
+    rec.stepAt = rec.stepAt === undefined ? Math.round(state.t) : rec.stepAt;
+    rec.usedAt = performance.now();
     rec.decideAt = performance.now();
     if (rec.ready) swapTo(rec);
     return true;
@@ -341,9 +471,21 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     const to = step.to;
     const el = () => resolveTarget(d, to);
     switch (step.do) {
-      case 'switch':
+      case 'switch': {
+        const rec = recOf(step.snapshot);
+        if (!rec || !rec.ready) {
+          // 到点了但那份快照还没就绪：不动画面，等它就绪后立刻切。宁可整体慢半拍。
+          if (!warnedSteps.has(step._i)) {
+            warnedSteps.add(step._i);
+            const why = rec ? (rec.failed ? '装失败' : '还没就绪') : '还没开始装';
+            delayed.push({ key: step.snapshot, stepAt: step.at, at: Math.round(state.t), why });
+            console.warn('[player] 第 ' + (step._i + 1) + ' 步（' + step.at + 'ms）要切到 "' + step.snapshot + '" 时它' + why
+              + '：继续显示当前这一帧，就绪后立刻切');
+          }
+        }
         want(step.snapshot);
         break;
+      }
       case 'move': {
         const e = el();
         if (!e) return false;
@@ -411,14 +553,24 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     updates = [];
     retries = [];
     fired.clear();
+    requested.clear();
+    warnedSteps.clear();
     state.t = 0;
     state.fired = 0;
     ring.classList.remove('show');
     ripple.classList.remove('go');
     setCursor(120, 120, true);
-    const first = steps.find((s) => s.do === 'switch');
-    const key = first ? first.snapshot : (Object.keys(snapshots)[0] || null);
-    if (key !== null) want(key);
+    // 第 1 步没有“前一步”可排程：一打开（或回到第 1 步）就把它装上。
+    const key = firstKey();
+    if (key !== null) {
+      want(key);
+      if (key === activeKey) {
+        // 第 1 步那份快照已经在屏幕上：want() 不会触发交换，就地重播这一帧并起表。
+        const rec = recOf(key);
+        if (rec) rewindLayer(rec);
+        startClock();
+      }
+    }
   }
 
   function tick(now) {
@@ -427,6 +579,7 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     const dt = now - last;
     last = now;
     state.t += dt;
+    scheduleLoads();
     fireDue();
     updates = updates.filter((fn) => fn() !== true);
     if (state.t >= duration) {
@@ -439,6 +592,23 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     raf = requestAnimationFrame(tick);
   }
 
+  /**
+   * 把一份快照重新解析一遍：拆掉这一层，装一个新的（新 iframe、新 blob URL），
+   * 就绪后照样硬切。零步骤的块没有时间轴可重来，restart() 走的就是这条路。
+   */
+  function reloadLayer(key) {
+    if (key === null || key === undefined) return null;
+    const old = recOf(key);
+    if (!old) return loadLayer(key);
+    if (activeKey === key) { activeKey = null; state.snapshot = null; }
+    layers.delete(key);
+    old.el.remove();
+    if (blobUrls.has(key)) { try { URL.revokeObjectURL(blobUrls.get(key)); } catch { /* 已经没了 */ } blobUrls.delete(key); }
+    const rec = loadLayer(key);
+    if (rec) wantKey = key;
+    return rec;
+  }
+
   function publicState() {
     const ls = [];
     for (const r of layers.values()) {
@@ -447,24 +617,32 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
     return {
       t: Math.round(state.t), playing: state.playing, snapshot: state.snapshot, duration,
       stepsFired: state.fired, steps: steps.length, layers: ls,
-      switched: switches.slice(-8), switchMs: switches.map((x) => x.costMs)
+      switched: switches.slice(-8), switchMs: switches.map((x) => x.costMs),
+      // 排程账：开头装了什么、谁被推迟、谁没拿到、当前 lead
+      loads: loads.slice(-8), delayed: delayed.slice(-8), failures: failures.slice(-8),
+      lead: leadMs(), maxLayers: MAX_LAYERS, liveDocs: layers.size
     };
   }
 
-  // 开场：每一份快照各就位（各自导航一次，之后永不重导航）
-  for (const key of Object.keys(snapshots)) {
-    try { makeLayer(key); } catch (e) { console.warn('[player] 快照装不进层：' + String((e && e.message) || e)); }
-  }
-  if (layers.size === 0) throw new Error('createPlayer: 没有可用的快照');
+  // 开场不把所有快照都装上（那是“打开就挂 N 份活文档”）：第 1 帧那份由
+  // resetPlayback() 立刻装，其余按时间轴排程一份一份来。
+  if (Object.keys(snapshots).length === 0) throw new Error('createPlayer: 没有可用的快照');
   resetPlayback();
 
   const api = {
     play() {
-      if (state.playing) return;
+      if (!hasSteps) {
+        // 零步骤：没有可以推进的时间轴，停在第 1 帧，一个定时器都不排。
+        state.playing = false;
+        onState && onState(publicState());
+        return publicState();
+      }
+      if (state.playing) return publicState();
       state.playing = true;
-      if (activeKey === null) { wantPlay = true; return; }   // 首帧还没上屏：等交换那一刻才起表
+      if (activeKey === null) { wantPlay = true; return publicState(); }   // 首帧还没上屏：等交换那一刻才起表
       last = 0;
       raf = requestAnimationFrame(tick);
+      return publicState();
     },
     pause() {
       state.playing = false;
@@ -494,6 +672,12 @@ export function createPlayer({ snapshots = {}, timeline = {}, mount, onState = n
       return publicState();
     },
     restart() {
+      if (!hasSteps) {
+        // 零步骤：时间轴归零没有意义，就把当前这一份重新解析一遍（⟲ 的文档那一半）。
+        state.t = 0;
+        reloadLayer(activeKey !== null ? activeKey : firstKey());
+        return publicState();
+      }
       state.playing = true;
       resetPlayback();
       return publicState();

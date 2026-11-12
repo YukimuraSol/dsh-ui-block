@@ -1466,13 +1466,16 @@ window.__ModuleLoader__.load({
           state.stage.style.transform = state.frame.style.transform;
         }
       }
-      // ── demo blocks: the HOST plays the timeline (route 1) ──────────────────
-      // A block file that carries a demo.json section is a DEMO BLOCK. The block
-      // stays pure data — sandbox: allow-same-origin only, no allow-scripts, the
-      // block frame still pointer-events:none — and this plugin is the projector:
-      // cursor, highlight, synthetic click, page switch and per-character typing
-      // all run from here on the snapshot documents the player mounts. A block
-      // without that section never reaches a line of this code.
+      // ── one content model, and the HOST plays whatever timeline it has ──────
+      //     snapshots (one of them is the entry document) + an optional timeline
+      // A block without a timeline is not a different kind of block: it is the
+      // degenerate input, one snapshot and zero steps. So readSpec() ALWAYS
+      // returns a spec, and every caller reads a parameter — "is there a
+      // timeline?" — instead of asking which kind of block this is. The block
+      // stays pure data (sandbox: allow-same-origin only, no allow-scripts,
+      // pointer-events:none); this plugin is the projector: cursor, highlight,
+      // synthetic click, page switch and per-character typing all run from here
+      // on the snapshot documents the player mounts.
       var DEMO_FILE_RE = /(^|\/)demo\.json$/;
 
       /** One block body's sections in file order; index 0 is the entry (path ''). */
@@ -1491,31 +1494,63 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * The demo spec of a block, or null for an ordinary block. Anything that is
-       * not a sectioned body with a parseable demo.json carrying a timeline stays
-       * on the old path — a typo must never cost a block its canvas.
+       * The degenerate spec: one snapshot (the entry document), zero steps.
+       *
+       * '' is the entry document — blockUrl() resolves it against the block's own
+       * served directory — so the entry needs no section name of its own.
        */
-      function readDemo(body) {
-        if (!hasSections(body)) return null;
+      function entrySpec() {
+        return { snapshots: { '': '' }, timeline: { steps: [] } };
+      }
+
+      /**
+       * Does this block carry a timeline? A PARAMETER read, never a kind check:
+       * the same expression decides painting, reloading and the test seam.
+       */
+      function hasTimeline(spec) {
+        return !!spec && !!spec.timeline && spec.timeline.steps.length > 0;
+      }
+
+      /**
+       * The spec of any block — always an object, never null.
+       *
+       * Anything that is not a sectioned body, or whose demo.json cannot be read,
+       * degrades to entrySpec(): a typo must never cost a block its canvas. An
+       * empty timeline is not a degraded block either; it is zero steps, which is
+       * the static case, read by the same rule as everything else.
+       */
+      function readSpec(body) {
+        if (!hasSections(body)) return entrySpec();
         var sections = blockSections(body);
         for (var i = 0; i < sections.length; i += 1) {
           if (!DEMO_FILE_RE.test(sections[i].path)) continue;
           var spec = null;
           try { spec = JSON.parse(sections[i].text); } catch (e) {
             // An unreadable timeline must never blank the block: one warning, then
-            // the ordinary static canvas shows its own markup.
-            console.warn('[dsh-ui-block] demo.json 解析失败，按静态块显示：' + String((e && e.message) || e));
-            return null;
+            // the entry document shows its own markup.
+            console.warn('[dsh-ui-block] demo.json 解析失败，按入口文档显示：' + String((e && e.message) || e));
+            return entrySpec();
           }
-          if (!spec || !spec.snapshots || !spec.timeline) return null;
-          var snaps = Object.keys(spec.snapshots);
-          var steps = spec.timeline.steps;
-          // No snapshot or no step is not a demo: an empty timeline falls back to
-          // the static page instead of a blank stage.
-          if (snaps.length === 0 || !Array.isArray(steps) || steps.length === 0) return null;
-          return spec;
+          if (!spec || !spec.snapshots || typeof spec.snapshots !== 'object') return entrySpec();
+          var snapshots = {};
+          var count = 0;
+          for (var name in spec.snapshots) {
+            if (!Object.prototype.hasOwnProperty.call(spec.snapshots, name)) continue;
+            snapshots[name] = String(spec.snapshots[name]);
+            count += 1;
+          }
+          if (count === 0) return entrySpec();
+          var timeline = spec.timeline && typeof spec.timeline === 'object' ? spec.timeline : {};
+          return {
+            snapshots: snapshots,
+            timeline: {
+              steps: Array.isArray(timeline.steps) ? timeline.steps : [],
+              loop: timeline.loop,
+              duration: timeline.duration
+            }
+          };
         }
-        return null;
+        return entrySpec();
       }
 
       /** A snapshot's address, resolved against the block's own served directory. */
@@ -1547,7 +1582,53 @@ window.__ModuleLoader__.load({
         state.mount = mount;
       }
 
-      /** A demo block paints the PLAYER; the raw block document never shows. */
+      /** The snapshot addresses of one spec, resolved against the served block. */
+      function snapshotUrls(state) {
+        var spec = state.spec;
+        var out = {};
+        for (var name in spec.snapshots) {
+          if (!Object.prototype.hasOwnProperty.call(spec.snapshots, name)) continue;
+          out[name] = blockUrl(state, spec.snapshots[name]);
+        }
+        return out;
+      }
+
+      /**
+       * One player for the block's spec. Every block with a timeline goes through
+       * here — there is no second renderer for "the demo kind".
+       *
+       * `previous` is the player a reload is replacing: its layers stay on screen
+       * until the new player's first frame has really been swapped in, so ⟲ never
+       * blanks the canvas on the way back to step 1.
+       */
+      function startPlayer(state, previous) {
+        var shown = false;
+        var onFail = function (info) {
+          // Nothing on screen yet and the snapshot step 1 asks for is gone: keep
+          // the entry document visible instead of an empty stage.
+          if (info && info.first && !info.onScreen) degradeToEntry(state, info.why);
+        };
+        var player = createPlayer({
+          snapshots: snapshotUrls(state),
+          timeline: state.spec.timeline,
+          mount: state.mount,
+          onState: function (next) {
+            state.playerState = next;
+            if (shown || !next || next.snapshot === null) return;
+            shown = true;
+            // The new first frame is up: only now does the old player go away.
+            if (previous) { try { previous.destroy(); } catch (e) { /* already gone */ } }
+          },
+          onFail: onFail
+        });
+        state.player = player;
+        armAutoplay(state);
+        applySize(state);
+        player.play();
+        return player;
+      }
+
+      /** A block with a timeline paints the PLAYER; the raw block document never shows. */
       function paintDemo(state) {
         if (state.paintedBody === state.body && state.player) return;
         state.paintedBody = state.body;
@@ -1555,27 +1636,27 @@ window.__ModuleLoader__.load({
         state.frame.style.display = 'none';
         destroyPlayer(state);
         ensureStage(state);
-        var spec = state.demoSpec;
-        var snapshots = {};
-        for (var name in spec.snapshots) {
-          if (!Object.prototype.hasOwnProperty.call(spec.snapshots, name)) continue;
-          snapshots[name] = blockUrl(state, spec.snapshots[name]);
-        }
-        state.player = createPlayer({
-          snapshots: snapshots,
-          timeline: spec.timeline,
-          mount: state.mount,
-          onState: function (next) { state.playerState = next; }
-        });
-        armAutoplay(state);
-        applySize(state);
-        state.player.play();
+        startPlayer(state, null);
+      }
+
+      /**
+       * Degrade instead of painting nothing: the entry document stays on the
+       * canvas, one warning names why. No 404 body is ever put on the canvas.
+       */
+      function degradeToEntry(state, why) {
+        if (state.degraded) return;
+        state.degraded = true;
+        console.warn('[dsh-ui-block] 时间轴里没有能显示的快照（' + why + '），退回入口文档：' + String(state.refPath || ''));
+        state.frame.style.visibility = '';
+        state.frame.style.display = '';
+        state.paintedKey = null;
+        paint(state);
       }
 
       /**
        * Autoplay by visibility: scrolling the block into view starts the show,
-       * scrolling it away pauses it. There is no pause button any more — the
-       * timeline is meant to run by itself and loop; ⟲ only puts it back on step 1.
+       * scrolling it away pauses it. The timeline is meant to run by itself;
+       * ⟲ re-parses the content, which is also how it gets back to step 1.
        */
       function armAutoplay(state) {
         if (typeof IntersectionObserver !== 'function' || !state.stage) return;
@@ -1591,23 +1672,17 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 演示块的 ⟲：把时间轴放回第 1 步，然后接着跑（要循环就还会循环）。
-       * 「重新加载」的语义没有变——对普通块是重载 entry，对演示块就是重放这份
-       * 时间轴；客户端不再为此多长一条控件。
+       * One block's live player facts. Any block takes this route: a block with no
+       * timeline simply has no player, and the answer says so (player: false)
+       * instead of the caller asking which kind of block it is.
        */
-      function demoRestart(state) {
-        if (!state.player) return null;
-        state.player.restart();
-        return state.player.state();
-      }
-
-      /** Test seam helper: one demo block's live facts, or null for a plain block. */
-      function demoInfoOf(index) {
+      function playerInfoOf(index) {
         var s = live[index || 0];
-        if (!s || !s.demoSpec) return null;
+        if (!s) return null;
         var st = s.player ? s.player.state() : null;
         return {
-          demo: true,
+          player: !!s.player,
+          timeline: hasTimeline(s.spec),
           playing: st ? st.playing : false,
           t: st ? st.t : null,
           snapshot: st ? st.snapshot : null,
@@ -1618,25 +1693,41 @@ window.__ModuleLoader__.load({
           layers: st ? st.layers : [],
           switched: st ? st.switched : [],
           switchMs: st ? st.switchMs : [],
+          loads: st ? st.loads : [],
+          delayed: st ? st.delayed : [],
+          failures: st ? st.failures : [],
+          lead: st ? st.lead : null,
+          liveDocs: st ? st.liveDocs : 0,
           frame: s.player ? s.player.frameInfo() : null
         };
       }
 
     // ── vendored player (ui-snapshot/player.mjs) — host-driven timeline ──────
-    // [vendored-player] copied 2026-11-09, re-vendored 2026-11-11 (double buffer);
-    // keep byte-identical to player.mjs in this plugin directory.
+    // [vendored-player] copied 2026-11-09, re-vendored 2026-11-11 (double buffer)
 // player.mjs — 宿主侧时间轴播放器（路线 1：块只当素材，外面演）
-// 用法：createPlayer({ snapshots, timeline, mount }) → { play, pause, seek, restart, destroy, state }
+// 用法：createPlayer({ snapshots, timeline, mount, onState, onFail })
+//         → { play, pause, seek, restart, destroy, state, frameInfo }
 // 快照是纯数据 HTML，用 blob: 装进同源 iframe；播放器在 iframe 之上画光标/高亮/涟漪，
 // 并直接改 iframe 里的 DOM（同源）来演示“填字 / 按下”。
 //
+// 内容模型（2026-11-12）：块 = 快照集合 + 可选时间轴。**零步骤是被接受的一种输入**，
+// 不是“另一种块”：steps.length === 0 时这里不排任何定时器、不推进，停在第 1 帧。
+// 于是调用方读的是参数（有没有时间轴），而不是块属于哪一类。
+//
 // 双缓冲（2026-11-11）。用户口径：浏览器里点链接就是硬切，不许我们“帮他画过渡”。
 // 所以这里做的只有一件事——**下一份文档画好之前，不把旧内容撤掉**：
-//   · 每份快照各自一个 iframe，开场全部导航一次；切步骤只改「显示哪一层」，永不重新导航；
+//   · 每份快照各自一个 iframe，切步骤只改「显示哪一层」，永不重新导航；
 //   · 就绪判据 = load 之后 readyState complete + document.fonts.status loaded，超时 800ms 兜底；
 //   · 就绪的那一刻在 requestAnimationFrame 里一次交换（opacity 直接 1/0，没有 transition/animation，
 //     没有淡入淡出）——硬切，只是把这次硬切挪到内容完整的那一刻；
 //   · 容器不写死底色：底色由每份快照自己的 body 背景色补上，取不到就保持透明。
+//
+// 按时间轴排程装快照（2026-11-12）。时间轴是写好的，所以“什么时候要哪一份”事先就知道：
+//   · 第 1 步打开就装；第 i 步在 (at − lead) 起装，lead = clamp(2 × 上一份实际加载耗时, 250, 2000ms)；
+//   · 到点还没就绪 → 继续显示上一帧、推迟切换，就绪后立刻切，并记一条告警（不留空画布）；
+//   · 层池上限 3，同一份快照复用，超了淘汰最久未用（正在显示/正要显示的除外）；
+//   · 装进后台层的动画一律 pause()，切过去 currentTime = 0 再 play()：只提前加载，不提前播。
+//   · 一份快照没拿到（404 / 非 HTML）：这一层永不上画布，告警一条，画面上留着上一帧。
 
 const STYLE_ID = 'snap-player-style';
 
@@ -1694,16 +1785,22 @@ function resolveTarget(doc, to) {
   return null;
 }
 
-function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) {
+function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null, onFail = null }) {
   if (!mount) throw new Error('createPlayer: mount 必填');
   ensureStyle();
 
   const steps = [...(timeline.steps || [])].sort((a, b) => a.at - b.at).map((s, i) => ({ ...s, _i: i }));
+  // 零步骤 = 静态（退化情形）：同一台机器，不推进而已。
+  const hasSteps = steps.length > 0;
   const loopEnabled = timeline.loop !== false;
-  const duration = timeline.duration || Math.max(0, ...steps.map((s) => s.at)) + 1500;
+  const duration = timeline.duration || (hasSteps ? Math.max(0, ...steps.map((s) => s.at)) + 1500 : 0);
   const READY_TIMEOUT_MS = 800;
   // 隐藏层上不许让动画偷跑：最多管这么多条，超了如实记下来（不假装全管住）。
   const MAX_ANIM = 300;
+  // 预加载提前量：钳在 250–2000ms；层池上限 3（淘汰最久未用）。
+  const LEAD_MIN = 250;
+  const LEAD_MAX = 2000;
+  const MAX_LAYERS = 3;
 
   // 快照两种形态，接口不变（仍是"换一份已抓快照"）：
   //   HTML 字符串  → 装进 blob:
@@ -1735,6 +1832,12 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   const state = { t: 0, playing: false, snapshot: null, fired: 0 };
   const layers = new Map();
   const switches = [];
+  const loads = [];         // 每次“开始装”：哪一步、什么时刻
+  const delayed = [];       // 到点还没就绪的切换（推迟，不是空画布）
+  const failures = [];      // 没拿到的快照
+  const requested = new Set();  // 本轮已经排过程的快照
+  const warnedSteps = new Set();
+  let lastLoadMs = 0;           // 上一份快照的实际加载耗时（lead 的来源）
   const undo = [];
   const originals = new Map();
   const hiddenOriginals = new Map();
@@ -1750,7 +1853,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   const doc = () => { try { const rec = activeKey === null ? null : layers.get(activeKey); return rec ? rec.el.contentDocument : null; } catch { return null; } };
   const recOf = (key) => layers.get(key) || null;
 
-  // ── 双缓冲：一层一快照，开场各自导航一次 ─────────────────────────────────────
+  // ── 双缓冲：一层一快照，每层导航一次 ─────────────────────────────────────────
   function makeLayer(key) {
     const el = document.createElement('iframe');
     el.className = 'snap-frame';
@@ -1759,7 +1862,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     el.setAttribute('data-snap', key);
     // 沙箱不变：可被同源读取，绝不执行脚本。
     el.setAttribute('sandbox', 'allow-same-origin');
-    const rec = { key, el, ready: false, bg: '', decideAt: 0, readyAt: 0 };
+    const rec = { key, el, ready: false, failed: false, bg: '', decideAt: 0, readyAt: 0, startedAt: performance.now(), usedAt: performance.now() };
     el.addEventListener('load', () => settle(rec, Date.now() + READY_TIMEOUT_MS));
     el.src = srcFor(key);
     mount.insertBefore(el, overlay);
@@ -1767,14 +1870,92 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     return rec;
   }
 
+  // 第 1 步要的那份快照：时间轴里第一个 switch，否则快照集合里的第一份。
+  function firstKey() {
+    const first = steps.find((s) => s.do === 'switch');
+    return first ? first.snapshot : (Object.keys(snapshots)[0] || null);
+  }
+
+  // lead = 2 × 上一份的实际加载耗时，钳在 250–2000ms。
+  const leadMs = () => Math.min(LEAD_MAX, Math.max(LEAD_MIN, Math.round((lastLoadMs || 0) * 2)));
+
+  /** 装一份快照进层。名字不在集合里、或层装不下，都只告警，不抛。 */
+  function loadLayer(key) {
+    const have = recOf(key);
+    if (have) return have;
+    if (!(key in snapshots)) {
+      const why = '不在快照集合里（有：' + Object.keys(snapshots).join(', ') + '）';
+      failures.push({ key, why, at: Math.round(performance.now() - t0) });
+      console.warn('[player] 时间轴要的 "' + key + '" ' + why);
+      onFail && onFail({ key, why, first: key === firstKey(), onScreen: activeKey !== null });
+      return null;
+    }
+    if (!makeRoom(key)) return null;
+    try { return makeLayer(key); } catch (e) {
+      const why = String((e && e.message) || e);
+      failures.push({ key, why, at: Math.round(performance.now() - t0) });
+      console.warn('[player] 快照 "' + key + '" 装不进层：' + why);
+      onFail && onFail({ key, why, first: key === firstKey(), onScreen: activeKey !== null });
+      return null;
+    }
+  }
+
+  /** 层池上限 MAX_LAYERS：超了淘汰最久未用的（正在显示、正要显示的都不淘汰）。 */
+  function makeRoom(key) {
+    if (layers.has(key)) return true;
+    while (layers.size >= MAX_LAYERS) {
+      let victim = null;
+      for (const r of layers.values()) {
+        if (r.key === activeKey || r.key === wantKey) continue;
+        if (!victim || r.usedAt < victim.usedAt) victim = r;
+      }
+      if (!victim) return false;   // 全是活层：宁可不预装，也不拆正在用的
+      victim.el.remove();
+      layers.delete(victim.key);
+    }
+    return true;
+  }
+
+  /** 每一帧核对一次：哪一步快到点了，就把它的快照装起来（只提前加载，不提前播）。 */
+  function scheduleLoads() {
+    if (!hasSteps) return;
+    const lead = leadMs();
+    for (const s of steps) {
+      if (s.do !== 'switch') continue;
+      if (s.at - lead > state.t) continue;
+      if (recOf(s.snapshot) || requested.has(s.snapshot)) continue;
+      requested.add(s.snapshot);
+      loads.push({ key: s.snapshot, stepAt: s.at, startedAt: Math.round(performance.now() - t0), lead });
+      loadLayer(s.snapshot);
+    }
+  }
+
+  /**
+   * 一份快照没拿到（404 / 没装成）：这一层永远不上画布——错误文档不许顶到画上。
+   * 画面上继续留上一帧；画布上还什么都没有时，交给 onFail 决定怎么降级。
+   */
+  function failLayer(rec, why) {
+    if (rec.failed) return;
+    rec.failed = true;
+    rec.ready = false;
+    rec.why = why;
+    failures.push({ key: rec.key, why, at: Math.round(performance.now() - t0) });
+    console.warn('[player] 快照 "' + rec.key + '" 没拿到（' + why + '）：保持上一帧，不把错误文档挂到画布上');
+    readyWaiters.delete(rec.key);
+    onFail && onFail({ key: rec.key, why, first: rec.key === firstKey(), onScreen: activeKey !== null });
+  }
+
   function settle(rec, deadline) {
-    if (rec.ready) return;
-    let complete = false, fonts = true;
+    if (rec.ready || rec.failed) return;
+    let complete = false, fonts = true, type = '';
     try {
       const d = rec.el.contentDocument;
+      type = d ? String(d.contentType || '') : '';
       complete = !!d && d.readyState === 'complete' && !!d.body;
       fonts = !d || !d.fonts || d.fonts.status === 'loaded';
     } catch { complete = false; }
+    // 拿回来的不是 HTML，就不是这份快照：宿主的 404/415 是 text/plain 正文。
+    if (complete && type && type !== 'text/html') { failLayer(rec, 'content-type ' + type); return; }
     if (complete && fonts) { finish(rec); return; }
     if (Date.now() >= deadline) { finish(rec); return; }   // 兜底：宁可慢一帧，也不许卡住时间轴
     laterReady(16, () => settle(rec, deadline));
@@ -1801,9 +1982,11 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
   }
 
   function finish(rec) {
-    if (rec.ready) return;
+    if (rec.ready || rec.failed) return;
     rec.ready = true;
     rec.readyAt = performance.now();
+    // 下一份的 lead 就取自这一次实际花了多久。
+    if (rec.startedAt) lastLoadMs = Math.max(0, Math.round(rec.readyAt - rec.startedAt));
     sampleBg(rec);
     freezeLayer(rec);
     const waiters = readyWaiters.get(rec.key);
@@ -1831,6 +2014,16 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     });
   }
 
+  // 起表只在「第一帧真的上屏」那一刻发生，所以循环与重来都不会先播一帧错的画面。
+  // ponytail: 回到第 1 步时那一层可能已经在屏幕上（末步正好也是第 1 步的快照），
+  // 没有交换可以等——那时候由 resetPlayback() 直接调这里，不然表会一直停在 0。
+  function startClock() {
+    if (!wantPlay) return;
+    wantPlay = false;
+    last = 0;
+    raf = requestAnimationFrame(tick);
+  }
+
   // 切换 = 换显示哪一层，一帧内 1/0，没有任何过渡。
   function swapTo(rec) {
     if (!rec || !rec.ready || rec.key === activeKey) return;
@@ -1847,24 +2040,40 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       }
       activeKey = rec.key;
       state.snapshot = rec.key;
+      rec.usedAt = performance.now();
       if (rec.bg) mount.style.background = rec.bg;
       ring.classList.remove('show');
       const appliedAt = performance.now();
       // 相位证据：交换这一刻新层动画的当前时间（≈0 才说明它没偷跑）
       let phaseMs = null;
       try { const first = layerAnims(rec)[0]; phaseMs = first ? Math.round(Number(first.currentTime) || 0) : null; } catch { phaseMs = null; }
-      switches.push({ key: rec.key, costMs: Math.round(appliedAt - decideAt), applyAt: Math.round(appliedAt - t0), phaseMs, anims: rec.animCount === undefined ? null : rec.animCount, animCapped: !!rec.animCapped });
+      switches.push({
+        key: rec.key,
+        costMs: Math.round(appliedAt - decideAt),
+        applyAt: Math.round(appliedAt - t0),
+        phaseMs,
+        anims: rec.animCount === undefined ? null : rec.animCount,
+        animCapped: !!rec.animCapped,
+        // 排程账：这一层什么时候开始装、装了多久、它的那一步在哪一刻（核对 lead ≥ loadMs 用）
+        loadStartAt: rec.startedAt ? Math.round(rec.startedAt - t0) : null,
+        loadMs: rec.startedAt && rec.readyAt ? Math.round(rec.readyAt - rec.startedAt) : null,
+        stepAt: rec.stepAt === undefined ? null : rec.stepAt
+      });
       if (switches.length > 24) switches.shift();
-      if (wantPlay) { wantPlay = false; last = 0; raf = requestAnimationFrame(tick); }
+      startClock();
       onState && onState(publicState());
     });
   }
 
+  // 要某一层出面。没有提前装到的，现在装：切过去自然晚一点，页面不会空。
   function want(key) {
-    if (!(key in snapshots)) return false;
     wantKey = key;
-    const rec = recOf(key);
+    let rec = recOf(key);
+    if (!rec) rec = loadLayer(key);
     if (!rec) return false;
+    requested.add(key);
+    rec.stepAt = rec.stepAt === undefined ? Math.round(state.t) : rec.stepAt;
+    rec.usedAt = performance.now();
     rec.decideAt = performance.now();
     if (rec.ready) swapTo(rec);
     return true;
@@ -1968,9 +2177,21 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     const to = step.to;
     const el = () => resolveTarget(d, to);
     switch (step.do) {
-      case 'switch':
+      case 'switch': {
+        const rec = recOf(step.snapshot);
+        if (!rec || !rec.ready) {
+          // 到点了但那份快照还没就绪：不动画面，等它就绪后立刻切。宁可整体慢半拍。
+          if (!warnedSteps.has(step._i)) {
+            warnedSteps.add(step._i);
+            const why = rec ? (rec.failed ? '装失败' : '还没就绪') : '还没开始装';
+            delayed.push({ key: step.snapshot, stepAt: step.at, at: Math.round(state.t), why });
+            console.warn('[player] 第 ' + (step._i + 1) + ' 步（' + step.at + 'ms）要切到 "' + step.snapshot + '" 时它' + why
+              + '：继续显示当前这一帧，就绪后立刻切');
+          }
+        }
         want(step.snapshot);
         break;
+      }
       case 'move': {
         const e = el();
         if (!e) return false;
@@ -2038,14 +2259,24 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     updates = [];
     retries = [];
     fired.clear();
+    requested.clear();
+    warnedSteps.clear();
     state.t = 0;
     state.fired = 0;
     ring.classList.remove('show');
     ripple.classList.remove('go');
     setCursor(120, 120, true);
-    const first = steps.find((s) => s.do === 'switch');
-    const key = first ? first.snapshot : (Object.keys(snapshots)[0] || null);
-    if (key !== null) want(key);
+    // 第 1 步没有“前一步”可排程：一打开（或回到第 1 步）就把它装上。
+    const key = firstKey();
+    if (key !== null) {
+      want(key);
+      if (key === activeKey) {
+        // 第 1 步那份快照已经在屏幕上：want() 不会触发交换，就地重播这一帧并起表。
+        const rec = recOf(key);
+        if (rec) rewindLayer(rec);
+        startClock();
+      }
+    }
   }
 
   function tick(now) {
@@ -2054,6 +2285,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     const dt = now - last;
     last = now;
     state.t += dt;
+    scheduleLoads();
     fireDue();
     updates = updates.filter((fn) => fn() !== true);
     if (state.t >= duration) {
@@ -2066,6 +2298,23 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     raf = requestAnimationFrame(tick);
   }
 
+  /**
+   * 把一份快照重新解析一遍：拆掉这一层，装一个新的（新 iframe、新 blob URL），
+   * 就绪后照样硬切。零步骤的块没有时间轴可重来，restart() 走的就是这条路。
+   */
+  function reloadLayer(key) {
+    if (key === null || key === undefined) return null;
+    const old = recOf(key);
+    if (!old) return loadLayer(key);
+    if (activeKey === key) { activeKey = null; state.snapshot = null; }
+    layers.delete(key);
+    old.el.remove();
+    if (blobUrls.has(key)) { try { URL.revokeObjectURL(blobUrls.get(key)); } catch { /* 已经没了 */ } blobUrls.delete(key); }
+    const rec = loadLayer(key);
+    if (rec) wantKey = key;
+    return rec;
+  }
+
   function publicState() {
     const ls = [];
     for (const r of layers.values()) {
@@ -2074,24 +2323,32 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
     return {
       t: Math.round(state.t), playing: state.playing, snapshot: state.snapshot, duration,
       stepsFired: state.fired, steps: steps.length, layers: ls,
-      switched: switches.slice(-8), switchMs: switches.map((x) => x.costMs)
+      switched: switches.slice(-8), switchMs: switches.map((x) => x.costMs),
+      // 排程账：开头装了什么、谁被推迟、谁没拿到、当前 lead
+      loads: loads.slice(-8), delayed: delayed.slice(-8), failures: failures.slice(-8),
+      lead: leadMs(), maxLayers: MAX_LAYERS, liveDocs: layers.size
     };
   }
 
-  // 开场：每一份快照各就位（各自导航一次，之后永不重导航）
-  for (const key of Object.keys(snapshots)) {
-    try { makeLayer(key); } catch (e) { console.warn('[player] 快照装不进层：' + String((e && e.message) || e)); }
-  }
-  if (layers.size === 0) throw new Error('createPlayer: 没有可用的快照');
+  // 开场不把所有快照都装上（那是“打开就挂 N 份活文档”）：第 1 帧那份由
+  // resetPlayback() 立刻装，其余按时间轴排程一份一份来。
+  if (Object.keys(snapshots).length === 0) throw new Error('createPlayer: 没有可用的快照');
   resetPlayback();
 
   const api = {
     play() {
-      if (state.playing) return;
+      if (!hasSteps) {
+        // 零步骤：没有可以推进的时间轴，停在第 1 帧，一个定时器都不排。
+        state.playing = false;
+        onState && onState(publicState());
+        return publicState();
+      }
+      if (state.playing) return publicState();
       state.playing = true;
-      if (activeKey === null) { wantPlay = true; return; }   // 首帧还没上屏：等交换那一刻才起表
+      if (activeKey === null) { wantPlay = true; return publicState(); }   // 首帧还没上屏：等交换那一刻才起表
       last = 0;
       raf = requestAnimationFrame(tick);
+      return publicState();
     },
     pause() {
       state.playing = false;
@@ -2121,6 +2378,12 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
       return publicState();
     },
     restart() {
+      if (!hasSteps) {
+        // 零步骤：时间轴归零没有意义，就把当前这一份重新解析一遍（⟲ 的文档那一半）。
+        state.t = 0;
+        reloadLayer(activeKey !== null ? activeKey : firstKey());
+        return publicState();
+      }
       state.playing = true;
       resetPlayback();
       return publicState();
@@ -2170,8 +2433,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         return query.length === 0 ? url : url + '?' + query.join('&');
       }
       function paint(state) {
-        // A demo block is played from here, never painted as a document.
-        if (state.demoSpec) { paintDemo(state); return; }
+        // A block WITH a timeline is played from here, never painted as a
+        // document. That is the only difference — a parameter, not a kind.
+        if (!state.degraded && hasTimeline(state.spec)) { paintDemo(state); return; }
         var served = hasSections(state.body);
         // Served branch: what renders is the SERVER's copy, so the key carries a
         // hash of the body (an edit must still repaint) and the pin. The token
@@ -2224,7 +2488,29 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         state.frame.style.visibility = '';
       }
       /**
-       * Replay one block: load its entry again, exactly like F5 in a browser.
+       * ⟲ = 刷新 = 把这个块当前可见的内容重新解析一遍。对任何块都成立，没有第二种：
+       *
+       *   · 有时间轴 → 播放器整个重建，于是时间轴回到第 1 步、第 1 步那份快照
+       *     重新解析（入场动画从 0 开始）。**回到第 1 步不是另一个动作，是重建的结果。**
+       *   · 零步骤   → 画布上那唯一一份文档重新解析。
+       *
+       * 也就没有“只把时间轴放回第 1 步、却不重播当前快照”的捷径了：那条旁路
+       * （demoRestart）已删除，播放器也不再对外提供只重置时间轴的入口。
+       * 空窗由双缓冲挡住：旧层留在屏幕上，新首帧上屏那一刻才拆。
+       */
+      function reloadBlock(state) {
+        if (!state) return null;
+        if (!hasTimeline(state.spec)) return replayBlock(state);
+        if (!state.stage || !state.stage.isConnected) { state.paintedBody = null; paint(state); return { mode: 'player' }; }
+        var previous = state.player;
+        state.player = null;
+        state.playerState = null;
+        // 同一个挂载点上再起一层播放器：旧层继续显示，新首帧交换后才拆旧的。
+        startPlayer(state, previous);
+        return { mode: 'player' };
+      }
+      /**
+       * The document half of ⟲: load this block's entry again, exactly like F5.
        *
        * NOT a loop. A block copies the site as it is, and the site plays its
        * entrance once and stops on the final frame — turning that into an
@@ -2246,9 +2532,6 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
        */
       function replayBlock(state) {
         if (!state || !state.frame || !state.frame.isConnected) return null;
-        // A demo block already has 播放 / 暂停 / 重新开始 and is owned by the
-        // player; reloading its frame underneath would fight the timeline.
-        if (state.demoSpec) return null;
         if (state.urlMode) {
           // Assigning the same src again is not a guaranteed navigation: the
           // counter makes it a different URL, and nothing else reads it.
@@ -2366,32 +2649,29 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           event.stopPropagation();
           armPick(state);
         });
-        // Replay. One-shot animations copy the site honestly and then sit on
-        // their final frame, which reads as "static" to anyone who looks a
-        // second later. This button reloads the entry instead of changing that
-        // timing: the loop stays a one-shot, the user decides when it runs.
-        // Not on a demo block — the transport already has 重新开始.
+        // ⟲ — ONE button, ONE wording, ONE action (user call, 2026-11-12).
+        // One-shot animations copy the site honestly and then sit on their final
+        // frame, which reads as "static" to anyone who looks a second later. This
+        // button re-parses the content instead of changing that timing: the loop
+        // stays a one-shot, the user decides when it runs.
         // Icon only (user call, 2026-11-11): no visible word, and the same 24x16
         // box as the picker, sitting BETWEEN 分辨率 and 选取元素. The name lives
         // in aria-label (what a screen reader says) and in the row's bubble (what
         // the pointer gets) — one hover mechanism for the whole row.
-        // Every block gets this button — demo or not (user call, 2026-11-11: one
-        // header, no demo-only row). What it does is the only thing that differs:
-        // a plain block throws its document away and parses it again (a reload); a
-        // demo block puts its timeline back on step 1.
+        // NOT branched on the kind of block: 重新加载 means the same thing for
+        // every block (refresh = parse it again), so the label, the bubble and the
+        // handler are constant. A block with a timeline gets back to step 1 as a
+        // CONSEQUENCE of being re-parsed, not through a second action.
         var replayButton = document.createElement('button');
         replayButton.type = 'button';
         replayButton.className = 'dshpb-btn dshpb-replay';
-        replayButton.setAttribute('aria-label', '重放动画');
-        attachTip(replayButton, function () {
-          return state.demoSpec ? '重新开始演示（从第 1 步重来）' : '重新加载画布内容（等同刷新）';
-        });
+        replayButton.setAttribute('aria-label', '重新加载');
+        attachTip(replayButton, '重新加载（重新解析画布内容，等同刷新）');
         replayButton.innerHTML = '<svg viewBox="0 0 13 13" aria-hidden="true"><path d="M10.9 6.5a4.4 4.4 0 1 1-1.29-3.11"/><path d="M9.9 1.3v2.3H7.6"/><path class="dshpb-tri" d="M5.7 4.6l2.4 1.9-2.4 1.9z"/></svg>';
         replayButton.addEventListener('click', function (event) {
           event.preventDefault();
           event.stopPropagation();
-          if (state.demoSpec) demoRestart(state);
-          else replayBlock(state);
+          reloadBlock(state);
         });
         // The copy icon is OURS now (see the block further down): same 24x24 box,
         // no border, same hover fill as the other three, and the same attachTip.
@@ -3116,7 +3396,9 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
             pinned: pin !== null,
             pin: pin,
             body: body,
-            demoSpec: readDemo(body),
+            // One content model for every block — always an object, never null.
+            spec: readSpec(body),
+            degraded: false,
             paintedKey: null,
             tokensKey: '',
             appliedAttrsKey: ''
@@ -3138,11 +3420,15 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
         // Same block, new file contents (the user or the agent edited it), or a
         // changed res= clause: adopt both, then repaint (paint() keys on the body
         // and the canvas size, so either change re-renders).
+        var bodyChanged = state.body !== body;
         state.firstLine = line;
         state.body = body;
-        // A timeline in the block file makes it a demo block; anything else is
-        // the ordinary canvas, untouched.
-        state.demoSpec = readDemo(body);
+        // The spec is re-read for every block, timeline or not: a block with no
+        // timeline is the zero-step case of the same model, not another kind.
+        state.spec = readSpec(body);
+        // A new body gets a fresh chance: a block that had to fall back to its
+        // entry document may well be fixed now.
+        if (bodyChanged) state.degraded = false;
         if (directive.res && (directive.res.w !== state.res.w || directive.res.h !== state.res.h)) {
           state.res = directive.res;
           state.declared = true;
@@ -3208,7 +3494,7 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
             if (again !== null) ensureSeat(state.root, again);
             continue;
           }
-          if (!state.demoSpec && state.frame.getAttribute('srcdoc') === null && state.frame.getAttribute('src') === null) { state.paintedKey = null; paint(state); }
+          if (!hasTimeline(state.spec) && state.frame.getAttribute('srcdoc') === null && state.frame.getAttribute('src') === null) { state.paintedKey = null; paint(state); }
           if (!state.controls || !state.controls.isConnected) { buildControls(state); applySize(state); }
           else if (!state.drag) applySize(state); // never fight an active rubber-band drag
           // TTL re-read: an edited file repaints without a page reload. A pinned
@@ -3372,23 +3658,51 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
           }
         },
         /**
-         * Test seam: the banner's replay button, as a function. Loads the
-         * block's entry again (exactly like F5); returns { mode } or null for a
-         * demo block / a block that is gone.
+         * Test seam: a banner button, as a function — ⟲ calls EXACTLY what the
+         * button calls (reloadBlock), never a nearby copy of it.
          */
-        replay: function (index) { var s = live[index || 0]; if (!s) return null; return replayBlock(s); },
-        /**
-         * Test seam: one demo block's clock and transport (null for a plain
-         * block). Read-only except play/pause/restart, which are the same
-         * functions the banner buttons call.
-         */
-        demos: {
-          count: function () { var n = 0; for (var i = 0; i < live.length; i += 1) if (live[i].demoSpec) n += 1; return n; },
-          state: function (index) { return demoInfoOf(index); },
-          play: function (index) { var s = live[index || 0]; if (s && s.demoSpec && s.player) s.player.play(); return demoInfoOf(index); },
-          pause: function (index) { var s = live[index || 0]; if (s && s.demoSpec && s.player) s.player.pause(); return demoInfoOf(index); },
-          restart: function (index) { var s = live[index || 0]; if (s && s.demoSpec) demoRestart(s); return demoInfoOf(index); }
+        replay: function (index) { var s = live[index || 0]; if (!s) return null; return reloadBlock(s); },
+        /** Test seam: the banner row as built (for comparing two blocks field by field). */
+        header: function (index) {
+          var s = live[index || 0];
+          if (!s || !s.controls) return null;
+          return { html: s.controls.outerHTML, buttons: s.controls.querySelectorAll('button').length };
         },
+        /** Test seam: press the banner's ⟲ exactly the way a pointer does. */
+        press: function (index) {
+          var s = live[index || 0];
+          if (!s || !s.controls) return null;
+          var b = s.controls.querySelector('.dshpb-replay');
+          if (!b) return null;
+          b.click();
+          return true;
+        },
+        /**
+         * Test seam: one block's content model. Every block answers, timeline or
+         * not — { snapshots, steps, loop, timeline, degraded }, never null for a
+         * live block. `timeline` is the parameter every branch reads.
+         */
+        spec: function (index) {
+          var s = live[index || 0];
+          if (!s) return null;
+          var spec = s.spec;
+          return {
+            snapshots: Object.keys(spec.snapshots),
+            steps: spec.timeline.steps.length,
+            loop: spec.timeline.loop !== false,
+            timeline: hasTimeline(spec),
+            degraded: !!s.degraded,
+            player: !!s.player
+          };
+        },
+        /**
+         * Test seam: one block's player facts (player:false when the block has no
+         * timeline). Read-only except play/pause/restart/reload, which are the
+         * same functions the banner uses.
+         */
+        player: function (index) { return playerInfoOf(index); },
+        play: function (index) { var s = live[index || 0]; if (s && s.player) s.player.play(); return playerInfoOf(index); },
+        pause: function (index) { var s = live[index || 0]; if (s && s.player) s.player.pause(); return playerInfoOf(index); },
         sweep: function () {
           sweep();
           return {
@@ -3398,7 +3712,8 @@ function createPlayer({ snapshots = {}, timeline = {}, mount, onState = null }) 
             live: live.map(function (s) {
               return {
                 ref: s.refPath,
-                demo: !!s.demoSpec,
+                timeline: hasTimeline(s.spec),
+                steps: s.spec.timeline.steps.length,
                 pinned: !!s.pinned,
                 pin: s.pin === null || s.pin === undefined ? null : { key: s.pin.key, index: s.pin.index },
                 res: formatRes(s.res),
