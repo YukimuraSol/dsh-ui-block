@@ -10,12 +10,12 @@ dsh-ui-block 全量回归测试清单
 
 这份清单测的是 dsh-ui-block 这个包，不是某个实例。三个代码位置：
 
-  归档仓库    D:\cursor编程文件\工作区1相关\工作区1\具体项目\DSH自研插件\dsh-ui-block（本目录，只读参考）
-  3080 插件体 D:\DSH Pack Launcher\dsh-packs\dsh-origin-3080\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block
+  归档仓库    <仓库目录>（本目录，只读参考）
+  3080 插件体 <DSH_HOME>\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block
              另有一份实体副本：...\profiles\web\node_modules\dsh-ui-block（不是 junction，见已知问题 3）
-  4000 插件体 D:\DSH Pack Launcher\dsh-packs\dsh-fallback-4000\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block
+  4000 插件体 <DSH_HOME>\profiles\web\.dsh-launcher-plugin-bodies\dsh-ui-block（另一份 DSH_HOME）
 
-被测数据都落在 DSH_HOME 下（3080 的 DSH_HOME 是 D:\DSH Pack Launcher\dsh-packs\dsh-origin-3080）：
+被测数据都落在 DSH_HOME 下：
 
   块文件      <DSH_HOME>\ui-blocks\<name>.uiblock（HTML 片段，无元信息行、无 <html> 包装）
   历史        <DSH_HOME>\ui-blocks\.history\<name>\base.uiblock 与 log.json（一行一条 {at, patch}）
@@ -501,8 +501,8 @@ K2. 版本号三处不同步
    只改一处就会让这句文案变成假话。
    相关条目：UB-C-03、UB-F-09。
 
-K3. README 说 node_modules 里是 junction，实测不是
-   README:44 写「3080 的 profiles\web\node_modules\dsh-ui-block junction 指向 D:\dsh-plugins\dsh-ui-block」。
+K3. 曾以为 node_modules 里是 junction，实测不是
+   README 旧版写「3080 的 profiles\web\node_modules\dsh-ui-block junction 指向 <插件源目录>\dsh-ui-block」。
    2026-10-30 实测：该目录是普通目录（fsutil reparsepoint query 报 4390「不是重解析点」），
    且内容与归档哈希一致。也就是说现在有三份实体副本（归档、3080、4000），改代码必须三处同步，
    而 index.js:63-67 的注释仍按「junction 会被 realpathSync 折回包体」来论证路由安全。

@@ -2,11 +2,11 @@
 
 - 执行时间：2026-10-30 17:22 ~ 18:25（Asia/Shanghai）
 - 实例：DeepSeekRuntime 桌面端（Electron 44.7.0 / Chrome 152.0.7977.130，宿主 release 0.2.1-rc.3，page target `dsh-app://app/`）
-- 插件版本：**0.2.2**（`C:\Users\ASUS\.dsh\profiles\desktop\node_modules\dsh-ui-block\package.json` → version 0.2.2；`window.__dshPageBlock.version` 报 `0.6.0`，见 K2）
+- 插件版本：**0.2.2**（`%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-ui-block\package.json` → version 0.2.2；`window.__dshPageBlock.version` 报 `0.6.0`，见 K2）
 - 模型：**ofm / codearts/deepseek-v4.1-flash**（`http://127.0.0.1:18900/v1`），单轮 40 ~ 150 秒
 - 执行方式：CDP（`--remote-debugging-port=9222`）驱动真界面（`Runtime.evaluate` + `Input.dispatchMouseEvent` / `Input.insertText`）+ 宿主路由直调 + 三个自检脚本直跑
 - 只记录，不改插件源码；未触碰 3080（pid 30636）/ 4000（pid 31112）/ 3500；窗口全程最小化（hwnd 660560，`IsIconic=True`），未 `Page.bringToFront`、未 `ShowWindow` 还原
-- 主会话：`session-f1443acc-ccf1-43c7-ab78-79351308716e`（共 4 轮）
+- 主会话：`<session-id>`（共 4 轮）
 
 ## 一、结论摘要
 
@@ -32,10 +32,10 @@
 | 项 | 实测 |
 | --- | --- |
 | 启动命令 | `Start-Process -FilePath '<安装目录>\DeepSeekRuntime.exe' -WorkingDirectory 'C:\' -ArgumentList '--remote-debugging-port=9222'` |
-| 安装目录 | `C:\Users\ASUS\AppData\Local\Programs\DeepSeekRuntime`（名字里**有空格**；注册表 `InstallLocation` 写的是无空格版本，照抄会报「系统找不到指定的文件」） |
+| 安装目录 | `%USERPROFILE%\AppData\Local\Programs\DeepSeekRuntime`（名字里**有空格**；注册表 `InstallLocation` 写的是无空格版本，照抄会报「系统找不到指定的文件」） |
 | 9222 | 监听 `127.0.0.1:9222`，pid **9956**；`/json/version` → `Chrome/152.0.7977.130`、UA 含 `@deepseek-ai/dsh-desktop/0.2.1-rc.3` |
 | 应用内 Web UI | `http://127.0.0.1:57901/?token=VlyFQ-…`（只绑 127.0.0.1） |
-| DSH_HOME | `C:\Users\ASUS\.dsh`；profile = `C:\Users\ASUS\.dsh\profiles\desktop` |
+| DSH_HOME | `%USERPROFILE%\.dsh`；profile = `%USERPROFILE%\.dsh\profiles\desktop` |
 | 插件装载 | 重启前 `__DSH_BOOT__.entries` 73 条、无 `dsh-ui-block`、`/ui-block-extension` 404；安装并重启后 74 条、`window.__dshPageBlock` 存在、路由 200 |
 | 窗口状态 | 最小化，`IsIconic=True`；rAF 被压到 ~1fps、`setTimeout` 被压到 ~1s，所有等待按 ≥1.5 秒（动画 2.5 秒）取 |
 | 桌面端与 3080 的差异 | 桌面端 profile 原本没装 dsh-ui-block（3080/4000 装了）；本轮按授权安装到 desktop profile |
@@ -91,8 +91,8 @@
 | --- | --- | --- |
 | C-01 | **PASS** | 插件详情页底部实测 `<div class="dshub-ext" data-dsh-ui-block-extension="card">`；`__pure.extensionEntry` 无法读（同 B-10），条目对象只按源码 client.js:2254 记录为 `{name:'plugins.detail.section', id:'ui-block-extension', order:100}` |
 | C-02 | **PARTIAL** | dsh-ui-block 详情页有卡片；**其它插件的详情页没打开成功**（点「返回」没回到列表，页面上仍是 dsh-ui-block 详情），所以「别的插件页没有卡片」这一半没验到 |
-| C-03 | **PASS** | 卡片第二行逐字 **`扩展版本 0.2.2 · 与插件 package.json 同版`**；`GET /ui-block-extension` → `{"ok":true,"dir":"C:\\Users\\ASUS\\.dsh\\profiles\\desktop\\node_modules\\dsh-ui-block\\extension","version":"0.2.2","name":"dsh-element-picker","manifestVersion":3}`。注：文案说的「与 package.json 同版」不做校验，读的是 manifest（K2） |
-| C-04 | **PARTIAL** | 成功态：`input.dshub-ext-path[aria-label=扩展目录]` 的 `value` = `C:\Users\ASUS\.dsh\profiles\desktop\node_modules\dsh-ui-block\extension`（绝对路径、`readonly`）。**「读取中…」与「（读取失败）」两个态没构造**（要改 extension 目录名或让路由 500，本轮没做） |
+| C-03 | **PASS** | 卡片第二行逐字 **`扩展版本 0.2.2 · 与插件 package.json 同版`**；`GET /ui-block-extension` → `{"ok":true,"dir":"%USERPROFILE%\\.dsh\\profiles\\desktop\\node_modules\\dsh-ui-block\\extension","version":"0.2.2","name":"dsh-element-picker","manifestVersion":3}`。注：文案说的「与 package.json 同版」不做校验，读的是 manifest（K2） |
+| C-04 | **PARTIAL** | 成功态：`input.dshub-ext-path[aria-label=扩展目录]` 的 `value` = `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-ui-block\extension`（绝对路径、`readonly`）。**「读取中…」与「（读取失败）」两个态没构造**（要改 extension 目录名或让路由 500，本轮没做） |
 | C-05 | **PARTIAL** | 点「复制路径」后按钮文字变 **`已复制`**；**剪贴板没验到**（同 4.2） |
 | C-06 | **BLOCKED** | 点「打开文件夹」会真的弹资源管理器并抢焦点，本轮按清单第 2 节的「放到最后」也没执行（E-06 同因未跑）；路由侧只验了缺头 403（E-05） |
 | C-07 | **PASS** | 卡片全文：标题 `浏览器扩展 dsh-element-picker`；`ol.dshub-ext-steps` 三条逐字 `打开 chrome://extensions` / `打开右上角的「开发者模式」` / `点「加载已解压的扩展程序」，选上面这个目录`；`div.dshub-ext-hint` 含「重新加载一次扩展」 |
@@ -124,7 +124,7 @@
 
 | 编号 | 结论 | 实测值 |
 | --- | --- | --- |
-| E-01 | **PASS** | `GET /ui-block-extension` → 200 `{"ok":true,"dir":"C:\\Users\\ASUS\\.dsh\\profiles\\desktop\\node_modules\\dsh-ui-block\\extension","version":"0.2.2","name":"dsh-element-picker","manifestVersion":3}`；`dir` 绝对路径、以 `\extension` 结尾 |
+| E-01 | **PASS** | `GET /ui-block-extension` → 200 `{"ok":true,"dir":"%USERPROFILE%\\.dsh\\profiles\\desktop\\node_modules\\dsh-ui-block\\extension","version":"0.2.2","name":"dsh-element-picker","manifestVersion":3}`；`dir` 绝对路径、以 `\extension` 结尾 |
 | E-02 | **PASS** | `/ui-block-extension`、`/ui-block-extension/`、`/ui-block-extension///`、`/ui-block-extension/info` 四条全 200，body 逐字节相同 |
 | E-03 | **PASS** | `POST /ui-block-extension` → 405 `{"ok":false,"error":"GET only"}` |
 | E-04 | **PASS** | `GET /ui-block-extension/reveal` → 405 `{"ok":false,"error":"POST only"}` |
@@ -207,7 +207,7 @@ div.Sixlwa_userRow[data-element-chip-bubble="history"]
 | desktop profile `package.json` | `bundles` 追加 `dsh-ui-block`、`dependencies` 追加 `"dsh-ui-block": "file:./.dsh-launcher-plugin-bodies/dsh-ui-block"` | **保留**（插件要留在桌面端；备份 `package.json.bak-uiblockinstall-20261030` 在同目录） |
 | 插件实体 | 新建 `profiles\desktop\.dsh-launcher-plugin-bodies\dsh-ui-block\` 与 `profiles\desktop\node_modules\dsh-ui-block\`（7 个文件 + `extension/`，哈希与 3080 插件体一致） | 保留 |
 | 桌面端进程 | 重启一次，现 pid **9956**，窗口最小化（hwnd 660560） | 保持现状 |
-| 测试块文件 | `C:\Users\ASUS\.dsh\ui-blocks\` 下 `probe-a01/a02/a03/a07/a09/a10/a11a/a11b/a12/a13/a14/a15/a16/a18/b12/e12.uiblock` 共 16 个 + `.history\` 下对应 10 个目录 + `.pins.json` 新增若干键 | 按任务要求**记录不删** |
+| 测试块文件 | `%USERPROFILE%\.dsh\ui-blocks\` 下 `probe-a01/a02/a03/a07/a09/a10/a11a/a11b/a12/a13/a14/a15/a16/a18/b12/e12.uiblock` 共 16 个 + `.history\` 下对应 10 个目录 + `.pins.json` 新增若干键 | 按任务要求**记录不删** |
 | 临时产物 | `%TEMP%\uiblock-reg\`（harness：`lib.mjs`/`send.mjs`/`probe-ui.mjs`/各 `test-*.mjs`/日志）、`%TEMP%\uiblock-edge*`（无头 Edge profile，进程已全部杀掉） | 可删 |
 | 已清理 | `probe-e13.uiblock`（E-13 用的**目录**）已删除；无头 Edge 测试进程已 `taskkill /F /T` 清空（`edge-after=0`） | 完成 |
 | 未触碰 | 3080（pid 30636）、4000（pid 31112）、3500、`dsh-ui-block\node_modules`、任何插件源码 | — |
