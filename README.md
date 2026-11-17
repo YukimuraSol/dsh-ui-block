@@ -33,17 +33,17 @@ DeepSeek Harness 插件。消息里独占一行写 `::dsh-ui 名字::`，这一�
 
 1. 写一个块文件 `<DSH_HOME>/ui-blocks/hello.uiblock`：
 
-`~html
+```html
 <!doctype html>
 <meta charset="utf-8">
 <h1 style="font:600 28px system-ui;padding:24px">Hello</h1>
-`~
+```
 
 2. 会话里发一条消息，正文里**单独一行**写引用。不包反引号，不放在代码围栏里，前后不加别的字：
 
-`~text
+```text
 ::dsh-ui hello::
-`~
+```
 
 3. 那一行变成画布，原位插在它后面。要指定画布尺寸写 `::dsh-ui hello res=820x510::`；不写是 1440x900。
 
@@ -53,14 +53,14 @@ DeepSeek Harness 插件。消息里独占一行写 `::dsh-ui 名字::`，这一�
 
 ## 自检
 
-`~text
+```text
 node self-check-uiblock-directive.mjs          # 引用行解析、画布控件、时间轴、版本历史
 node self-check-element-chip.mjs              # element«…» token 的编解码与 chip
 node self-check-blockbuild.mjs                # 块文件分段与素材目录组装
 node self-check-agent-tools.mjs               # list_pages / capture_page 的通道与实例登记台
 node self-check.mjs                           # 宿主半边：两个文件工具注册与写盘（不加 --shot 不碰浏览器）
 cd extension-capture; node self-check.mjs     # 抓取扩展
-`~
+```
 
 都是零依赖的 Node 脚本，失败时退出码非 0。
 
